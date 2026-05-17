@@ -224,7 +224,7 @@ function recordIntelAction(type, symbol, reason) {
   <details id="live-settings" open style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.75rem 0.9rem;margin-bottom:0.9rem;">
     <summary class="mono" style="cursor:pointer;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">
       Session settings
-      <span id="live-settings-summary" class="text-dim" style="margin-left:0.6rem;font-size:0.72rem;">tick 5s · floor 0.55 · $100/trade · 5 open</span>
+      <span id="live-settings-summary" class="text-dim" style="margin-left:0.6rem;font-size:0.72rem;">tick 5s · floor 0.50 · $80/trade · 25 open · 100 coins</span>
     </summary>
     <div class="grid mt-3" style="grid-template-columns:repeat(4,1fr);gap:0.9rem;">
       <div>
@@ -236,30 +236,30 @@ function recordIntelAction(type, symbol, reason) {
       </div>
       <div>
         <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
-          Confidence floor <span id="live-conf-val" class="mono" style="color:var(--text);font-weight:700;">0.55</span>
+          Confidence floor <span id="live-conf-val" class="mono" style="color:var(--text);font-weight:700;">0.50</span>
         </label>
-        <input id="live-min-confidence" type="range" min="0" max="0.95" step="0.01" value="0.55" style="width:100%;">
+        <input id="live-min-confidence" type="range" min="0" max="0.95" step="0.01" value="0.50" style="width:100%;">
         <div class="text-dim" style="font-size:0.68rem;">Drop to ~0.30 to see lots of trades while training</div>
       </div>
       <div>
         <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
-          Position size <span id="live-size-val" class="mono" style="color:var(--text);font-weight:700;">$100</span>
+          Position size <span id="live-size-val" class="mono" style="color:var(--text);font-weight:700;">$80</span>
         </label>
-        <input id="live-position-size" type="range" min="10" max="2000" step="10" value="100" style="width:100%;">
+        <input id="live-position-size" type="range" min="10" max="2000" step="10" value="80" style="width:100%;">
         <div class="text-dim" style="font-size:0.68rem;">USD notional per opened paper trade</div>
       </div>
       <div>
         <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
-          Max open / wallet <span id="live-maxopen-val" class="mono" style="color:var(--text);font-weight:700;">5</span>
+          Max open / wallet <span id="live-maxopen-val" class="mono" style="color:var(--text);font-weight:700;">25</span>
         </label>
-        <input id="live-max-open" type="range" min="1" max="25" step="1" value="5" style="width:100%;">
+        <input id="live-max-open" type="range" min="1" max="50" step="1" value="25" style="width:100%;">
         <div class="text-dim" style="font-size:0.68rem;">How many concurrent positions per wallet</div>
       </div>
     </div>
     <div class="flex items-center gap-2 mt-3" style="flex-wrap:wrap;">
       <label class="text-muted" style="font-size:0.74rem;">Universe size</label>
-      <input id="live-universe-limit" type="number" min="10" max="150" value="40" class="input" style="width:80px;">
-      <span class="text-dim" style="font-size:0.68rem;">Min 10. Smaller = faster ticks, fewer chances to fire.</span>
+      <input id="live-universe-limit" type="number" min="10" max="200" value="100" class="input" style="width:80px;">
+      <span class="text-dim" style="font-size:0.68rem;">Min 10. Higher = more crypto diversity.</span>
       <label class="flex items-center gap-1 text-muted" style="font-size:0.74rem;margin-left:0.6rem;cursor:pointer;">
         <input id="live-aggressive" type="checkbox">
         <span>Aggressive training mode</span>
@@ -358,10 +358,12 @@ function recordIntelAction(type, symbol, reason) {
 <div class="card mb-4" id="active-positions">
   <div class="card-header">
     <div class="card-title">Active Positions</div>
-    <div class="flex gap-2 items-center">
+    <div class="flex gap-2 items-center flex-wrap">
       <button type="button" class="btn btn-sm btn-outline" onclick="refreshPositions()">Refresh</button>
+      <button type="button" class="btn btn-sm btn-good" onclick="takeProfits()" title="Close all profitable positions">Take Profits</button>
       <button type="button" class="btn btn-sm btn-warn" onclick="closeAllPositions()">Close All</button>
       <button type="button" class="btn btn-sm btn-bad" onclick="emergencyExit()">Emergency Exit</button>
+      <button type="button" class="btn btn-sm btn-outline" onclick="openTradingStyleModal()" title="Configure scalper/swing settings">Trading Style</button>
     </div>
   </div>
   <p class="text-muted mb-3" style="font-size: 0.82rem;">
@@ -584,6 +586,99 @@ async function emergencyExit() {
     }
   } catch (err) {
     alert('Emergency exit failed: ' + err.message);
+  }
+}
+
+async function takeProfits() {
+  if (!confirm('Close ALL profitable positions? This will lock in gains on all winning trades.')) return;
+  try {
+    const res = await fetch('/api/positions/take-profits', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Profits taken!\n- Closed: ${data.closed} winners\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Held: ${data.skipped} positions`);
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to take profits: ' + err.message);
+  }
+}
+
+async function openTradingStyleModal() {
+  // Fetch current settings
+  let settings = { trading_style: 'hybrid', micro_profit_target_usd: 0.25, min_profit_pct: 0.003, auto_reinvest: true, max_daily_trades: 100 };
+  try {
+    const res = await fetch('/api/wallet/trading-style');
+    const data = await res.json();
+    if (data.ok) settings = data;
+  } catch (err) {}
+
+  document.getElementById('modal-title').textContent = 'Trading Style Settings';
+  document.getElementById('modal-content').innerHTML = `
+    <div style="margin-bottom: 1rem;">
+      <p class="text-muted" style="font-size: 0.82rem; margin-bottom: 1rem;">
+        Configure how the bot takes profits. <strong>Scalper</strong> takes small profits quickly. <strong>Swing</strong> holds for bigger gains.
+      </p>
+      
+      <label class="form-label">Trading Mode</label>
+      <select id="ts-mode" class="form-input" style="margin-bottom: 0.8rem;">
+        <option value="scalper" ${settings.trading_style === 'scalper' ? 'selected' : ''}>Scalper - Take micro-profits ($0.25+)</option>
+        <option value="hybrid" ${settings.trading_style === 'hybrid' ? 'selected' : ''}>Hybrid - AI decides based on conditions</option>
+        <option value="swing" ${settings.trading_style === 'swing' ? 'selected' : ''}>Swing - Hold for larger gains (1-5%)</option>
+      </select>
+      
+      <label class="form-label">Micro-Profit Target (USD)</label>
+      <input type="number" id="ts-micro-usd" class="form-input" value="${settings.micro_profit_target_usd}" step="0.05" min="0.05" style="margin-bottom: 0.8rem;">
+      <p class="text-muted" style="font-size: 0.75rem; margin-top: -0.5rem;">In scalper mode, sell when profit hits this amount (e.g., $0.25)</p>
+      
+      <label class="form-label">Min Profit Percentage</label>
+      <input type="number" id="ts-min-pct" class="form-input" value="${(settings.min_profit_pct * 100).toFixed(2)}" step="0.1" min="0.1" style="margin-bottom: 0.8rem;">
+      <p class="text-muted" style="font-size: 0.75rem; margin-top: -0.5rem;">Alternative trigger: sell when up this % (e.g., 0.3%)</p>
+      
+      <label class="form-label">Max Daily Trades</label>
+      <input type="number" id="ts-max-trades" class="form-input" value="${settings.max_daily_trades}" step="10" min="1" style="margin-bottom: 0.8rem;">
+      <p class="text-muted" style="font-size: 0.75rem; margin-top: -0.5rem;">Maximum trades per day (set to 500 for aggressive scalping)</p>
+      
+      <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem;">
+        <input type="checkbox" id="ts-reinvest" ${settings.auto_reinvest ? 'checked' : ''}>
+        <label for="ts-reinvest" style="margin: 0;">Auto-reinvest after taking profit</label>
+      </div>
+    </div>
+    
+    <div class="flex gap-2">
+      <button type="button" class="btn btn-outline" onclick="closeModal()">Cancel</button>
+      <button type="button" class="btn btn-good" onclick="saveTradingStyle()">Save Settings</button>
+    </div>
+  `;
+  document.getElementById('position-modal').style.display = 'flex';
+}
+
+async function saveTradingStyle() {
+  const mode = document.getElementById('ts-mode').value;
+  const microUsd = parseFloat(document.getElementById('ts-micro-usd').value) || 0.25;
+  const minPct = (parseFloat(document.getElementById('ts-min-pct').value) || 0.3) / 100;
+  const maxTrades = parseInt(document.getElementById('ts-max-trades').value) || 100;
+  const reinvest = document.getElementById('ts-reinvest').checked;
+  
+  const formData = new FormData();
+  formData.append('trading_style', mode);
+  formData.append('micro_profit_target_usd', microUsd);
+  formData.append('min_profit_pct', minPct);
+  formData.append('max_daily_trades', maxTrades);
+  formData.append('auto_reinvest', reinvest);
+  
+  try {
+    const res = await fetch('/api/wallet/trading-style', { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Trading style updated!\n- Mode: ${mode}\n- Micro-target: $${microUsd}\n- Max trades/day: ${maxTrades}`);
+      closeModal();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to save: ' + err.message);
   }
 }
 

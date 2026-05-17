@@ -175,8 +175,8 @@ class TradeDecision:
     action: str = "HOLD"           # BUY / SELL / HOLD / CLOSE
     confidence: float = 0.0        # 0..1
     size_multiplier: float = 1.0   # 0..1 (fraction of cfg.position_size_usd)
-    stop_loss_pct: float = 0.05
-    take_profit_pct: float = 0.10
+    stop_loss_pct: float = 0.02    # 2% stop loss (tighter for faster iteration)
+    take_profit_pct: float = 0.03  # 3% take profit (lock in gains quickly)
     rationale: str = ""
     key_factors: list[str] = field(default_factory=list)
     risk_flags: list[str] = field(default_factory=list)
@@ -259,8 +259,8 @@ def decide(
             action=side,
             confidence=tech_conf,
             size_multiplier=1.0,
-            stop_loss_pct=0.05,
-            take_profit_pct=0.10,
+            stop_loss_pct=0.02,   # 2% stop loss
+            take_profit_pct=0.03, # 3% take profit
             rationale=(
                 f"Training-mode passthrough (tech conf {tech_conf:.2f} >= floor {bypass_threshold:.2f}). "
                 f"{technical_signal.reasoning}"
@@ -732,8 +732,8 @@ def _technical_fallback(signal: Signal) -> TradeDecision:
         action=side,
         confidence=float(signal.confidence or 0.0),
         size_multiplier=1.0,
-        stop_loss_pct=0.05,
-        take_profit_pct=0.10,
+        stop_loss_pct=0.02,   # 2% stop loss
+        take_profit_pct=0.03, # 3% take profit
         rationale=signal.reasoning or "Fallback: technical signal only.",
         key_factors=[],
         risk_flags=["claude_unavailable"],
