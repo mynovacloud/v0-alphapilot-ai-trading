@@ -254,6 +254,390 @@
 </div>
 
 <!-- ============================================================ -->
+<!-- ACTIVE POSITIONS MANAGER                                      -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="active-positions">
+  <div class="card-header">
+    <div class="card-title">Active Positions</div>
+    <div class="flex gap-2 items-center">
+      <button type="button" class="btn btn-sm btn-outline" onclick="refreshPositions()">Refresh</button>
+      <button type="button" class="btn btn-sm btn-warn" onclick="closeAllPositions()">Close All</button>
+      <button type="button" class="btn btn-sm btn-bad" onclick="emergencyExit()">Emergency Exit</button>
+    </div>
+  </div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem;">
+    Manage open positions in real-time. Monitor SL/TP proximity, set trailing stops, and execute closes directly.
+    The progress bars show how close price is to stop-loss (red) or take-profit (green).
+  </p>
+
+  <div id="positions-table-container">
+    <table class="table" style="width: 100%; font-size: 0.82rem;">
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Size</th>
+          <th style="text-align:right;">Entry</th>
+          <th style="text-align:right;">Current</th>
+          <th style="text-align:right;">P&amp;L</th>
+          <th>SL/TP Proximity</th>
+          <th>Time Open</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="positions-body">
+        <tr><td colspan="9" class="empty">Loading positions...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Position detail modal (hidden by default) -->
+  <div id="position-modal" style="display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.7); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem; max-width: 480px; width: 90%;">
+      <div class="flex justify-between items-center mb-3">
+        <h3 id="modal-title" style="margin: 0;">Position Settings</h3>
+        <button type="button" onclick="closeModal()" style="background: none; border: none; color: var(--text); cursor: pointer; font-size: 1.2rem;">&times;</button>
+      </div>
+      <div id="modal-content">
+        <!-- Filled dynamically -->
+      </div>
+    </div>
+  </div>
+</div>
+
+<style>
+  .sl-bar, .tp-bar {
+    height: 6px;
+    border-radius: 3px;
+    transition: width 0.3s ease;
+  }
+  .sl-bar { background: var(--bad); }
+  .tp-bar { background: var(--good); }
+  .proximity-container {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 100px;
+  }
+  .proximity-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .proximity-label {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    width: 18px;
+  }
+  .proximity-track {
+    flex: 1;
+    height: 6px;
+    background: var(--bg-elev);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .position-danger {
+    background: rgba(239,68,68,0.1) !important;
+  }
+  .position-profit {
+    background: rgba(38,194,129,0.05) !important;
+  }
+  .btn-sm {
+    padding: 0.3rem 0.6rem;
+    font-size: 0.75rem;
+  }
+  .btn-warn {
+    background: var(--warn);
+    color: var(--bg);
+  }
+  .btn-bad {
+    background: var(--bad);
+    color: white;
+  }
+  .btn-outline {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+  }
+  .btn-outline:hover {
+    background: var(--bg-elev);
+  }
+</style>
+
+<script>
+// Position management functions
+let positionsData = [];
+
+async function refreshPositions() {
+  try {
+    const res = await fetch('/api/positions');
+    const data = await res.json();
+    if (data.ok) {
+      positionsData = data.positions;
+      renderPositions(data.positions);
+    }
+  } catch (err) {
+    console.error('Failed to refresh positions:', err);
+  }
+}
+
+function renderPositions(positions) {
+  const tbody = document.getElementById('positions-body');
+  if (!positions || positions.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="9" class="empty">No open positions.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = positions.map(p => {
+    const pnlClass = p.pnl >= 0 ? 'text-good' : 'text-bad';
+    const rowClass = p.sl_proximity > 0.7 ? 'position-danger' : (p.pnl_pct > 5 ? 'position-profit' : '');
+    const timeStr = p.time_in_trade_min < 60 
+      ? `${Math.round(p.time_in_trade_min)}m` 
+      : `${(p.time_in_trade_min / 60).toFixed(1)}h`;
+
+    return `
+      <tr class="${rowClass}">
+        <td class="mono" style="font-weight: 600;">${p.symbol}</td>
+        <td><span class="badge ${p.side === 'BUY' ? 'badge-good' : 'badge-bad'}">${p.side}</span></td>
+        <td class="mono">${p.qty.toFixed(6)}</td>
+        <td class="mono" style="text-align:right;">$${p.entry_price.toFixed(4)}</td>
+        <td class="mono" style="text-align:right;">$${p.current_price.toFixed(4)}</td>
+        <td class="mono ${pnlClass}" style="text-align:right;">
+          ${p.pnl >= 0 ? '+' : ''}$${p.pnl.toFixed(2)}
+          <div style="font-size:0.7rem;">${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%</div>
+        </td>
+        <td>
+          <div class="proximity-container">
+            <div class="proximity-row">
+              <span class="proximity-label">SL</span>
+              <div class="proximity-track">
+                <div class="sl-bar" style="width: ${Math.min(100, p.sl_proximity * 100)}%;"></div>
+              </div>
+              <span style="font-size:0.68rem;color:var(--text-muted);">${p.stop_loss_price ? '$'+p.stop_loss_price.toFixed(2) : '—'}</span>
+            </div>
+            <div class="proximity-row">
+              <span class="proximity-label">TP</span>
+              <div class="proximity-track">
+                <div class="tp-bar" style="width: ${Math.min(100, p.tp_proximity * 100)}%;"></div>
+              </div>
+              <span style="font-size:0.68rem;color:var(--text-muted);">${p.take_profit_price ? '$'+p.take_profit_price.toFixed(2) : '—'}</span>
+            </div>
+            ${p.trailing_stop_price ? `<div style="font-size:0.68rem;color:var(--accent);">Trail: $${p.trailing_stop_price.toFixed(2)}</div>` : ''}
+          </div>
+        </td>
+        <td style="font-size:0.78rem;">
+          ${timeStr}
+          ${p.dca_count > 0 ? `<div style="font-size:0.68rem;color:var(--accent);">DCA x${p.dca_count}</div>` : ''}
+        </td>
+        <td>
+          <div class="flex gap-1 flex-wrap">
+            <button class="btn btn-sm btn-outline" onclick="openSettings(${p.id})">Settings</button>
+            <button class="btn btn-sm btn-bad" onclick="closePosition(${p.id})">Close</button>
+          </div>
+        </td>
+      </tr>
+    `;
+  }).join('');
+}
+
+async function closePosition(tradeId) {
+  if (!confirm('Close this position at market price?')) return;
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/close`, { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Position closed. Realized P&L: $${data.realized_pnl.toFixed(2)}`);
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to close position: ' + err.message);
+  }
+}
+
+async function closeAllPositions() {
+  if (!confirm('Close ALL open positions? This cannot be undone.')) return;
+  try {
+    const res = await fetch('/api/positions/close-all', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Closed ${data.closed} positions. Total P&L: $${data.total_pnl.toFixed(2)}`);
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to close positions: ' + err.message);
+  }
+}
+
+async function emergencyExit() {
+  if (!confirm('EMERGENCY EXIT: This will close ALL positions AND engage the kill switch. Continue?')) return;
+  try {
+    const res = await fetch('/api/positions/emergency-exit', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Emergency exit complete.\n- Positions closed: ${data.positions_closed}\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Kill switch: ENGAGED`);
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Emergency exit failed: ' + err.message);
+  }
+}
+
+function openSettings(tradeId) {
+  const p = positionsData.find(pos => pos.id === tradeId);
+  if (!p) return;
+
+  document.getElementById('modal-title').textContent = `Settings: ${p.symbol} ${p.side}`;
+  document.getElementById('modal-content').innerHTML = `
+    <div class="flex flex-col gap-3">
+      <div>
+        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Stop Loss Price</label>
+        <div class="flex gap-2">
+          <input type="number" id="modal-sl" class="input" style="flex:1;" step="0.01" value="${p.stop_loss_price || ''}" placeholder="Not set">
+          <button class="btn btn-outline btn-sm" onclick="updateSlTp(${p.id}, 'sl')">Set SL</button>
+        </div>
+      </div>
+      <div>
+        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Take Profit Price</label>
+        <div class="flex gap-2">
+          <input type="number" id="modal-tp" class="input" style="flex:1;" step="0.01" value="${p.take_profit_price || ''}" placeholder="Not set">
+          <button class="btn btn-outline btn-sm" onclick="updateSlTp(${p.id}, 'tp')">Set TP</button>
+        </div>
+      </div>
+      <div>
+        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Trailing Stop %</label>
+        <div class="flex gap-2">
+          <input type="number" id="modal-trail" class="input" style="flex:1;" step="0.001" min="0.01" max="0.5" value="${p.trailing_stop_pct || ''}" placeholder="e.g. 0.03 for 3%">
+          <button class="btn btn-outline btn-sm" onclick="setTrailing(${p.id})">Set Trailing</button>
+        </div>
+        <div class="text-dim" style="font-size:0.7rem;margin-top:0.2rem;">
+          Current trailing price: ${p.trailing_stop_price ? '$'+p.trailing_stop_price.toFixed(4) : '—'}
+        </div>
+      </div>
+      <hr style="border-color:var(--border);margin:0.5rem 0;">
+      <div>
+        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">DCA - Add to Position ($USD)</label>
+        <div class="flex gap-2">
+          <input type="number" id="modal-dca" class="input" style="flex:1;" step="10" min="10" placeholder="Amount in USD">
+          <button class="btn btn-outline btn-sm" onclick="executeDca(${p.id})" ${p.dca_count >= 3 ? 'disabled' : ''}>
+            Add (${3 - p.dca_count} left)
+          </button>
+        </div>
+        <div class="text-dim" style="font-size:0.7rem;margin-top:0.2rem;">
+          Current avg entry: $${p.entry_price.toFixed(4)} | Current price: $${p.current_price.toFixed(4)}
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('position-modal').style.display = 'flex';
+}
+
+function closeModal() {
+  document.getElementById('position-modal').style.display = 'none';
+}
+
+async function updateSlTp(tradeId, type) {
+  const slVal = document.getElementById('modal-sl').value;
+  const tpVal = document.getElementById('modal-tp').value;
+
+  const formData = new FormData();
+  if (type === 'sl' && slVal) formData.append('stop_loss_price', slVal);
+  if (type === 'tp' && tpVal) formData.append('take_profit_price', tpVal);
+
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/sl-tp`, {
+      method: 'POST',
+      body: formData
+    });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`${type.toUpperCase()} updated successfully`);
+      closeModal();
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to update: ' + err.message);
+  }
+}
+
+async function setTrailing(tradeId) {
+  const trailVal = document.getElementById('modal-trail').value;
+  if (!trailVal || trailVal <= 0) {
+    alert('Please enter a valid trailing stop percentage');
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('trailing_stop_pct', trailVal);
+
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/trailing`, {
+      method: 'POST',
+      body: formData
+    });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Trailing stop set at $${data.trailing_stop_price.toFixed(4)}`);
+      closeModal();
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Failed to set trailing stop: ' + err.message);
+  }
+}
+
+async function executeDca(tradeId) {
+  const dcaVal = document.getElementById('modal-dca').value;
+  if (!dcaVal || dcaVal <= 0) {
+    alert('Please enter a valid USD amount');
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('add_usd', dcaVal);
+
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/dca`, {
+      method: 'POST',
+      body: formData
+    });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`DCA executed. New avg entry: $${data.new_entry.toFixed(4)}, Total qty: ${data.new_qty.toFixed(6)}`);
+      closeModal();
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('DCA failed: ' + err.message);
+  }
+}
+
+// Auto-refresh positions every 10 seconds when page is visible
+document.addEventListener('DOMContentLoaded', () => {
+  refreshPositions();
+  setInterval(() => {
+    if (!document.hidden) refreshPositions();
+  }, 10000);
+});
+
+// Close modal on escape key
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closeModal();
+});
+</script>
+
+<!-- ============================================================ -->
 <!-- POSITIONS LAB                                                   -->
 <!-- ============================================================ -->
 <div class="card mb-4" id="positions-lab">

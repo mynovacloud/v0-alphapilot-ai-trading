@@ -116,6 +116,32 @@ class PaperTrade(Base):
     closed_at = Column(DateTime, nullable=True)
     notes = Column(Text, default="")
 
+    # ----- Position Management & Auto-Exit Fields -----
+    # Stop-loss / take-profit as ABSOLUTE prices (easier to compare vs current price).
+    stop_loss_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+
+    # Trailing stop: when price moves favorably, we ratchet the SL closer to lock gains.
+    # `trailing_stop_pct` is the gap from the high-water mark (e.g. 0.03 = 3%).
+    # `trailing_stop_price` is the current computed SL (updated each tick).
+    trailing_stop_pct = Column(Float, nullable=True)
+    trailing_stop_price = Column(Float, nullable=True)
+    high_water_price = Column(Float, nullable=True)  # best price since open (for trailing calc)
+
+    # Hard cap: if unrealized loss exceeds this %, force-close immediately.
+    max_loss_pct = Column(Float, default=0.10)
+
+    # Time-based exit: auto-close if position is older than N hours and flat.
+    time_limit_hours = Column(Float, nullable=True)
+
+    # DCA / averaging support. `dca_count` tracks how many times we've added.
+    # `original_entry` preserves the first entry before any averaging.
+    dca_count = Column(Integer, default=0)
+    original_entry = Column(Float, nullable=True)
+
+    # Exit reason (for analytics): "sl" / "tp" / "trailing" / "max_loss" / "time" / "manual" / "signal"
+    exit_reason = Column(String(30), nullable=True)
+
     wallet = relationship("Wallet", back_populates="trades")
     strategy = relationship("Strategy")
 

@@ -1946,3 +1946,356 @@ def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
         return RedirectResponse(url="/settings?reset=denied", status_code=303)
     reset_db()
     return RedirectResponse(url="/wallets", status_code=303)
+
+
+# ============================================================================ #
+# POSITION MANAGEMENT API
+# ============================================================================ #
+
+
+@router.get("/api/positions")
+def api_positions() -> JSONResponse:
+    """
+    Get all open positions with current P&L and SL/TP proximity.
+    """
+    from connectors.live_prices import get_price
+
+    with session_scope() as s:
+        trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.status == "open")
+            .order_by(PaperTrade.opened_at.desc())
+            .all()
+        )
+
+        positions = []
+        for t in trades:
+            entry = float(t.entry_price or 0)
+            qty = float(t.qty or 0)
+            side = (t.side or "BUY").upper()
+
+            # Get current price
+            p = get_price(t.symbol)
+            current = float(p.get("price") or 0) if p.get("ok") else entry
+
+            # Calculate P&L
+            if side == "BUY":
+                pnl = (current - entry) * qty
+                pnl_pct = (current - entry) / entry if entry > 0 else 0
+            else:
+                pnl = (entry - current) * qty
+                pnl_pct = (entry - current) / entry if entry > 0 else 0
+
+            # Calculate SL/TP proximity (0-1 where 1 = at the level)
+            sl_proximity = 0.0
+            tp_proximity = 0.0
+
+            if t.stop_loss_price and entry > 0:
+                sl = float(t.stop_loss_price)
+                if side == "BUY":
+                    # Distance from current to SL, relative to entry-to-SL distance
+                    sl_range = entry - sl
+                    current_dist = current - sl
+                    sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+                else:
+                    sl_range = sl - entry
+                    current_dist = sl - current
+                    sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+
+            if t.take_profit_price and entry > 0:
+                tp = float(t.take_profit_price)
+                if side == "BUY":
+                    tp_range = tp - entry
+                    current_dist = tp - current
+                    tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+                else:
+                    tp_range = entry - tp
+                    current_dist = current - tp
+                    tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+
+            # Time in trade
+            opened = t.opened_at
+            time_in_trade_min = 0
+            if opened:
+                from utils.helpers import utcnow
+                time_in_trade_min = (utcnow() - opened).total_seconds() / 60
+
+            positions.append({
+                "id": t.id,
+                "wallet_id": t.wallet_id,
+                "symbol": t.symbol,
+                "side": side,
+                "qty": qty,
+                "entry_price": entry,
+                "current_price": current,
+                "pnl": round(pnl, 2),
+                "pnl_pct": round(pnl_pct * 100, 2),
+                "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
+                "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
+                "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
+                "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
+                "sl_proximity": round(sl_proximity, 3),
+                "tp_proximity": round(tp_proximity, 3),
+                "max_loss_pct": float(t.max_loss_pct or 0.10),
+                "dca_count": t.dca_count or 0,
+                "time_in_trade_min": round(time_in_trade_min, 1),
+                "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+            })
+
+    return JSONResponse({"ok": True, "positions": positions})
+
+
+@router.post("/api/positions/{trade_id}/close")
+def api_close_position(trade_id: int) -> JSONResponse:
+    """
+    Close a single position at current market price.
+    """
+    from connectors.live_prices import get_price
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if not trade:
+            return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
+        if trade.status != "open":
+            return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
+
+        symbol = trade.symbol
+
+    # Get current price
+    p = get_price(symbol)
+    if not p.get("ok"):
+        return JSONResponse({"ok": False, "error": "Could not fetch current price"}, status_code=500)
+    current_price = float(p["price"])
+
+    engine = PaperTradingEngine()
+    result = engine.close_trade(trade_id, current_price, notes="manual close via API")
+
+    if result.get("ok"):
+        # Set exit reason
+        with session_scope() as s:
+            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+            if trade:
+                trade.exit_reason = "manual"
+        return JSONResponse({"ok": True, "realized_pnl": result.get("pnl", 0)})
+    else:
+        return JSONResponse({"ok": False, "error": result.get("error", "Unknown error")}, status_code=500)
+
+
+@router.post("/api/positions/close-all")
+def api_close_all_positions() -> JSONResponse:
+    """
+    Close all open positions at current market prices.
+    """
+    from connectors.live_prices import get_price
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    engine = PaperTradingEngine()
+    closed = 0
+    errors = 0
+    total_pnl = 0.0
+
+    with session_scope() as s:
+        open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+        trade_info = [(t.id, t.symbol) for t in open_trades]
+
+    for trade_id, symbol in trade_info:
+        p = get_price(symbol)
+        if not p.get("ok"):
+            errors += 1
+            continue
+
+        result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
+        if result.get("ok"):
+            closed += 1
+            total_pnl += float(result.get("pnl", 0))
+            with session_scope() as s:
+                trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                if trade:
+                    trade.exit_reason = "manual"
+        else:
+            errors += 1
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="positions",
+                level="info",
+                message=f"Close-all: {closed} positions closed, {errors} errors, total P&L: ${total_pnl:+.2f}",
+            )
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "closed": closed,
+        "errors": errors,
+        "total_pnl": round(total_pnl, 2),
+    })
+
+
+@router.post("/api/positions/{trade_id}/sl-tp")
+def api_update_sl_tp(
+    trade_id: int,
+    stop_loss_price: float | None = Form(None),
+    take_profit_price: float | None = Form(None),
+) -> JSONResponse:
+    """
+    Update stop-loss and/or take-profit prices for a position.
+    """
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if not trade:
+            return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
+        if trade.status != "open":
+            return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
+
+        if stop_loss_price is not None:
+            trade.stop_loss_price = stop_loss_price
+        if take_profit_price is not None:
+            trade.take_profit_price = take_profit_price
+
+        s.add(
+            ActivityLog(
+                category="positions",
+                level="info",
+                message=f"Updated SL/TP for {trade.symbol}: SL=${stop_loss_price}, TP=${take_profit_price}",
+                wallet_id=trade.wallet_id,
+            )
+        )
+
+    return JSONResponse({"ok": True})
+
+
+@router.post("/api/positions/{trade_id}/trailing")
+def api_set_trailing_stop(
+    trade_id: int,
+    trailing_stop_pct: float = Form(...),
+) -> JSONResponse:
+    """
+    Enable or update a trailing stop for a position.
+    """
+    from connectors.live_prices import get_price
+
+    if trailing_stop_pct <= 0 or trailing_stop_pct > 0.5:
+        return JSONResponse(
+            {"ok": False, "error": "Trailing stop must be between 0 and 50%"},
+            status_code=400,
+        )
+
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if not trade:
+            return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
+        if trade.status != "open":
+            return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
+
+        # Get current price to initialize trailing stop
+        p = get_price(trade.symbol)
+        current = float(p.get("price") or trade.entry_price) if p.get("ok") else float(trade.entry_price)
+
+        entry = float(trade.entry_price)
+        side = (trade.side or "BUY").upper()
+
+        trade.trailing_stop_pct = trailing_stop_pct
+
+        # Initialize high water mark and trailing price
+        if side == "BUY":
+            trade.high_water_price = max(current, entry)
+            trade.trailing_stop_price = trade.high_water_price * (1 - trailing_stop_pct)
+        else:
+            trade.high_water_price = min(current, entry)
+            trade.trailing_stop_price = trade.high_water_price * (1 + trailing_stop_pct)
+
+        s.add(
+            ActivityLog(
+                category="positions",
+                level="info",
+                message=(
+                    f"Trailing stop set for {trade.symbol}: {trailing_stop_pct:.1%} "
+                    f"(initial price: ${trade.trailing_stop_price:.4f})"
+                ),
+                wallet_id=trade.wallet_id,
+            )
+        )
+
+    return JSONResponse({"ok": True, "trailing_stop_price": trade.trailing_stop_price})
+
+
+@router.post("/api/positions/{trade_id}/dca")
+def api_dca_position(
+    trade_id: int,
+    add_usd: float = Form(...),
+) -> JSONResponse:
+    """
+    Dollar-cost average into an existing position.
+    """
+    from connectors.live_prices import get_price
+    from trading.loss_recovery import LossRecoveryEngine
+
+    if add_usd <= 0:
+        return JSONResponse({"ok": False, "error": "Amount must be positive"}, status_code=400)
+
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if not trade:
+            return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
+        if trade.status != "open":
+            return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
+        if (trade.dca_count or 0) >= 3:
+            return JSONResponse({"ok": False, "error": "Max DCA count (3) reached"}, status_code=400)
+
+        symbol = trade.symbol
+
+    # Get current price
+    p = get_price(symbol)
+    if not p.get("ok"):
+        return JSONResponse({"ok": False, "error": "Could not fetch current price"}, status_code=500)
+    current_price = float(p["price"])
+    add_qty = add_usd / current_price
+
+    engine = LossRecoveryEngine()
+    success = engine.execute_dca(trade, add_qty, current_price)
+
+    if success:
+        # Reload trade to get new values
+        with session_scope() as s:
+            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+            return JSONResponse({
+                "ok": True,
+                "new_entry": float(trade.entry_price) if trade else 0,
+                "new_qty": float(trade.qty) if trade else 0,
+                "dca_count": trade.dca_count if trade else 0,
+            })
+    else:
+        return JSONResponse({"ok": False, "error": "DCA failed"}, status_code=500)
+
+
+@router.post("/api/positions/emergency-exit")
+def api_emergency_exit() -> JSONResponse:
+    """
+    Emergency exit: Close all positions AND engage kill switch.
+    """
+    # First engage kill switch
+    RiskManager.set_kill_switch(True, reason="emergency exit via API")
+
+    # Then close all positions
+    result = api_close_all_positions()
+    data = result.body.decode() if hasattr(result, "body") else "{}"
+    import json
+    close_result = json.loads(data) if data else {}
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="risk",
+                level="warn",
+                message="EMERGENCY EXIT: Kill switch engaged and all positions closed.",
+            )
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "kill_switch_engaged": True,
+        "positions_closed": close_result.get("closed", 0),
+        "total_pnl": close_result.get("total_pnl", 0),
+    })
