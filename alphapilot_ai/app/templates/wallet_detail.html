@@ -137,7 +137,7 @@
     if (!sym) return;
     priceStatus.textContent = 'Fetching live price for ' + sym + '...';
     try {
-      const r = await fetch('/api/price?symbol=' + encodeURIComponent(sym));
+      const r = await fetch('/_price?symbol=' + encodeURIComponent(sym));
       const j = await r.json();
       if (j.ok) {
         priceInput.value = Number(j.price).toFixed(2);

@@ -492,9 +492,9 @@ def wallet_sync(request: Request, wallet_id: int) -> HTMLResponse:
         return HTMLResponse(f"<span class='badge badge-bad'>Sync failed: {err}</span>")
 
 
-@router.get("/api/price")
+@router.get("/_price")
 def api_live_price(symbol: str) -> dict[str, Any]:
-    """Endpoint used by HTMX in templates to look up a live price."""
+    """Endpoint used by JS in templates to look up a live price."""
     return live_price(symbol)
 
 

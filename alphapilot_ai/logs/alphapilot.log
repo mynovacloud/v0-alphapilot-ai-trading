@@ -37,3 +37,8 @@
 2026-05-17 04:55:30,464 | WARNING | database.db | Resetting database!
 2026-05-17 04:55:30,489 | INFO    | httpx | HTTP Request: POST http://testserver/settings/reset-data "HTTP/1.1 303 See Other"
 2026-05-17 04:55:30,492 | INFO    | httpx | HTTP Request: GET http://testserver/wallets "HTTP/1.1 200 OK"
+2026-05-17 04:56:15,091 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
+2026-05-17 04:56:15,110 | INFO    | app.main | AlphaPilot AI ready.
+2026-05-17 04:56:15,112 | INFO    | httpx | HTTP Request: GET http://testserver/_price?symbol=BTC-USD "HTTP/1.1 404 Not Found"
+2026-05-17 04:56:15,113 | INFO    | httpx | HTTP Request: GET http://testserver/_price?symbol=ETH-USD "HTTP/1.1 404 Not Found"
+2026-05-17 04:56:15,113 | INFO    | httpx | HTTP Request: GET http://testserver/_price?symbol=ZZZZ "HTTP/1.1 404 Not Found"
