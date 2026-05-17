@@ -935,6 +935,347 @@ def training_chart_data(
     )
 
 
+# ============================================================
+# LIVE TRAINING SESSION
+# ============================================================
+# When the user clicks "Start Live Session" on the Training Center, we:
+#   1. Snapshot the current autonomous-bot config so we can restore later.
+#   2. Force paper trading ON (dry_run = false), bot_enabled = true, and
+#      drop the tick interval to a session-friendly cadence (default 15s).
+#   3. Reload the scheduler so the new interval takes effect immediately.
+#   4. Stamp `training_session_active = true` so the UI knows to poll the
+#      live feed.
+# Stopping reverses all of the above and restores the user's previous knobs.
+# Polling is deliberately HTTP rather than websocket so it works behind any
+# reverse proxy without additional configuration.
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@router.post("/training/session/start")
+def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
+    from config.bot_config import get as cfg_get
+    from config.bot_config import set_many as cfg_set
+    from services.claude_client import is_configured as claude_is_configured
+    from services.scheduler import bot_scheduler
+
+    if _truthy(cfg_get("training_session_active")):
+        return JSONResponse({"ok": True, "already_running": True})
+
+    tick = max(5, min(120, int(tick_seconds or 15)))
+
+    # Snapshot the values we're about to overwrite so Stop can restore.
+    prev_enabled = cfg_get("bot_enabled")
+    prev_dry = cfg_get("bot_dry_run")
+    prev_tick = cfg_get("bot_tick_seconds")
+
+    cfg_set(
+        {
+            "training_session_active": "true",
+            "training_session_started_at": utcnow().isoformat(),
+            "training_session_tick_seconds": str(tick),
+            "training_session_prev_bot_enabled": prev_enabled or "",
+            "training_session_prev_dry_run": prev_dry or "",
+            "training_session_prev_tick_seconds": prev_tick or "",
+            # Force the autonomous loop ON in paper-live mode.
+            "bot_enabled": "true",
+            "bot_dry_run": "false",
+            "bot_tick_seconds": str(tick),
+        }
+    )
+
+    bot_scheduler.reload()  # picks up the new tick interval
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="bot",
+                level="info",
+                message=(
+                    f"Live training session started "
+                    f"(tick={tick}s, paper-live={'YES' if claude_is_configured() else 'YES (no Claude — fallback signals)'})"
+                ),
+            )
+        )
+    return JSONResponse(
+        {
+            "ok": True,
+            "tick_seconds": tick,
+            "claude_configured": claude_is_configured(),
+        }
+    )
+
+
+@router.post("/training/session/stop")
+def training_session_stop() -> JSONResponse:
+    from config.bot_config import get as cfg_get
+    from config.bot_config import set_many as cfg_set
+    from services.scheduler import bot_scheduler
+
+    if not _truthy(cfg_get("training_session_active")):
+        return JSONResponse({"ok": True, "already_stopped": True})
+
+    prev_enabled = cfg_get("training_session_prev_bot_enabled") or "false"
+    prev_dry = cfg_get("training_session_prev_dry_run") or "true"
+    prev_tick = cfg_get("training_session_prev_tick_seconds") or "60"
+
+    cfg_set(
+        {
+            "training_session_active": "false",
+            "training_session_started_at": "",
+            "training_session_prev_bot_enabled": "",
+            "training_session_prev_dry_run": "",
+            "training_session_prev_tick_seconds": "",
+            # Restore the user's prior config.
+            "bot_enabled": prev_enabled,
+            "bot_dry_run": prev_dry,
+            "bot_tick_seconds": prev_tick,
+        }
+    )
+    bot_scheduler.reload()
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="bot",
+                level="info",
+                message="Live training session stopped — bot config restored.",
+            )
+        )
+    return JSONResponse({"ok": True})
+
+
+@router.post("/training/session/tick")
+def training_session_tick_now() -> JSONResponse:
+    """Force a tick immediately so the user doesn't have to wait. Returns the result."""
+    from trading.bot_engine import bot_engine
+
+    res = bot_engine.tick(manual=True)
+    return JSONResponse(
+        {
+            "ok": True,
+            "result": {
+                "started_at": res.started_at,
+                "ended_at": res.ended_at,
+                "universe_size": res.universe_size,
+                "wallets_evaluated": res.wallets_evaluated,
+                "decisions": res.decisions,
+                "actions": res.actions,
+                "skipped": res.skipped,
+                "errors": res.errors,
+                "notes": res.notes,
+            },
+        }
+    )
+
+
+@router.get("/training/session/feed")
+def training_session_feed(
+    since_decision_id: int = Query(0, ge=0),
+    since_log_id: int = Query(0, ge=0),
+    since_trade_id: int = Query(0, ge=0),
+) -> JSONResponse:
+    """
+    Polled every 2s by the Training Center while a live session is running.
+
+    Returns:
+      - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
+      - portfolio: live mark-to-market P&L across every wallet
+      - decisions: new ClaudeDecision rows (BUY / SELL / HOLD / CLOSE) with rationale
+      - fills:     newly opened or closed paper trades
+      - logs:      bot/trade/system activity logs (the streaming console)
+      - ticks:     last 5 tick summaries for the "what just happened" panel
+    """
+    from config.bot_config import get as cfg_get
+    from connectors.live_prices import get_price
+    from database.models import ClaudeDecision
+    from services.scheduler import bot_scheduler
+    from trading.bot_engine import bot_engine
+
+    sched = bot_scheduler.status()
+    session_active = _truthy(cfg_get("training_session_active"))
+    started_at = cfg_get("training_session_started_at") or None
+
+    with session_scope() as s:
+        # ---- Live portfolio mark-to-market ----
+        wallets = s.query(Wallet).all()
+        starting = sum(float(w.paper_balance or 0) for w in wallets)
+
+        all_trades = s.query(PaperTrade).all()
+        realized = 0.0
+        unrealized = 0.0
+        invested_open = 0.0
+        wins = 0
+        losses = 0
+        # Re-mark every open position to the latest live price so the
+        # "Currently Sitting At" number truly updates in real time.
+        symbol_prices: dict[str, float] = {}
+        for t in all_trades:
+            if t.status == "closed":
+                pnl = float(t.realized_pnl or 0)
+                realized += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+                continue
+            entry = float(t.entry_price or 0)
+            qty = float(t.qty or 0)
+            invested_open += entry * qty
+            mark = symbol_prices.get(t.symbol)
+            if mark is None:
+                p = get_price(t.symbol)
+                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
+                symbol_prices[t.symbol] = mark
+            if mark > 0 and entry > 0:
+                if (t.side or "").upper() == "BUY":
+                    unrealized += (mark - entry) * qty
+                else:  # SELL / SHORT
+                    unrealized += (entry - mark) * qty
+
+        closed_count = wins + losses
+        total_pl = realized + unrealized
+        portfolio = {
+            "starting": round(starting, 2),
+            "realized": round(realized, 2),
+            "unrealized": round(unrealized, 2),
+            "current": round(starting + total_pl, 2),
+            "total_pl": round(total_pl, 2),
+            "total_pl_pct": round((total_pl / starting * 100.0) if starting else 0.0, 3),
+            "invested_open": round(invested_open, 2),
+            "open_trades": len(all_trades) - closed_count,
+            "closed_trades": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round((wins / closed_count) if closed_count else 0.0, 4),
+        }
+
+        # ---- New Claude decisions since the client's last cursor ----
+        new_decisions = (
+            s.query(ClaudeDecision)
+            .filter(ClaudeDecision.id > since_decision_id)
+            .order_by(ClaudeDecision.id.asc())
+            .limit(50)
+            .all()
+        )
+        decisions_payload = [
+            {
+                "id": d.id,
+                "ts": int(d.created_at.timestamp()) if d.created_at else None,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "wallet_id": d.wallet_id,
+                "symbol": d.symbol,
+                "action": d.action,
+                "confidence": float(d.confidence or 0),
+                "size_multiplier": float(d.size_multiplier or 1),
+                "stop_loss_pct": float(d.stop_loss_pct or 0),
+                "take_profit_pct": float(d.take_profit_pct or 0),
+                "technical_side": d.technical_side,
+                "technical_confidence": float(d.technical_confidence or 0),
+                "price": float(d.price or 0),
+                "rationale": (d.rationale or "")[:400],
+                "source": d.source,
+            }
+            for d in new_decisions
+        ]
+
+        # ---- Newly opened or closed paper trades ----
+        # Use a max(opened_id, closed_id) cursor so the client gets both events.
+        new_trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.id > since_trade_id)
+            .order_by(PaperTrade.id.asc())
+            .limit(40)
+            .all()
+        )
+        fills_payload = []
+        for t in new_trades:
+            mark = symbol_prices.get(t.symbol)
+            if mark is None:
+                p = get_price(t.symbol)
+                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
+            fills_payload.append(
+                {
+                    "id": t.id,
+                    "wallet_id": t.wallet_id,
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "qty": float(t.qty or 0),
+                    "entry_price": float(t.entry_price or 0),
+                    "exit_price": float(t.exit_price or 0) if t.exit_price else None,
+                    "mark_price": mark,
+                    "status": t.status,
+                    "realized_pnl": float(t.realized_pnl or 0),
+                    "unrealized_pnl": float(t.unrealized_pnl or 0),
+                    "confidence": float(t.confidence or 0),
+                    "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                    "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+                    "notes": (t.notes or "")[:200],
+                }
+            )
+
+        # ---- Activity logs (the live console) ----
+        new_logs = (
+            s.query(ActivityLog)
+            .filter(ActivityLog.id > since_log_id)
+            .order_by(ActivityLog.id.asc())
+            .limit(80)
+            .all()
+        )
+        logs_payload = [
+            {
+                "id": l.id,
+                "ts": int(l.created_at.timestamp()) if l.created_at else None,
+                "category": l.category,
+                "level": l.level,
+                "wallet_id": l.wallet_id,
+                "message": l.message,
+            }
+            for l in new_logs
+        ]
+
+    ticks_payload = [
+        {
+            "started_at": t.started_at,
+            "ended_at": t.ended_at,
+            "decisions": t.decisions,
+            "actions": t.actions,
+            "skipped": t.skipped,
+            "errors": t.errors,
+            "universe_size": t.universe_size,
+            "notes": t.notes[:5],
+        }
+        for t in bot_engine.recent_ticks(limit=8)
+    ]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "session": {
+                "active": session_active,
+                "started_at": started_at,
+                "tick_seconds": sched.get("tick_seconds"),
+                "next_tick": sched.get("next_tick"),
+                "scheduler_running": sched.get("scheduler_running"),
+                "dry_run": sched.get("dry_run"),
+                "bot_enabled": sched.get("bot_enabled"),
+            },
+            "portfolio": portfolio,
+            "decisions": decisions_payload,
+            "fills": fills_payload,
+            "logs": logs_payload,
+            "ticks": ticks_payload,
+            # Cursors the client should send back next poll.
+            "cursors": {
+                "decision_id": (decisions_payload[-1]["id"] if decisions_payload else since_decision_id),
+                "log_id": (logs_payload[-1]["id"] if logs_payload else since_log_id),
+                "trade_id": (fills_payload[-1]["id"] if fills_payload else since_trade_id),
+            },
+        }
+    )
+
+
 @router.post("/training/run", response_class=HTMLResponse)
 def training_run(
     request: Request,

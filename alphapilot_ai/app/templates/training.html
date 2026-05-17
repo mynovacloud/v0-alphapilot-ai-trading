@@ -97,6 +97,108 @@
 </div>
 
 <!-- ============================================================ -->
+<!-- LIVE TRADING SESSION                                            -->
+<!-- Real-time paper trading with the autonomous engine running.     -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="live-session" data-claude-configured="{{ 'true' if claude_configured else 'false' }}">
+  <div class="card-header">
+    <div class="card-title">
+      <span id="live-pulse" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--text-muted);margin-right:0.5rem;vertical-align:middle;"></span>
+      Live Trading Session
+      <span id="live-status-badge" class="badge" style="margin-left:0.6rem;">Idle</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-muted" style="font-size:0.78rem;">Tick</label>
+      <select id="live-tick-seconds" class="select" style="width:90px;">
+        <option value="5">5s</option>
+        <option value="10">10s</option>
+        <option value="15" selected>15s</option>
+        <option value="30">30s</option>
+        <option value="60">60s</option>
+      </select>
+      <button id="live-start-btn" class="btn btn-primary" type="button">Start Live Session</button>
+      <button id="live-stop-btn" class="btn btn-danger" type="button" style="display:none;">Stop Session</button>
+      <button id="live-tick-btn" class="btn" type="button" title="Force one tick now">Tick&nbsp;Now</button>
+    </div>
+  </div>
+
+  <p class="text-muted mb-3" style="font-size:0.85rem;max-width:780px;">
+    Watch the bot trade in real time on paper money. Starting a session forces the autonomous engine to wake up
+    every few seconds, route Claude's decisions through the paper trading layer, and stream every BUY, SELL, HOLD,
+    and exit straight onto this page. Stop any time. We perfect this here before live capital.
+  </p>
+
+  <!-- Live equity strip — these numbers tick every poll -->
+  <div class="grid mb-3" style="grid-template-columns:1.4fr repeat(4,1fr);gap:0.6rem;">
+    <div class="kpi" id="live-kpi-equity"
+         style="background:linear-gradient(135deg,var(--bg-elev),var(--bg));border-left:3px solid var(--accent,#4aa3ff);">
+      <div class="kpi-label">Currently Sitting At</div>
+      <div class="kpi-value mono" id="live-equity" style="font-size:2.2rem;font-weight:800;letter-spacing:-0.02em;">$0.00</div>
+      <div class="text-dim mono" id="live-equity-sub" style="font-size:0.78rem;">— vs. seeded —</div>
+    </div>
+    <div class="kpi" id="live-kpi-pl">
+      <div class="kpi-label">Total P&amp;L</div>
+      <div class="kpi-value mono" id="live-total-pl" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-total-pl-pct" style="font-size:0.72rem;">0.00%</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Realized</div>
+      <div class="kpi-value mono" id="live-realized" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-realized-sub" style="font-size:0.72rem;">0 closed</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Unrealized</div>
+      <div class="kpi-value mono" id="live-unrealized" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-unrealized-sub" style="font-size:0.72rem;">0 open · marked live</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Win Rate</div>
+      <div class="kpi-value mono" id="live-winrate" style="font-size:1.5rem;font-weight:800;">0%</div>
+      <div class="text-dim mono" id="live-winrate-sub" style="font-size:0.72rem;">0W / 0L</div>
+    </div>
+  </div>
+
+  <!-- Three streams: Decisions · Fills · Console -->
+  <div class="grid" style="grid-template-columns:1.1fr 1fr 1fr;gap:0.75rem;">
+    <!-- Claude decision feed -->
+    <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">Claude decisions</div>
+        <span class="text-dim" id="live-decision-count" style="font-size:0.72rem;">0</span>
+      </div>
+      <div id="live-decision-feed" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.78rem;display:flex;flex-direction:column-reverse;gap:0.35rem;">
+        <div class="text-dim">Decisions will stream here.</div>
+      </div>
+    </div>
+
+    <!-- Fills -->
+    <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">Fills (open / close)</div>
+        <span class="text-dim" id="live-fill-count" style="font-size:0.72rem;">0</span>
+      </div>
+      <div id="live-fill-feed" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.78rem;display:flex;flex-direction:column-reverse;gap:0.35rem;">
+        <div class="text-dim">Buys and sells will appear here.</div>
+      </div>
+    </div>
+
+    <!-- Console / activity log -->
+    <div style="background:#0a0a0a;border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:#888;">Console</div>
+        <span id="live-tick-info" class="mono" style="font-size:0.72rem;color:#aaa;">tick —</span>
+      </div>
+      <div id="live-console" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.74rem;color:#d6d6d6;display:flex;flex-direction:column-reverse;gap:0.2rem;">
+        <div style="color:#666;">Console output will appear here.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
 <!-- POSITIONS LAB                                                   -->
 <!-- ============================================================ -->
 <div class="card mb-4" id="positions-lab">
@@ -559,5 +661,6 @@
 <div id="training-result"></div>
 
 <script src="/static/positions_lab.js?v=2"></script>
+<script src="/static/live_session.js?v=1"></script>
 
 {% endblock %}
