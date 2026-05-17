@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}Wallets — {{ app_name }}{% endblock %}
+{% block topbar %}Wallets{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Wallets</h1>
+    <p>Manage your paper-trading accounts. Each wallet is platform-specific and isolated.</p>
+  </div>
+  <a class="btn btn-primary" href="/wallets/new">+ Add Wallet</a>
+</div>
+
+<div class="grid grid-3">
+  {% for w in wallets %}
+    <div class="card">
+      <div class="flex justify-between items-center mb-2">
+        <div>
+          <div class="card-title">{{ w.name }}</div>
+          <div class="text-muted" style="font-size: 0.8rem;">{{ w.platform }}</div>
+        </div>
+        {% if 'connected' in w.connection_status %}
+          <span class="badge badge-good badge-dot">connected</span>
+        {% else %}
+          <span class="badge badge-warn badge-dot">{{ w.connection_status }}</span>
+        {% endif %}
+      </div>
+
+      <div class="flex justify-between mb-2">
+        <span class="text-muted" style="font-size: 0.8rem;">Paper balance</span>
+        <span class="tnum" style="font-weight: 600;">{{ w.paper_balance | money }}</span>
+      </div>
+      <div class="flex justify-between mb-2">
+        <span class="text-muted" style="font-size: 0.8rem;">Realized P&amp;L</span>
+        <span class="tnum {{ 'text-good' if w.pnl >= 0 else 'text-bad' }}">{{ w.pnl | signed }}</span>
+      </div>
+      <div class="flex justify-between mb-2">
+        <span class="text-muted" style="font-size: 0.8rem;">Risk profile</span>
+        <span class="badge">{{ w.risk_profile }}</span>
+      </div>
+      <div class="flex justify-between mb-3">
+        <span class="text-muted" style="font-size: 0.8rem;">Trades</span>
+        <span class="tnum">{{ w.open_trades }} open · {{ w.closed_trades }} closed</span>
+      </div>
+
+      <div class="flex gap-2">
+        <a class="btn btn-sm" href="/wallets/{{ w.id }}">Open</a>
+        <button class="btn btn-sm" hx-post="/wallets/{{ w.id }}/test" hx-target="#test-{{ w.id }}" hx-swap="innerHTML">Test API</button>
+        <form method="post" action="/wallets/{{ w.id }}/delete" onsubmit="return confirm('Delete wallet {{ w.name }}? This cannot be undone.')" style="margin-left: auto;">
+          <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+        </form>
+      </div>
+      <div id="test-{{ w.id }}" class="mt-2"></div>
+    </div>
+  {% else %}
+    <div class="card empty" style="grid-column: 1 / -1;">
+      No wallets yet. <a href="/wallets/new">Add your first wallet</a> to get started.
+    </div>
+  {% endfor %}
+</div>
+
+{% endblock %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Activity — {{ app_name }}{% endblock %}
+{% block topbar %}Activity Log{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Activity Log</h1>
+    <p>Every wallet, trade, AI session, and configuration change is recorded here.</p>
+  </div>
+</div>
+
+<div class="card mb-3">
+  <form method="get" class="flex items-center gap-3">
+    <div class="field">
+      <label>Category</label>
+      <select class="select" name="category">
+        <option value="">All</option>
+        {% for c in categories %}<option value="{{ c }}" {{ 'selected' if c == current_category else '' }}>{{ c }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Level</label>
+      <select class="select" name="level">
+        <option value="">All</option>
+        {% for l in levels %}<option value="{{ l }}" {{ 'selected' if l == current_level else '' }}>{{ l }}</option>{% endfor %}
+      </select>
+    </div>
+    <div style="margin-top: 1.4rem;">
+      <button class="btn btn-primary" type="submit">Apply</button>
+      <a class="btn" href="/activity">Clear</a>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Time</th><th>Category</th><th>Level</th><th>Message</th></tr></thead>
+      <tbody>
+        {% for log in logs %}
+          <tr>
+            <td class="text-dim mono" style="font-size: 0.78rem;">{{ log.created_at | dt }}</td>
+            <td><span class="badge">{{ log.category }}</span></td>
+            <td>
+              {% if log.level == 'error' %}<span class="badge badge-bad">{{ log.level }}</span>
+              {% elif log.level == 'warn' %}<span class="badge badge-warn">{{ log.level }}</span>
+              {% else %}<span class="badge badge-info">{{ log.level }}</span>{% endif %}
+            </td>
+            <td>{{ log.message }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="4" class="empty">No activity matches your filters.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

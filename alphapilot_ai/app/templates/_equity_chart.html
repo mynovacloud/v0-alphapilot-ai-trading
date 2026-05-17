@@ -1,0 +1,35 @@
+{# Reusable inline SVG line chart for the equity curve.
+   Expects: equity_points = [{date: str, equity: float}, ...]
+#}
+{% if equity_points and equity_points|length > 1 %}
+  {% set vals = equity_points | map(attribute='equity') | list %}
+  {% set min_v = vals | min %}
+  {% set max_v = vals | max %}
+  {% set rng = (max_v - min_v) if (max_v - min_v) > 0 else 1 %}
+  {% set w = 800 %}
+  {% set h = 220 %}
+  {% set pad = 30 %}
+  {% set step = (w - pad * 2) / (equity_points|length - 1) %}
+  {% set points = [] %}
+  {% for p in equity_points %}
+    {% set x = pad + loop.index0 * step %}
+    {% set y = h - pad - ((p.equity - min_v) / rng) * (h - pad * 2) %}
+    {% set _ = points.append((x, y)) %}
+  {% endfor %}
+  <svg class="chart" viewBox="0 0 {{ w }} {{ h }}" preserveAspectRatio="none" style="height: 240px;">
+    <rect class="chart-bg" width="{{ w }}" height="{{ h }}"/>
+    {# horizontal grid lines #}
+    {% for i in range(5) %}
+      <line class="chart-grid" x1="{{ pad }}" x2="{{ w - pad }}" y1="{{ pad + i * (h - pad * 2) / 4 }}" y2="{{ pad + i * (h - pad * 2) / 4 }}" stroke-dasharray="2,4"/>
+    {% endfor %}
+    {# area #}
+    <path class="chart-area" d="M {{ points[0][0] }} {{ h - pad }} {% for px, py in points %}L {{ '%.2f' | format(px) }} {{ '%.2f' | format(py) }} {% endfor %} L {{ points[-1][0] }} {{ h - pad }} Z"/>
+    {# line #}
+    <path class="chart-line" d="M {% for px, py in points %}{{ 'L' if not loop.first else '' }} {{ '%.2f' | format(px) }} {{ '%.2f' | format(py) }} {% endfor %}"/>
+    {# axis labels #}
+    <text class="axis-text" x="{{ pad }}" y="{{ pad - 8 }}">${{ '%.0f' | format(max_v) }}</text>
+    <text class="axis-text" x="{{ pad }}" y="{{ h - pad + 14 }}">${{ '%.0f' | format(min_v) }}</text>
+  </svg>
+{% else %}
+  <div class="empty">Not enough data for a chart yet. Run an AI training session or close some paper trades.</div>
+{% endif %}

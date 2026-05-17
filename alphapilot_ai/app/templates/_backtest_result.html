@@ -1,0 +1,13 @@
+{% if result %}
+<div style="padding: 0.85rem 1rem; border-top: 1px solid var(--border); background: var(--bg-card);">
+  <div class="kpi-grid" style="margin-bottom: 0;">
+    <div class="kpi"><div class="kpi-label">Trades</div><div class="kpi-value tnum">{{ result.total_trades }}</div></div>
+    <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value tnum">{{ (result.win_rate * 100) | round(1) }}%</div></div>
+    <div class="kpi"><div class="kpi-label">Total P&amp;L</div><div class="kpi-value tnum {{ 'text-good' if result.total_pnl >= 0 else 'text-bad' }}">{{ result.total_pnl | signed }}</div></div>
+    <div class="kpi"><div class="kpi-label">Avg Win</div><div class="kpi-value tnum text-good">{{ result.avg_win | money }}</div></div>
+    <div class="kpi"><div class="kpi-label">Avg Loss</div><div class="kpi-value tnum text-bad">{{ result.avg_loss | money }}</div></div>
+    <div class="kpi"><div class="kpi-label">Drawdown</div><div class="kpi-value tnum">{{ (result.drawdown * 100) | round(1) }}%</div></div>
+    <div class="kpi"><div class="kpi-label">Recommendation</div><div class="kpi-value" style="font-size: 0.95rem;"><span class="badge badge-info">{{ result.recommendation }}</span></div></div>
+  </div>
+</div>
+{% endif %}

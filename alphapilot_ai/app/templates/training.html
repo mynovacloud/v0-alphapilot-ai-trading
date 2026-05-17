@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}AI Training Lab — {{ app_name }}{% endblock %}
+{% block topbar %}AI Training Lab{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>AI Training Lab</h1>
+    <p>Run simulated training sessions. The AI makes decisions on mock market snapshots, learns from mistakes, and saves lessons it can apply to future sessions.</p>
+  </div>
+  <form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe all stored AI lessons?')">
+    <button class="btn btn-danger" type="submit">Reset AI Memory</button>
+  </form>
+</div>
+
+<div class="grid grid-2-1 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Configure Session</div></div>
+    <form hx-post="/training/run" hx-target="#training-result" hx-swap="innerHTML" hx-indicator="#train-spinner" class="grid grid-2">
+      <div class="field"><label>Wallet (optional)</label>
+        <select class="select" name="wallet_id"><option value="">— None —</option>{% for w in wallets %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Strategy (optional)</label>
+        <select class="select" name="strategy_id"><option value="">— None —</option>{% for s in strategies %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Market</label>
+        <select class="select" name="market_type">{% for m in market_types %}<option>{{ m }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Risk Level</label>
+        <select class="select" name="risk_level">{% for r in risk_levels %}<option>{{ r }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Number of Trades</label><input class="input" name="num_trades" type="number" min="5" max="500" value="50"></div>
+      <div class="field"><label>Starting Balance</label><input class="input" name="starting_balance" type="number" step="0.01" value="10000"></div>
+      <div style="grid-column: 1 / -1;" class="flex items-center gap-3 mt-2">
+        <button class="btn btn-primary" type="submit">Run Training</button>
+        <span id="train-spinner" class="htmx-indicator"><span class="spinner"></span> <span class="text-muted">simulating...</span></span>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><div class="card-title">Stored Lessons</div><span class="badge">{{ lessons|length }}</span></div>
+    <div class="flex flex-col gap-2" style="max-height: 380px; overflow-y: auto;">
+      {% for l in lessons %}
+        <div style="padding: 0.5rem 0.6rem; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border); font-size: 0.8rem;">
+          <div class="flex justify-between mb-1">
+            <span class="badge badge-info">{{ l.category }}</span>
+            <span class="text-dim" style="font-size: 0.7rem;">w {{ '%.1f' | format(l.weight) }}</span>
+          </div>
+          <div>{{ l.content }}</div>
+        </div>
+      {% else %}
+        <div class="empty">No lessons yet. Run a training session to generate some.</div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<div id="training-result"></div>
+
+{% endblock %}

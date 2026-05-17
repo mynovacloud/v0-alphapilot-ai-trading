@@ -1,0 +1,18 @@
+{# horizontal bar chart. Expects: wallet_pnl = [{label, value}, ...] #}
+{% set max_v = wallet_pnl | map(attribute='value') | map('abs') | max %}
+{% if max_v and max_v > 0 %}
+  <div class="flex flex-col gap-2">
+    {% for row in wallet_pnl %}
+      {% set pct = (row.value | abs) / max_v * 100 %}
+      <div class="flex items-center gap-3">
+        <div style="flex: 0 0 35%; font-size: 0.82rem;">{{ row.label }}</div>
+        <div style="flex: 1; height: 18px; background: var(--bg-elev); border-radius: 4px; position: relative; overflow: hidden;">
+          <div style="height: 100%; width: {{ pct }}%; background: {{ 'var(--good)' if row.value >= 0 else 'var(--bad)' }}; opacity: 0.85; border-radius: 4px;"></div>
+        </div>
+        <div class="tnum {{ 'text-good' if row.value >= 0 else 'text-bad' }}" style="flex: 0 0 90px; text-align: right; font-size: 0.85rem;">{{ row.value | signed }}</div>
+      </div>
+    {% endfor %}
+  </div>
+{% else %}
+  <div class="empty">No data.</div>
+{% endif %}

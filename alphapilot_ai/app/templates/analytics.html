@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Analytics — {{ app_name }}{% endblock %}
+{% block topbar %}Analytics{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Analytics</h1>
+    <p>Portfolio-wide performance breakdown. All numbers are computed live from your paper trade history.</p>
+  </div>
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Profit Factor</div><div class="kpi-value tnum">{{ perf.profit_factor }}</div></div>
+  <div class="kpi"><div class="kpi-label">Sharpe (proxy)</div><div class="kpi-value tnum">{{ perf.sharpe_placeholder }}</div></div>
+  <div class="kpi"><div class="kpi-label">Avg R:R</div><div class="kpi-value tnum">{{ perf.avg_rr }}</div></div>
+  <div class="kpi"><div class="kpi-label">Max DD</div><div class="kpi-value tnum text-bad">{{ (perf.max_drawdown * 100) | round(1) }}%</div></div>
+  <div class="kpi"><div class="kpi-label">Best Win</div><div class="kpi-value tnum text-good">{{ perf.biggest_win | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Worst Loss</div><div class="kpi-value tnum text-bad">{{ perf.biggest_loss | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Win Streak</div><div class="kpi-value tnum">{{ perf.max_consecutive_wins }}</div></div>
+  <div class="kpi"><div class="kpi-label">Loss Streak</div><div class="kpi-value tnum">{{ perf.max_consecutive_losses }}</div></div>
+  <div class="kpi"><div class="kpi-label">Avg Duration</div><div class="kpi-value tnum">{{ perf.avg_trade_duration_hours }}h</div></div>
+</div>
+
+<div class="grid grid-2-1 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Equity Curve</div></div>
+    {% include "_equity_chart.html" %}
+  </div>
+  <div class="card">
+    <div class="card-header"><div class="card-title">Period P&amp;L</div></div>
+    <div class="flex flex-col gap-3">
+      <div class="flex justify-between"><span class="text-muted">Daily</span><span class="tnum {{ 'text-good' if summary.daily_pnl >= 0 else 'text-bad' }}">{{ summary.daily_pnl | signed }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Weekly</span><span class="tnum {{ 'text-good' if summary.weekly_pnl >= 0 else 'text-bad' }}">{{ summary.weekly_pnl | signed }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Monthly</span><span class="tnum {{ 'text-good' if summary.monthly_pnl >= 0 else 'text-bad' }}">{{ summary.monthly_pnl | signed }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">YTD</span><span class="tnum {{ 'text-good' if summary.ytd_pnl >= 0 else 'text-bad' }}">{{ summary.ytd_pnl | signed }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Total</span><span class="tnum {{ 'text-good' if summary.total_pnl >= 0 else 'text-bad' }}">{{ summary.total_pnl | signed }}</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="grid grid-2 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">P&amp;L by Wallet</div></div>
+    {% if wallet_pnl %}{% include "_bar_chart.html" with context %}{% else %}<div class="empty">No data.</div>{% endif %}
+  </div>
+  <div class="card">
+    <div class="card-header"><div class="card-title">P&amp;L by Strategy</div></div>
+    {% with wallet_pnl = strategy_pnl %}{% if wallet_pnl %}{% include "_bar_chart.html" %}{% else %}<div class="empty">No data.</div>{% endif %}{% endwith %}
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><div class="card-title">P&amp;L Distribution</div></div>
+  {% set max_h = histogram | max %}
+  {% if max_h and max_h > 0 %}
+    <div class="flex items-end gap-1" style="height: 160px; padding: 0.5rem;">
+      {% for v in histogram %}
+        <div style="flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; gap: 0.3rem;">
+          <div style="width: 100%; height: {{ ((v / max_h) * 140) | round(0) }}px; background: var(--accent); border-radius: 3px; opacity: 0.85;"></div>
+          <div class="text-dim" style="font-size: 0.7rem;">{{ v }}</div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="text-dim text-center mt-2" style="font-size: 0.75rem;">Buckets from worst loss → best win</div>
+  {% else %}
+    <div class="empty">Not enough closed trades to plot.</div>
+  {% endif %}
+</div>
+
+{% endblock %}

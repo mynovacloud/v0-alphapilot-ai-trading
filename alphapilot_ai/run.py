@@ -1,18 +1,14 @@
+"""AlphaPilot AI — one-command launcher.
+
+No Streamlit, no two processes. Just runs the unified FastAPI server
+that serves both the HTML web UI and the JSON API on one port.
+
+Usage:
+    python run.py
 """
-AlphaPilot AI - One-click launcher.
-
-Just run:   python run.py
-
-This starts the backend API and the Streamlit UI together,
-initializes the database, seeds demo data, and opens your browser.
-Press Ctrl+C once to shut everything down cleanly.
-"""
-
 from __future__ import annotations
 
-import atexit
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -24,9 +20,8 @@ ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
 sys.path.insert(0, str(ROOT))
 
-API_HOST = "127.0.0.1"
-API_PORT = 8000
-UI_PORT = 8501
+HOST = "127.0.0.1"
+PORT = 8000
 
 
 def _banner(msg: str) -> None:
@@ -40,63 +35,22 @@ def _check_python() -> None:
         sys.exit(1)
 
 
-def _pip_install(args: list[str]) -> None:
-    cmd = [sys.executable, "-m", "pip", "install", *args]
-    try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as e:
-        print("ERROR: pip install failed:", e)
-        sys.exit(1)
-
-
 def _ensure_dependencies() -> None:
-    """Install requirements.txt if any required package is missing or broken."""
-    required = [
-        "streamlit",
-        "fastapi",
-        "uvicorn",
-        "sqlalchemy",
-        "pydantic",
-        "pandas",
-        "numpy",
-        "plotly",
-        "httpx",
-    ]
-    missing: list[str] = []
-    broken: list[str] = []
+    required = ["fastapi", "uvicorn", "jinja2", "sqlalchemy", "pydantic", "pandas", "numpy", "httpx"]
+    missing = []
     for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
             missing.append(pkg)
-        except Exception:
-            # e.g. a half-installed/corrupted package raising at import time
-            broken.append(pkg)
-
     if missing:
         _banner(f"Installing missing packages: {', '.join(missing)}")
-        req_file = ROOT / "requirements.txt"
-        _pip_install(["-q", "-r", str(req_file)])
-
-    if broken:
-        _banner(f"Repairing broken packages: {', '.join(broken)}")
-        # force a clean reinstall of just the broken ones
-        _pip_install(["--force-reinstall", "--no-deps", *broken])
-        req_file = ROOT / "requirements.txt"
-        _pip_install(["-q", "-r", str(req_file)])
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-q", "-r", str(ROOT / "requirements.txt")]
+        )
 
 
-def _init_database() -> None:
-    from database.db import init_db
-    from database.seed import seed_if_empty
-
-    _banner("Initializing database")
-    init_db()
-    seed_if_empty()
-    print("  Database ready at data/alphapilot.db")
-
-
-def _wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
+def _wait_for_port(host: str, port: int, timeout: float = 25.0) -> bool:
     start = time.time()
     while time.time() - start < timeout:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -112,82 +66,40 @@ def _wait_for_port(host: str, port: int, timeout: float = 20.0) -> bool:
 def main() -> None:
     _check_python()
     _ensure_dependencies()
-    _init_database()
 
     env = os.environ.copy()
     env["PYTHONPATH"] = str(ROOT)
-    env["ALPHAPILOT_API_URL"] = f"http://{API_HOST}:{API_PORT}"
 
-    procs: list[subprocess.Popen] = []
-
-    def cleanup() -> None:
-        for p in procs:
-            if p.poll() is None:
-                try:
-                    if os.name == "nt":
-                        p.send_signal(signal.CTRL_BREAK_EVENT)
-                    else:
-                        p.terminate()
-                except Exception:
-                    pass
-        for p in procs:
-            try:
-                p.wait(timeout=5)
-            except Exception:
-                p.kill()
-
-    atexit.register(cleanup)
-
-    popen_kwargs = {"env": env, "cwd": str(ROOT)}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
-
-    _banner(f"Starting backend API on http://{API_HOST}:{API_PORT}")
-    api_cmd = [
+    _banner(f"Starting AlphaPilot AI on http://{HOST}:{PORT}")
+    cmd = [
         sys.executable, "-m", "uvicorn",
-        "backend.api:app",
-        "--host", API_HOST,
-        "--port", str(API_PORT),
-        "--log-level", "warning",
+        "app.main:app",
+        "--host", HOST,
+        "--port", str(PORT),
+        "--log-level", "info",
     ]
-    procs.append(subprocess.Popen(api_cmd, **popen_kwargs))
+    proc = subprocess.Popen(cmd, env=env, cwd=str(ROOT))
 
-    if not _wait_for_port(API_HOST, API_PORT, timeout=25):
-        print("ERROR: Backend API failed to start.")
-        cleanup()
-        sys.exit(1)
-    print("  Backend ready.  Docs: http://%s:%d/docs" % (API_HOST, API_PORT))
-
-    _banner(f"Starting UI on http://localhost:{UI_PORT}")
-    ui_cmd = [
-        sys.executable, "-m", "streamlit", "run",
-        str(ROOT / "app" / "streamlit_app.py"),
-        "--server.port", str(UI_PORT),
-        "--server.headless", "true",
-        "--browser.gatherUsageStats", "false",
-    ]
-    procs.append(subprocess.Popen(ui_cmd, **popen_kwargs))
-
-    if _wait_for_port("127.0.0.1", UI_PORT, timeout=30):
-        url = f"http://localhost:{UI_PORT}"
-        print(f"  UI ready.  Opening {url} ...")
-        try:
-            webbrowser.open(url)
-        except Exception:
-            pass
-    else:
-        print("  UI did not respond in time. You can still try http://localhost:%d" % UI_PORT)
-
-    _banner("AlphaPilot AI is running. Press Ctrl+C to stop.")
     try:
-        while True:
-            for p in procs:
-                if p.poll() is not None:
-                    print("\nA process exited unexpectedly. Shutting down...")
-                    return
-            time.sleep(1)
+        if _wait_for_port(HOST, PORT, timeout=25):
+            url = f"http://{HOST}:{PORT}"
+            print(f"  Ready. Opening {url} ...")
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+        else:
+            print(f"  Server did not respond in time. Try {url} manually.")
+
+        _banner("AlphaPilot AI is running. Press Ctrl+C to stop.")
+        proc.wait()
     except KeyboardInterrupt:
         print("\nShutting down...")
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
 
 
 if __name__ == "__main__":

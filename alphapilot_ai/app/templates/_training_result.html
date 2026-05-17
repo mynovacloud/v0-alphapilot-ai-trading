@@ -1,0 +1,59 @@
+{% if result %}
+<div class="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Starting</div><div class="kpi-value tnum">{{ result.starting_balance | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Ending</div><div class="kpi-value tnum">{{ result.ending_balance | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">P&amp;L</div><div class="kpi-value tnum {{ 'text-good' if result.pnl >= 0 else 'text-bad' }}">{{ result.pnl | signed }}</div></div>
+  <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value tnum">{{ (result.win_rate * 100) | round(1) }}%</div><div class="kpi-sub">{{ result.wins }}W / {{ result.losses }}L</div></div>
+  <div class="kpi"><div class="kpi-label">Avg Confidence</div><div class="kpi-value tnum">{{ (result.avg_confidence * 100) | round(0) }}%</div></div>
+  <div class="kpi"><div class="kpi-label">Max Drawdown</div><div class="kpi-value tnum text-bad">{{ (result.max_drawdown * 100) | round(1) }}%</div></div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">Equity Curve</div><span class="badge">{{ result.trades }} trades</span></div>
+  {% if equity and equity|length > 1 %}
+    {% set min_v = equity | min %}
+    {% set max_v = equity | max %}
+    {% set rng = (max_v - min_v) if (max_v - min_v) > 0 else 1 %}
+    {% set w = 800 %}{% set h = 220 %}{% set pad = 30 %}
+    {% set step = (w - pad * 2) / (equity|length - 1) %}
+    <svg class="chart" viewBox="0 0 {{ w }} {{ h }}" style="height: 240px;">
+      {% for i in range(5) %}<line class="chart-grid" x1="{{ pad }}" x2="{{ w - pad }}" y1="{{ pad + i * (h - pad * 2) / 4 }}" y2="{{ pad + i * (h - pad * 2) / 4 }}" stroke-dasharray="2,4"/>{% endfor %}
+      <path class="chart-line" d="{% for v in equity %}{% set x = pad + loop.index0 * step %}{% set y = h - pad - ((v - min_v) / rng) * (h - pad * 2) %}{{ 'M' if loop.first else 'L' }} {{ '%.2f' | format(x) }} {{ '%.2f' | format(y) }} {% endfor %}"/>
+      <text class="axis-text" x="{{ pad }}" y="{{ pad - 8 }}">${{ '%.0f' | format(max_v) }}</text>
+      <text class="axis-text" x="{{ pad }}" y="{{ h - pad + 14 }}">${{ '%.0f' | format(min_v) }}</text>
+    </svg>
+  {% endif %}
+</div>
+
+<div class="grid grid-2">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Lessons Learned This Session</div></div>
+    {% if result.lessons %}
+      <ul style="margin: 0; padding-left: 1rem; font-size: 0.86rem;">
+        {% for l in result.lessons %}<li class="mb-1">{{ l }}</li>{% endfor %}
+      </ul>
+    {% else %}
+      <div class="empty">No new lessons identified.</div>
+    {% endif %}
+  </div>
+  <div class="card">
+    <div class="card-header"><div class="card-title">Last 10 Decisions</div></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>#</th><th>Symbol</th><th>Side</th><th class="num">Conf</th><th class="num">P&amp;L</th></tr></thead>
+        <tbody>
+          {% for d in result.decisions[-10:] %}
+            <tr>
+              <td class="text-dim">{{ d.i }}</td>
+              <td class="mono">{{ d.symbol }}</td>
+              <td>{% if d.side == 'BUY' %}<span class="badge badge-good">BUY</span>{% elif d.side == 'SELL' %}<span class="badge badge-bad">SELL</span>{% else %}<span class="badge">{{ d.side }}</span>{% endif %}</td>
+              <td class="num tnum">{{ (d.confidence * 100) | round(0) }}%</td>
+              <td class="num tnum {{ 'text-good' if d.pnl > 0 else ('text-bad' if d.pnl < 0 else 'text-muted') }}">{{ d.pnl | signed }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endif %}

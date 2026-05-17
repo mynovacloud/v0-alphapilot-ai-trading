@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block title %}Add Wallet — {{ app_name }}{% endblock %}
+{% block topbar %}Add Wallet{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Add a wallet</h1>
+    <p>Wallets are paper-trading accounts. API keys are stored locally as placeholders for future live integration — they are never used to place real trades.</p>
+  </div>
+  <a class="btn" href="/wallets">Cancel</a>
+</div>
+
+<div class="banner banner-warn">
+  Live trading is locked. Any keys you enter here are saved as placeholders only and will not be used until live trading is explicitly enabled.
+</div>
+
+<form method="post" action="/wallets/new" class="panel">
+  <div class="form-grid">
+    <div class="field">
+      <label>Wallet Name</label>
+      <input class="input" name="name" required placeholder="e.g. Crypto.com Spot">
+    </div>
+    <div class="field">
+      <label>Platform</label>
+      <select class="select" name="platform" required>
+        {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Initial Paper Balance</label>
+      <input class="input" name="paper_balance" type="number" step="0.01" value="10000.00">
+      <small>Virtual cash for simulated trades.</small>
+    </div>
+    <div class="field">
+      <label>Risk Profile</label>
+      <select class="select" name="risk_profile">
+        {% for r in risk_profiles %}<option value="{{ r }}">{{ r }}</option>{% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Sandbox Mode</label>
+      <select class="select" name="sandbox_mode">
+        <option value="on" selected>On</option>
+        <option value="off">Off</option>
+      </select>
+      <small>Forces all connectors into mocked behavior.</small>
+    </div>
+  </div>
+
+  <h3 class="mt-4 mb-2">API Credentials (optional, placeholder only)</h3>
+  <div class="form-grid">
+    <div class="field"><label>API Key</label><input class="input" name="api_key" type="password" autocomplete="off"></div>
+    <div class="field"><label>API Secret</label><input class="input" name="api_secret" type="password" autocomplete="off"></div>
+    <div class="field"><label>Passphrase</label><input class="input" name="api_passphrase" type="password" autocomplete="off"></div>
+    <div class="field"><label>Account ID</label><input class="input" name="account_id"></div>
+  </div>
+
+  <div class="flex gap-2 mt-4">
+    <button class="btn btn-primary" type="submit">Create Wallet</button>
+    <a class="btn" href="/wallets">Cancel</a>
+  </div>
+</form>
+
+{% endblock %}

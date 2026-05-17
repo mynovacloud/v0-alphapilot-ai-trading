@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}Strategies — {{ app_name }}{% endblock %}
+{% block topbar %}Strategies{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Strategies</h1>
+    <p>Define risk caps, signal types, and execution rules. The AI engine uses these when running training sessions and when validating live decisions.</p>
+  </div>
+</div>
+
+<div class="grid grid-2-1">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Your Strategies</div></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Name</th><th>Type</th><th>Market</th><th>Risk</th><th class="num">Max Pos</th><th class="num">Stop / Take</th><th class="num">Min Conf</th><th class="num">Total P&amp;L</th><th></th></tr></thead>
+        <tbody>
+          {% for s in strategies %}
+            <tr>
+              <td><strong>{{ s.name }}</strong>{% if s.description %}<div class="text-dim" style="font-size:0.75rem;">{{ s.description }}</div>{% endif %}</td>
+              <td class="text-muted">{{ s.strategy_type }}</td>
+              <td class="text-muted">{{ s.market_type }}</td>
+              <td><span class="badge">{{ s.risk_level }}</span></td>
+              <td class="num tnum">{{ s.max_position_size | money }}</td>
+              <td class="num tnum">{{ (s.stop_loss_pct * 100) | round(1) }}% / {{ (s.take_profit_pct * 100) | round(1) }}%</td>
+              <td class="num tnum">{{ (s.min_confidence * 100) | round(0) }}%</td>
+              <td class="num tnum {{ 'text-good' if s.pnl >= 0 else 'text-bad' }}">{{ s.pnl | signed }}</td>
+              <td class="flex gap-1">
+                <button class="btn btn-sm" hx-post="/strategies/{{ s.id }}/backtest" hx-vals='{"n_trades": 200}' hx-target="#bt-{{ s.id }}" hx-swap="innerHTML" hx-indicator="#bt-spin-{{ s.id }}">Backtest</button>
+                <form method="post" action="/strategies/{{ s.id }}/delete" onsubmit="return confirm('Delete strategy?')">
+                  <button class="btn btn-sm btn-danger" type="submit">Delete</button>
+                </form>
+              </td>
+            </tr>
+            <tr>
+              <td colspan="9" style="background: var(--bg-elev); padding: 0;">
+                <span id="bt-spin-{{ s.id }}" class="htmx-indicator" style="padding: 0.5rem 0.75rem; display: inline-flex; align-items: center; gap: 0.4rem;"><span class="spinner"></span> Running backtest...</span>
+                <div id="bt-{{ s.id }}"></div>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="9" class="empty">No strategies yet. Create one on the right.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><div class="card-title">New Strategy</div></div>
+    <form method="post" action="/strategies/new" class="flex flex-col gap-3">
+      <div class="field"><label>Name</label><input class="input" name="name" required></div>
+      <div class="field"><label>Description</label><textarea name="description"></textarea></div>
+      <div class="field"><label>Strategy Type</label>
+        <select class="select" name="strategy_type">{% for t in strategy_types %}<option>{{ t }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Market</label>
+        <select class="select" name="market_type">{% for m in market_types %}<option>{{ m }}</option>{% endfor %}</select>
+      </div>
+      <div class="field"><label>Risk Level</label>
+        <select class="select" name="risk_level">{% for r in risk_levels %}<option>{{ r }}</option>{% endfor %}</select>
+      </div>
+      <div class="grid grid-2">
+        <div class="field"><label>Max Position $</label><input class="input" name="max_position_size" type="number" step="0.01" value="1000"></div>
+        <div class="field"><label>Max Daily Loss $</label><input class="input" name="max_daily_loss" type="number" step="0.01" value="500"></div>
+        <div class="field"><label>Stop Loss %</label><input class="input" name="stop_loss_pct" type="number" step="0.01" value="0.05"></div>
+        <div class="field"><label>Take Profit %</label><input class="input" name="take_profit_pct" type="number" step="0.01" value="0.10"></div>
+        <div class="field"><label>Min Confidence</label><input class="input" name="min_confidence" type="number" step="0.05" min="0" max="1" value="0.6"></div>
+        <div class="field"><label>Max Open Trades</label><input class="input" name="max_open_trades" type="number" value="5"></div>
+      </div>
+      <button class="btn btn-primary" type="submit">Create Strategy</button>
+    </form>
+  </div>
+</div>
+
+{% endblock %}

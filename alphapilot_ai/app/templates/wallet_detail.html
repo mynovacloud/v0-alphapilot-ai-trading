@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block title %}{{ wallet.name }} — {{ app_name }}{% endblock %}
+{% block topbar %}{{ wallet.name }}{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>{{ wallet.name }}</h1>
+    <p>{{ wallet.platform }} · {{ wallet.risk_profile }} · created {{ wallet.created_at | dt }}</p>
+  </div>
+  <div class="flex gap-2">
+    <a class="btn" href="/wallets">← Back</a>
+    <button class="btn" hx-post="/wallets/{{ wallet.id }}/test" hx-target="#test-result" hx-swap="innerHTML">Test API</button>
+    <form method="post" action="/wallets/{{ wallet.id }}/delete" onsubmit="return confirm('Delete wallet?')">
+      <button class="btn btn-danger" type="submit">Delete</button>
+    </form>
+  </div>
+</div>
+
+<div id="test-result" class="mb-3"></div>
+
+<div class="kpi-grid">
+  <div class="kpi"><div class="kpi-label">Paper Balance</div><div class="kpi-value tnum">{{ wallet.paper_balance | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Total P&amp;L</div><div class="kpi-value tnum {{ 'text-good' if total_pnl >= 0 else 'text-bad' }}">{{ total_pnl | signed }}</div></div>
+  <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value tnum">{{ win_rate | pct }}</div><div class="kpi-sub">{{ wins }} wins · {{ closed_count }} closed</div></div>
+  <div class="kpi"><div class="kpi-label">Open Trades</div><div class="kpi-value tnum">{{ open_count }}</div></div>
+  <div class="kpi"><div class="kpi-label">Connection</div><div class="kpi-value" style="font-size:0.95rem;"><span class="badge badge-good badge-dot">{{ wallet.connection_status }}</span></div></div>
+  <div class="kpi"><div class="kpi-label">Sandbox</div><div class="kpi-value" style="font-size:0.95rem;"><span class="badge {{ 'badge-good' if wallet.sandbox_mode else 'badge-warn' }}">{{ 'Yes' if wallet.sandbox_mode else 'No' }}</span></div></div>
+</div>
+
+<div class="grid grid-2-1 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Trades</div></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Exit</th><th class="num">P&amp;L</th><th class="num">Confidence</th><th>Status</th><th>Opened</th><th></th></tr></thead>
+        <tbody>
+          {% for t in trades %}
+            <tr>
+              <td class="mono">{{ t.symbol }}</td>
+              <td>{% if t.side == 'BUY' %}<span class="badge badge-good">BUY</span>{% else %}<span class="badge badge-bad">SELL</span>{% endif %}</td>
+              <td class="num tnum">{{ '%.4f' | format(t.qty) }}</td>
+              <td class="num tnum">{{ t.entry_price | money }}</td>
+              <td class="num tnum">{{ t.exit_price | money if t.exit_price else '—' }}</td>
+              <td class="num tnum {{ 'text-good' if t.realized_pnl > 0 else ('text-bad' if t.realized_pnl < 0 else 'text-muted') }}">{{ t.realized_pnl | signed if t.status == 'closed' else '—' }}</td>
+              <td class="num tnum">{{ t.confidence | pct(0) }}</td>
+              <td>{% if t.status == 'open' %}<span class="badge badge-info">open</span>{% else %}<span class="badge">{{ t.status }}</span>{% endif %}</td>
+              <td class="text-muted" style="font-size: 0.78rem;">{{ t.opened_at | dt }}</td>
+              <td>
+                {% if t.status == 'open' %}
+                  <form method="post" action="/trades/{{ t.id }}/close" class="flex gap-1">
+                    <input class="input" name="exit_price" type="number" step="0.01" value="{{ '%.2f' | format(t.entry_price) }}" style="width: 90px; padding: 0.3rem 0.4rem; font-size: 0.78rem;">
+                    <button class="btn btn-sm" type="submit">Close</button>
+                  </form>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="10" class="empty">No trades yet for this wallet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><div class="card-title">Open Paper Trade</div></div>
+    <form method="post" action="/wallets/{{ wallet.id }}/trade" class="flex flex-col gap-3">
+      <div class="field"><label>Symbol</label><input class="input" name="symbol" required placeholder="BTC-USD"></div>
+      <div class="field">
+        <label>Side</label>
+        <select class="select" name="side"><option>BUY</option><option>SELL</option></select>
+      </div>
+      <div class="field"><label>Quantity</label><input class="input" name="qty" type="number" step="0.0001" required value="1"></div>
+      <div class="field"><label>Entry Price</label><input class="input" name="entry_price" type="number" step="0.01" required value="100"></div>
+      <div class="field"><label>Confidence (0–1)</label><input class="input" name="confidence" type="number" step="0.01" min="0" max="1" value="0.7"></div>
+      <div class="field">
+        <label>Strategy (optional)</label>
+        <select class="select" name="strategy_id">
+          <option value="">— None —</option>
+          {% for s in strategies %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}
+        </select>
+      </div>
+      <button class="btn btn-primary" type="submit">Open Trade</button>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><div class="card-title">Open Positions</div></div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Avg Entry</th><th class="num">Current</th><th class="num">Unrealized</th></tr></thead>
+      <tbody>
+        {% for p in positions %}
+          <tr>
+            <td class="mono">{{ p.symbol }}</td>
+            <td class="num tnum">{{ '%.4f' | format(p.qty) }}</td>
+            <td class="num tnum">{{ p.avg_entry | money }}</td>
+            <td class="num tnum">{{ p.current_price | money }}</td>
+            <td class="num tnum {{ 'text-good' if p.unrealized_pnl >= 0 else 'text-bad' }}">{{ p.unrealized_pnl | signed }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="5" class="empty">No open positions.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% endblock %}

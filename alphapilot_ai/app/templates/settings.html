@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Settings — {{ app_name }}{% endblock %}
+{% block topbar %}Settings{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>Settings</h1>
+    <p>Application preferences and runtime status. Live trading is locked at the environment level for safety.</p>
+  </div>
+</div>
+
+<div class="grid grid-2-1 mb-4">
+  <form method="post" action="/settings/save" class="card">
+    <div class="card-header"><div class="card-title">Preferences</div></div>
+    <div class="form-grid">
+      <div class="field"><label>Theme</label>
+        <select class="select" name="theme"><option value="dark" {{ 'selected' if prefs.theme == 'dark' else '' }}>Dark</option><option value="light" {{ 'selected' if prefs.theme == 'light' else '' }}>Light (coming soon)</option></select>
+      </div>
+      <div class="field"><label>Default Risk Profile</label>
+        <select class="select" name="default_risk">
+          {% for r in ['Conservative', 'Moderate', 'Aggressive', 'Degenerate'] %}
+            <option value="{{ r }}" {{ 'selected' if prefs.default_risk == r else '' }}>{{ r }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field"><label>Default Market</label>
+        <select class="select" name="default_market">
+          {% for m in ['Crypto', 'Stocks', 'Prediction Markets'] %}
+            <option value="{{ m }}" {{ 'selected' if prefs.default_market == m else '' }}>{{ m }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="field"><label>Max Concurrent Trades</label><input class="input" name="max_concurrent_trades" type="number" value="{{ prefs.max_concurrent_trades }}"></div>
+      <div class="field"><label>Default Position Size</label><input class="input" name="default_position_size" type="number" step="0.01" value="{{ prefs.default_position_size }}"></div>
+    </div>
+    <button class="btn btn-primary mt-3" type="submit">Save Preferences</button>
+  </form>
+
+  <div class="card">
+    <div class="card-header"><div class="card-title">Runtime</div></div>
+    <div class="flex flex-col gap-2" style="font-size: 0.86rem;">
+      <div class="flex justify-between"><span class="text-muted">App</span><span>{{ settings.app_name }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Environment</span><span>{{ settings.app_env }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Debug</span><span>{{ 'on' if settings.debug else 'off' }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Database</span><span class="mono" style="font-size: 0.78rem;">{{ settings.database_url }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">API Port</span><span class="mono">{{ settings.api_port }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Live Trading</span>{% if settings.live_trading_enabled %}<span class="badge badge-bad">enabled</span>{% else %}<span class="badge badge-good">locked</span>{% endif %}</div>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><div class="card-title">Safety</div></div>
+  <div class="banner banner-warn">
+    Live trading is intentionally disabled. To enable it you must set <span class="mono">LIVE_TRADING_ENABLED=true</span> in your <span class="mono">.env</span> file and restart the server. Even then, no real-API trade execution code is wired up.
+  </div>
+  <p class="text-muted">All API credentials are stored as encrypted-at-rest placeholders. Replace the placeholder columns in <span class="mono">api_credentials_placeholder</span> with real encrypted storage (e.g. <span class="mono">cryptography.fernet</span> or an OS keychain) before going live.</p>
+</div>
+
+{% endblock %}

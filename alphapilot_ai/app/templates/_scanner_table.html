@@ -1,0 +1,49 @@
+{% if opportunities %}
+<div class="card">
+  <div class="card-header"><div class="card-title">Results — {{ opportunities|length }} opportunities</div></div>
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th>Platform</th>
+          <th>Symbol</th>
+          <th>Market</th>
+          <th class="num">Price</th>
+          <th class="num">AI Prob</th>
+          <th class="num">Mkt Prob</th>
+          <th class="num">Edge</th>
+          <th class="num">Conf</th>
+          <th class="num">Liq</th>
+          <th class="num">Vol</th>
+          <th>Risk</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for o in opportunities %}
+          <tr>
+            <td class="text-muted">{{ o.platform }}</td>
+            <td class="mono">{{ o.symbol }}</td>
+            <td class="text-muted">{{ o.market_type }}</td>
+            <td class="num tnum">{{ '%.2f' | format(o.current_price) }}</td>
+            <td class="num tnum">{{ (o.ai_probability * 100) | round(1) }}%</td>
+            <td class="num tnum">{{ (o.market_probability * 100) | round(1) }}%</td>
+            <td class="num tnum {{ 'text-good' if o.edge_pct > 0 else 'text-bad' }}">{{ '+' if o.edge_pct >= 0 else '' }}{{ (o.edge_pct * 100) | round(1) }}%</td>
+            <td class="num tnum">{{ (o.confidence * 100) | round(0) }}%</td>
+            <td class="num tnum">{{ (o.liquidity * 100) | round(0) }}%</td>
+            <td class="num tnum">{{ (o.volatility * 100) | round(0) }}%</td>
+            <td>
+              {% if o.risk_rating == 'High' %}<span class="badge badge-bad">{{ o.risk_rating }}</span>
+              {% elif o.risk_rating == 'Medium' %}<span class="badge badge-warn">{{ o.risk_rating }}</span>
+              {% else %}<span class="badge badge-good">{{ o.risk_rating }}</span>{% endif %}
+            </td>
+            <td><span class="badge badge-info">{{ o.suggested_action }}</span></td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="card empty">Click <strong>Run Scan</strong> to generate market opportunities.</div>
+{% endif %}

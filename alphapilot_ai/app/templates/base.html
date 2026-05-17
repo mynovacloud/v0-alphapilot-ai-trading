@@ -1,0 +1,53 @@
+{% set nav_items = [
+  ('dashboard', '/', 'Dashboard'),
+  ('wallets', '/wallets', 'Wallets'),
+  ('scanner', '/scanner', 'Market Scanner'),
+  ('strategies', '/strategies', 'Strategies'),
+  ('training', '/training', 'AI Training'),
+  ('analytics', '/analytics', 'Analytics'),
+  ('activity', '/activity', 'Activity'),
+  ('settings', '/settings', 'Settings'),
+] %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ app_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+</head>
+<body>
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-name">{{ app_name }}</div>
+        <div class="brand-tag">Paper Trading</div>
+      </div>
+      <nav class="nav">
+        {% for key, href, label in nav_items %}
+          <a href="{{ href }}" class="{{ 'active' if active == key else '' }}">{{ label }}</a>
+        {% endfor %}
+      </nav>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <div class="topbar-title">{% block topbar %}{% endblock %}</div>
+        <div class="topbar-actions">
+          {% if live_trading_enabled %}
+            <span class="badge badge-bad badge-dot">Live trading: ENABLED</span>
+          {% else %}
+            <span class="badge badge-good badge-dot">Paper mode</span>
+          {% endif %}
+        </div>
+      </div>
+      <div class="container">
+        {% block content %}{% endblock %}
+      </div>
+    </main>
+  </div>
+</body>
+</html>

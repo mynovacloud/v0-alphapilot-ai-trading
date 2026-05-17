@@ -1,0 +1,161 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — {{ app_name }}{% endblock %}
+{% block topbar %}Dashboard{% endblock %}
+{% block content %}
+
+<div class="banner banner-info">
+  Paper trading mode is active. All trades are simulated against mock market data — no real funds are at risk.
+</div>
+
+<div class="kpi-grid">
+  <div class="kpi">
+    <div class="kpi-label">Total Portfolio Value</div>
+    <div class="kpi-value tnum">{{ summary.total_portfolio_value | money }}</div>
+    <div class="kpi-sub">Across {{ summary.active_wallets }} wallet{{ '' if summary.active_wallets == 1 else 's' }}</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Realized P&amp;L</div>
+    <div class="kpi-value tnum {{ 'text-good' if summary.total_pnl >= 0 else 'text-bad' }}">{{ summary.total_pnl | signed }}</div>
+    <div class="kpi-sub">{{ summary.total_trades }} closed trades</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Unrealized P&amp;L</div>
+    <div class="kpi-value tnum {{ 'text-good' if summary.unrealized_pnl >= 0 else 'text-bad' }}">{{ summary.unrealized_pnl | signed }}</div>
+    <div class="kpi-sub">{{ summary.open_positions }} open positions</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Win Rate</div>
+    <div class="kpi-value tnum">{{ summary.win_rate | pct }}</div>
+    <div class="kpi-sub">{{ summary.wins }}W / {{ summary.losses }}L</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">AI Confidence</div>
+    <div class="kpi-value tnum">{{ summary.ai_confidence | pct }}</div>
+    <div class="kpi-sub">avg of recent decisions</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">Max Drawdown</div>
+    <div class="kpi-value tnum text-bad">{{ summary.drawdown | pct }}</div>
+    <div class="kpi-sub">profit factor {{ perf.profit_factor }}</div>
+  </div>
+</div>
+
+<div class="grid grid-2-1 mb-4">
+  <div class="card">
+    <div class="card-header">
+      <div>
+        <div class="card-title">Equity Curve</div>
+        <div class="card-sub">Cumulative realized P&amp;L over time</div>
+      </div>
+      <div class="flex gap-2">
+        <span class="badge">Daily {{ summary.daily_pnl | signed }}</span>
+        <span class="badge">Weekly {{ summary.weekly_pnl | signed }}</span>
+        <span class="badge">Monthly {{ summary.monthly_pnl | signed }}</span>
+      </div>
+    </div>
+    {% include "_equity_chart.html" %}
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Highlights</div>
+    </div>
+    <div class="flex flex-col gap-3">
+      <div>
+        <div class="kpi-label">Best Wallet</div>
+        {% if summary.best_wallet %}
+          <div class="text-good tnum">{{ summary.best_wallet.pnl | signed }}</div>
+          <div class="text-muted">{{ summary.best_wallet.name }}</div>
+        {% else %}<div class="text-dim">No closed trades yet.</div>{% endif %}
+      </div>
+      <div>
+        <div class="kpi-label">Worst Wallet</div>
+        {% if summary.worst_wallet %}
+          <div class="text-bad tnum">{{ summary.worst_wallet.pnl | signed }}</div>
+          <div class="text-muted">{{ summary.worst_wallet.name }}</div>
+        {% else %}<div class="text-dim">—</div>{% endif %}
+      </div>
+      <div>
+        <div class="kpi-label">Best Strategy</div>
+        {% if summary.best_strategy %}
+          <div class="text-good tnum">{{ summary.best_strategy.pnl | signed }}</div>
+          <div class="text-muted">{{ summary.best_strategy.name }}</div>
+        {% else %}<div class="text-dim">—</div>{% endif %}
+      </div>
+      <div>
+        <div class="kpi-label">Profit Factor</div>
+        <div class="tnum">{{ perf.profit_factor }}</div>
+        <div class="text-muted">avg win {{ perf.avg_win | money }} · avg loss {{ perf.avg_loss | money }}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="grid grid-2 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Wallets</div><a class="btn btn-sm" href="/wallets">View all</a></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Name</th><th>Platform</th><th class="num">Paper Balance</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for w in wallets[:6] %}
+            <tr>
+              <td><a href="/wallets/{{ w.id }}">{{ w.name }}</a></td>
+              <td class="text-muted">{{ w.platform }}</td>
+              <td class="num tnum">{{ w.paper_balance | money }}</td>
+              <td>
+                {% if 'connected' in w.connection_status %}
+                  <span class="badge badge-good badge-dot">{{ w.connection_status }}</span>
+                {% else %}
+                  <span class="badge badge-warn badge-dot">{{ w.connection_status }}</span>
+                {% endif %}
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="4" class="empty">No wallets yet — <a href="/wallets/new">add one</a>.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header"><div class="card-title">Recent Trades</div><a class="btn btn-sm" href="/wallets">View all</a></div>
+    <div class="table-wrap">
+      <table class="table">
+        <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">P&amp;L</th><th>Status</th></tr></thead>
+        <tbody>
+          {% for t in recent_trades %}
+            <tr>
+              <td class="mono">{{ t.symbol }}</td>
+              <td>{% if t.side == 'BUY' %}<span class="badge badge-good">BUY</span>{% else %}<span class="badge badge-bad">SELL</span>{% endif %}</td>
+              <td class="num tnum">{{ '%.2f' | format(t.qty) }}</td>
+              <td class="num tnum">{{ t.entry_price | money }}</td>
+              <td class="num tnum {{ 'text-good' if t.realized_pnl > 0 else ('text-bad' if t.realized_pnl < 0 else 'text-muted') }}">{{ t.realized_pnl | signed if t.status == 'closed' else '—' }}</td>
+              <td><span class="badge {{ 'badge-info' if t.status == 'open' else '' }}">{{ t.status }}</span></td>
+            </tr>
+          {% else %}
+            <tr><td colspan="6" class="empty">No trades yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header"><div class="card-title">Recent Activity</div><a class="btn btn-sm" href="/activity">View all</a></div>
+  <div class="flex flex-col gap-2">
+    {% for log in recent_logs %}
+      <div class="flex items-center gap-3" style="padding: 0.4rem 0; border-bottom: 1px solid var(--border);">
+        <span class="badge {{ 'badge-warn' if log.level == 'warn' else ('badge-bad' if log.level == 'error' else 'badge-info') }}">{{ log.category }}</span>
+        <div style="flex:1; font-size: 0.85rem;">{{ log.message }}</div>
+        <div class="text-dim" style="font-size: 0.75rem;">{{ log.created_at | dt }}</div>
+      </div>
+    {% else %}
+      <div class="empty">No activity yet.</div>
+    {% endfor %}
+  </div>
+</div>
+
+{% endblock %}
