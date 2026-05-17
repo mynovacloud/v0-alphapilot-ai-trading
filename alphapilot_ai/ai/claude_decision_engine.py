@@ -514,7 +514,7 @@ def _build_user_prompt(
     # 4. Market Regime Detection
     market_regime_context = None
     try:
-        from connectors.coinbase import get_candles
+        from connectors.candles import get_candles
         from trading.market_regime import detect_regime, get_regime_trading_rules
         import numpy as np
         
@@ -550,7 +550,7 @@ def _build_user_prompt(
     # 5. Advanced Technical Indicators
     advanced_indicators = None
     try:
-        from connectors.coinbase import get_candles
+        from connectors.candles import get_candles
         from trading.indicators import compute_all_indicators
         import numpy as np
         
