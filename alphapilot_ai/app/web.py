@@ -175,9 +175,7 @@ def dashboard(request: Request) -> HTMLResponse:
             for t in trades
         ]
 
-    return templates.TemplateResponse(
-        "dashboard.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="dashboard.html", context=_ctx(
             request,
             active="dashboard",
             summary=summary,
@@ -187,7 +185,7 @@ def dashboard(request: Request) -> HTMLResponse:
             recent_logs=recent_logs,
             recent_trades=recent_trades,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -214,17 +212,13 @@ def wallets_page(request: Request) -> HTMLResponse:
             label = f"{w['name']} ({w['platform']})"
             w["pnl"] = pnl_map.get(label, 0.0)
 
-    return templates.TemplateResponse(
-        "wallets.html",
-        _ctx(request, active="wallets", wallets=wallets),
-    )
+    return templates.TemplateResponse(request=request, name="wallets.html", context=_ctx(request, active="wallets", wallets=wallets),
+)
 
 
 @router.get("/wallets/new", response_class=HTMLResponse)
 def add_wallet_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
-        "add_wallet.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="add_wallet.html", context=_ctx(
             request,
             active="wallets",
             platforms=list(CONNECTOR_REGISTRY.keys()),
@@ -367,8 +361,9 @@ def wallet_detail(request: Request, wallet_id: int) -> HTMLResponse:
         strategies = [{"id": st.id, "name": st.name} for st in s.query(Strategy).all()]
 
     return templates.TemplateResponse(
-        "wallet_detail.html",
-        _ctx(
+        request=request,
+        name="wallet_detail.html",
+        context=_ctx(
             request,
             active="wallets",
             wallet=wallet,
@@ -573,18 +568,17 @@ def trade_close(
 
 @router.get("/scanner", response_class=HTMLResponse)
 def scanner_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
-        "scanner.html",
-        _ctx(request, active="scanner", opportunities=[]),
-    )
+    return templates.TemplateResponse(request=request, name="scanner.html", context=_ctx(request, active="scanner", opportunities=[]),
+)
 
 
 @router.post("/scanner/run", response_class=HTMLResponse)
 def scanner_run(request: Request, n: int = Form(20)) -> HTMLResponse:
     opps = scan_markets(n=n)
     return templates.TemplateResponse(
-        "_scanner_table.html",
-        {"request": request, "opportunities": opps},
+        request=request,
+        name="_scanner_table.html",
+        context={"request": request, "opportunities": opps},
     )
 
 
@@ -599,9 +593,7 @@ def strategies_page(request: Request) -> HTMLResponse:
     pnl_map = {row["strategy"]: float(row["pnl"]) for _, row in pnl_df.iterrows()} if not pnl_df.empty else {}
     for s in strategies:
         s["pnl"] = pnl_map.get(s["name"], 0.0)
-    return templates.TemplateResponse(
-        "strategies.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="strategies.html", context=_ctx(
             request,
             active="strategies",
             strategies=strategies,
@@ -616,7 +608,7 @@ def strategies_page(request: Request) -> HTMLResponse:
             ],
             market_types=["Crypto", "Stocks", "Prediction Markets", "Options"],
         ),
-    )
+)
 
 
 @router.post("/strategies/new")
@@ -663,8 +655,9 @@ def strategies_delete(strategy_id: int) -> RedirectResponse:
 def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form(200)) -> HTMLResponse:
     result = run_backtest(strategy_id, n_trades=n_trades)
     return templates.TemplateResponse(
-        "_backtest_result.html",
-        {"request": request, "result": result},
+        request=request,
+        name="_backtest_result.html",
+        context={"request": request, "result": result},
     )
 
 
@@ -677,9 +670,7 @@ def training_page(request: Request) -> HTMLResponse:
     wallets = get_wallets()
     strategies = list_strategies()
     lessons = _memory.list_lessons(limit=20)
-    return templates.TemplateResponse(
-        "training.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
             wallets=wallets,
@@ -688,7 +679,7 @@ def training_page(request: Request) -> HTMLResponse:
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
-    )
+)
 
 
 @router.post("/training/run", response_class=HTMLResponse)
@@ -714,8 +705,9 @@ def training_run(
     for d in result.decisions:
         eq.append(d.get("balance", eq[-1]))
     return templates.TemplateResponse(
-        "_training_result.html",
-        {"request": request, "result": result, "equity": eq},
+        request=request,
+        name="_training_result.html",
+        context={"request": request, "result": result, "equity": eq},
     )
 
 
@@ -764,9 +756,7 @@ def analytics_page(request: Request) -> HTMLResponse:
                     bucket = min(9, max(0, int((v - lo) / rng * 10)))
                     histogram[bucket] += 1
 
-    return templates.TemplateResponse(
-        "analytics.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
             request,
             active="analytics",
             summary=summary,
@@ -776,7 +766,7 @@ def analytics_page(request: Request) -> HTMLResponse:
             strategy_pnl=strategy_pnl,
             histogram=histogram,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -805,9 +795,7 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
         categories = sorted({r[0] for r in s.query(ActivityLog.category).distinct().all() if r[0]})
         levels = sorted({r[0] for r in s.query(ActivityLog.level).distinct().all() if r[0]})
 
-    return templates.TemplateResponse(
-        "activity.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="activity.html", context=_ctx(
             request,
             active="activity",
             logs=logs,
@@ -816,7 +804,7 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
             current_category=category,
             current_level=level,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -848,15 +836,13 @@ def settings_page(request: Request) -> HTMLResponse:
         "max_concurrent_trades": _get_setting("max_concurrent_trades", "5"),
         "default_position_size": _get_setting("default_position_size", "1000"),
     }
-    return templates.TemplateResponse(
-        "settings.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
             request,
             active="settings",
             prefs=prefs,
             settings=settings,
         ),
-    )
+)
 
 
 @router.post("/settings/save")

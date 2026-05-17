@@ -14,3 +14,5 @@
 2026-05-17 02:56:57,970 | INFO    | httpx | HTTP Request: POST http://testserver/wallets "HTTP/1.1 200 OK"
 2026-05-17 02:56:57,978 | INFO    | ai.learning_memory | AI lesson added: Avoid low-liquidity markets after slippage-driven losses.
 2026-05-17 02:56:57,985 | INFO    | httpx | HTTP Request: POST http://testserver/ai/train "HTTP/1.1 200 OK"
+2026-05-17 04:54:01,236 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
+2026-05-17 04:54:01,255 | INFO    | app.main | AlphaPilot AI ready.
