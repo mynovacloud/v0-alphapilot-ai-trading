@@ -245,16 +245,21 @@ class BotEngine:
             evaluated += 1
             result.decisions += 1
 
-            # Skip the LLM round-trip when we have nothing useful to ask about:
-            # no candles + zero technical confidence means Claude will just
-            # respond "no indicators provided, HOLD" and waste a paid API call.
-            # The very low confidence floor in aggressive mode is checked first
-            # so the user can still force-call Claude on weak signals.
+            # Skip the LLM round-trip when we have nothing useful to ask about.
+            # A truly empty technical signal (HOLD with zero confidence and no
+            # computed indicators) gives Claude nothing to reason from — it
+            # will respond "no indicators provided, HOLD" 100% of the time.
+            # That wastes paid API calls AND fills the decision log with
+            # noise that masks any real BUY/SELL signals.
+            #
+            # We always skip these — the previous version gated on
+            # `cfg.min_confidence > 0.05`, but a training session at floor 0.0
+            # would NOT skip and would dump dozens of useless HOLDs into the
+            # decision log every tick.
             if (
                 signal.side == "HOLD"
                 and float(signal.confidence or 0) <= 0.0
                 and not signal.indicators.get("ema_fast")
-                and cfg.min_confidence > 0.05
             ):
                 # Still record the diagnostic so the user sees we evaluated it.
                 if best is None:

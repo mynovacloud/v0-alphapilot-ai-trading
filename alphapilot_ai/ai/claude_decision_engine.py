@@ -165,11 +165,17 @@ def decide(
     is_training = False
     try:
         from config.bot_config import get as cfg_get
-        floor = float(cfg_get("bot_min_confidence") or 0.55)
+        # cfg_get returns a string from the AppSetting table, or None if unset.
+        # We must NOT use `or 0.55` here — the string "0.0" is truthy but the
+        # FLOAT 0.0 is falsy, and earlier code paths that did `or 0.55` after
+        # float() were silently bumping the user's floor of 0.0 back up to
+        # 0.55, causing the training-mode bypass to never fire.
+        raw_floor = cfg_get("bot_min_confidence")
+        if raw_floor is not None and str(raw_floor).strip() != "":
+            floor = float(raw_floor)
         is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
         pass
-
     side = (technical_signal.side or "HOLD").upper()
     tech_conf = float(technical_signal.confidence or 0.0)
 
@@ -314,11 +320,14 @@ def _build_user_prompt(
     open_positions, recent_trades = _wallet_recent_history(int(wallet["id"]))
 
     # Read the operator's calibration knobs so Claude doesn't invent its own.
+    # See note above: avoid `or 0.55` which would clobber an explicit 0.0.
     floor = 0.55
     is_training = False
     try:
         from config.bot_config import get as cfg_get
-        floor = float(cfg_get("bot_min_confidence") or 0.55)
+        raw_floor = cfg_get("bot_min_confidence")
+        if raw_floor is not None and str(raw_floor).strip() != "":
+            floor = float(raw_floor)
         is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
         pass

@@ -184,11 +184,20 @@ class RiskManager:
                         "strategy_position_cap",
                     )
                 if confidence < (strat.min_confidence or 0):
-                    return RiskDecision(
-                        False,
-                        f"Confidence {confidence:.2f} < strategy min {strat.min_confidence:.2f}",
-                        "strategy_confidence",
-                    )
+                    # Training-session escape hatch: when the operator is on
+                    # the AI Training page they explicitly set a global
+                    # confidence floor (often 0.0) to see lots of trades.
+                    # Without this override, the strategy table's seeded
+                    # min_confidence (0.55-0.65) silently vetoes every
+                    # training trade — that's the "Settings page wins over
+                    # Training page" behaviour the operator reported.
+                    training_floor = self._training_session_floor()
+                    if training_floor is None or confidence < training_floor:
+                        return RiskDecision(
+                            False,
+                            f"Confidence {confidence:.2f} < strategy min {strat.min_confidence:.2f}",
+                            "strategy_confidence",
+                        )
 
                 strategy_today = (
                     s.query(PaperTrade)
@@ -249,6 +258,28 @@ class RiskManager:
         with session_scope() as s:
             row = s.query(AppSetting).filter(AppSetting.key == cls.KILL_SWITCH_KEY).first()
             return bool(row and (row.value or "").strip().lower() in {"1", "true", "on", "yes"})
+
+    @classmethod
+    def _training_session_floor(cls) -> float | None:
+        """If a training session is active, return the operator's confidence
+        floor. Otherwise return None and let the strategy's own min_confidence
+        win. This is what makes the AI Training page's slider authoritative
+        during a training session — without it, the strategy table's seeded
+        floors silently veto the operator's intent.
+        """
+        with session_scope() as s:
+            active_row = s.query(AppSetting).filter(AppSetting.key == "training_session_active").first()
+            active = bool(active_row and (active_row.value or "").strip().lower() in {"1", "true", "on", "yes"})
+            if not active:
+                return None
+            floor_row = s.query(AppSetting).filter(AppSetting.key == "bot_min_confidence").first()
+            raw = (floor_row.value if floor_row else "") or ""
+            if raw.strip() == "":
+                return None
+            try:
+                return float(raw)
+            except ValueError:
+                return None
 
     @classmethod
     def set_kill_switch(cls, on: bool, *, reason: str = "") -> None:
