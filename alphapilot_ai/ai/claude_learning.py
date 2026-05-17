@@ -367,7 +367,8 @@ def readiness_score() -> dict[str, Any]:
                 "side": t.side,
                 "entry_price": float(t.entry_price or 0.0),
                 "exit_price": float(t.exit_price or 0.0) if t.exit_price is not None else None,
-                "size_usd": float(t.size_usd or 0.0),
+                # PaperTrade has no size_usd column — derive from qty * entry_price.
+                "size_usd": float((t.qty or 0.0) * (t.entry_price or 0.0)),
                 "unrealized_pnl": float(t.unrealized_pnl or 0.0),
             }
             for t in s.query(PaperTrade).all()
