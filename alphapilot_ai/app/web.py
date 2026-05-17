@@ -133,43 +133,56 @@ def _ctx(request: Request, **extra: Any) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 @router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request) -> HTMLResponse:
-    summary = portfolio_summary()
+def dashboard(request: Request, mode: str = "all") -> HTMLResponse:
+    mode = mode if mode in {"all", "paper", "live"} else "all"
+    summary = portfolio_summary(mode)
     perf = performance_metrics()
     wallets = get_wallets()
+    wallet_modes = {w["id"]: (w.get("trading_mode") or "paper").lower() for w in wallets}
 
-    # Equity curve points for the SVG chart
-    eq = equity_curve_df()
+    # Equity curve points for the SVG chart (scoped to selected mode)
+    eq = equity_curve_df(mode)
     points: list[dict[str, Any]] = []
     if not eq.empty:
         for _, row in eq.iterrows():
             points.append({"date": str(row["date"]), "equity": float(row["equity"])})
 
-    # Recent activity
+    # IDs to filter on, based on mode
+    if mode == "paper":
+        scoped_wids = {wid for wid, m in wallet_modes.items() if m == "paper"}
+    elif mode == "live":
+        scoped_wids = {wid for wid, m in wallet_modes.items() if m in {"live", "live_shadow"}}
+    else:
+        scoped_wids = set(wallet_modes.keys())
+
+    # Recent activity (scoped: also filter by wallet_id when scoping to a mode)
     with session_scope() as s:
-        logs = (
-            s.query(ActivityLog)
-            .order_by(ActivityLog.created_at.desc())
-            .limit(8)
-            .all()
-        )
+        log_q = s.query(ActivityLog)
+        if mode != "all":
+            # ActivityLog rows from trade engine carry wallet_id; system rows
+            # without wallet_id are kept so the user still sees scheduler events.
+            log_q = log_q.filter(
+                (ActivityLog.wallet_id == None)  # noqa: E711
+                | (ActivityLog.wallet_id.in_(scoped_wids if scoped_wids else {-1}))
+            )
+        logs = log_q.order_by(ActivityLog.created_at.desc()).limit(8).all()
         recent_logs = [
             {
                 "category": l.category,
                 "level": l.level,
                 "message": l.message,
                 "created_at": l.created_at,
+                "wallet_id": l.wallet_id,
+                "trading_mode": wallet_modes.get(l.wallet_id, ""),
             }
             for l in logs
         ]
 
-        # Recent trades
-        trades = (
-            s.query(PaperTrade)
-            .order_by(PaperTrade.opened_at.desc())
-            .limit(8)
-            .all()
-        )
+        # Recent trades, filtered by mode
+        trade_q = s.query(PaperTrade)
+        if mode != "all":
+            trade_q = trade_q.filter(PaperTrade.wallet_id.in_(scoped_wids if scoped_wids else {-1}))
+        trades = trade_q.order_by(PaperTrade.opened_at.desc()).limit(8).all()
         wallet_names = {w["id"]: w["name"] for w in wallets}
         recent_trades = [
             {
@@ -178,13 +191,22 @@ def dashboard(request: Request) -> HTMLResponse:
                 "side": t.side,
                 "qty": t.qty,
                 "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
                 "status": t.status,
                 "realized_pnl": t.realized_pnl,
+                "unrealized_pnl": t.unrealized_pnl,
                 "wallet": wallet_names.get(t.wallet_id, "?"),
+                "wallet_id": t.wallet_id,
+                "trading_mode": wallet_modes.get(t.wallet_id, "paper"),
                 "opened_at": t.opened_at,
+                "closed_at": t.closed_at,
             }
             for t in trades
         ]
+
+    # Live training session indicator so the dashboard can show "session running"
+    from config.bot_config import get as cfg_get
+    session_active = str(cfg_get("training_session_active") or "").lower() in {"1", "true", "yes"}
 
     return templates.TemplateResponse(request=request, name="dashboard.html", context=_ctx(
             request,
@@ -195,6 +217,8 @@ def dashboard(request: Request) -> HTMLResponse:
             equity_points=points,
             recent_logs=recent_logs,
             recent_trades=recent_trades,
+            current_mode=mode,
+            session_active=session_active,
         ),
 )
 
@@ -1406,14 +1430,44 @@ def analytics_page(request: Request) -> HTMLResponse:
 # ----------------------------------------------------------------------
 
 @router.get("/activity", response_class=HTMLResponse)
-def activity_page(request: Request, category: str = "", level: str = "") -> HTMLResponse:
+def activity_page(
+    request: Request,
+    category: str = "",
+    level: str = "",
+    mode: str = "",
+    wallet_id: int | None = None,
+) -> HTMLResponse:
+    wallets = get_wallets()
+    wallet_lookup = {w["id"]: w for w in wallets}
+    wallet_modes = {wid: (w.get("trading_mode") or "paper").lower() for wid, w in wallet_lookup.items()}
+
+    # Resolve which wallet ids the mode filter should hit.
+    mode_norm = (mode or "").lower()
+    mode_wids: set[int] | None
+    if mode_norm == "paper":
+        mode_wids = {wid for wid, m in wallet_modes.items() if m == "paper"}
+    elif mode_norm == "live":
+        mode_wids = {wid for wid, m in wallet_modes.items() if m in {"live", "live_shadow"}}
+    else:
+        mode_wids = None
+
+    # Pull recent paper trades to merge into the timeline so users see every
+    # buy/sell/close inline with the bot's narration on a single page.
     with session_scope() as s:
-        q = s.query(ActivityLog)
+        log_q = s.query(ActivityLog)
         if category:
-            q = q.filter(ActivityLog.category == category)
+            log_q = log_q.filter(ActivityLog.category == category)
         if level:
-            q = q.filter(ActivityLog.level == level)
-        rows = q.order_by(ActivityLog.created_at.desc()).limit(300).all()
+            log_q = log_q.filter(ActivityLog.level == level)
+        if wallet_id:
+            log_q = log_q.filter(ActivityLog.wallet_id == wallet_id)
+        elif mode_wids is not None:
+            # Keep system events with no wallet_id so scheduler/heartbeat lines stay visible.
+            log_q = log_q.filter(
+                (ActivityLog.wallet_id == None)  # noqa: E711
+                | (ActivityLog.wallet_id.in_(mode_wids if mode_wids else {-1}))
+            )
+        rows = log_q.order_by(ActivityLog.created_at.desc()).limit(300).all()
         logs = [
             {
                 "id": r.id,
@@ -1421,20 +1475,58 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
                 "level": r.level,
                 "message": r.message,
                 "created_at": r.created_at,
+                "wallet_id": r.wallet_id,
+                "wallet_name": (wallet_lookup.get(r.wallet_id) or {}).get("name") if r.wallet_id else None,
+                "trading_mode": wallet_modes.get(r.wallet_id, "") if r.wallet_id else "system",
             }
             for r in rows
         ]
         categories = sorted({r[0] for r in s.query(ActivityLog.category).distinct().all() if r[0]})
         levels = sorted({r[0] for r in s.query(ActivityLog.level).distinct().all() if r[0]})
 
+        # Trade executions to render in the "Executions" tab.
+        ex_q = s.query(PaperTrade)
+        if wallet_id:
+            ex_q = ex_q.filter(PaperTrade.wallet_id == wallet_id)
+        elif mode_wids is not None:
+            ex_q = ex_q.filter(PaperTrade.wallet_id.in_(mode_wids if mode_wids else {-1}))
+        trades_recent = (
+            ex_q.order_by(PaperTrade.id.desc()).limit(150).all()
+        )
+        executions = [
+            {
+                "id": t.id,
+                "wallet": (wallet_lookup.get(t.wallet_id) or {}).get("name", "?"),
+                "wallet_id": t.wallet_id,
+                "trading_mode": wallet_modes.get(t.wallet_id, "paper"),
+                "symbol": t.symbol,
+                "side": t.side,
+                "qty": float(t.qty or 0),
+                "entry_price": float(t.entry_price or 0),
+                "exit_price": float(t.exit_price or 0) if t.exit_price else None,
+                "status": t.status,
+                "realized_pnl": float(t.realized_pnl or 0),
+                "unrealized_pnl": float(t.unrealized_pnl or 0),
+                "confidence": float(t.confidence or 0),
+                "opened_at": t.opened_at,
+                "closed_at": t.closed_at,
+                "notes": (t.notes or "")[:240],
+            }
+            for t in trades_recent
+        ]
+
     return templates.TemplateResponse(request=request, name="activity.html", context=_ctx(
             request,
             active="activity",
             logs=logs,
+            executions=executions,
+            wallets=wallets,
             categories=categories,
             levels=levels,
             current_category=category,
             current_level=level,
+            current_mode=mode_norm or "all",
+            current_wallet_id=wallet_id,
         ),
 )
 
