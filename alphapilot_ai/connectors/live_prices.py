@@ -59,37 +59,64 @@ def coingecko_id(symbol: str) -> str | None:
 
 def get_price(symbol: str) -> dict[str, Any]:
     """
-    Fetch the live USD price for a crypto symbol from CoinGecko.
+    Fetch the live USD price for a crypto symbol.
 
-    Returns a dict like:
-        {"ok": True, "symbol": "BTC-USD", "price": 67421.10, "source": "coingecko", "live": True}
-    or, on failure / unknown symbol, an error payload with ok=False.
+    Strategy:
+      1. If symbol is mapped in SYMBOL_TO_COINGECKO, use CoinGecko (primary).
+      2. Otherwise, try Coinbase's public ticker endpoint at
+         https://api.exchange.coinbase.com/products/{SYMBOL}/ticker
+         which works for ANY tradable Coinbase product (BTC-USD, BONK-USD, etc.)
+         and requires no API key.
+
+    Returns:
+        {"ok": True, "symbol": "BTC-USD", "price": 67421.10, "source": "...", "live": True}
+    or, on failure, an error payload with ok=False.
     """
     sym = _normalize(symbol)
     coin_id = coingecko_id(sym)
-    if not coin_id:
-        return {
-            "ok": False,
-            "symbol": sym,
-            "error": f"Unknown symbol '{sym}'. Add it to SYMBOL_TO_COINGECKO in connectors/live_prices.py.",
-        }
 
     now = time.time()
-    cached = _CACHE.get(coin_id)
-    if cached and (now - cached[1]) < _CACHE_TTL:
-        return {"ok": True, "symbol": sym, "price": cached[0], "source": "coingecko (cached)", "live": True}
 
-    url = "https://api.coingecko.com/api/v3/simple/price"
+    # ---- Path 1: CoinGecko (preferred for mapped majors) ----
+    if coin_id:
+        cached = _CACHE.get(coin_id)
+        if cached and (now - cached[1]) < _CACHE_TTL:
+            return {"ok": True, "symbol": sym, "price": cached[0], "source": "coingecko (cached)", "live": True}
+
+        url = "https://api.coingecko.com/api/v3/simple/price"
+        try:
+            with httpx.Client(timeout=10.0) as c:
+                r = c.get(url, params={"ids": coin_id, "vs_currencies": "usd"})
+                r.raise_for_status()
+                data = r.json()
+            price = float(data[coin_id]["usd"])
+            _CACHE[coin_id] = (price, now)
+            return {"ok": True, "symbol": sym, "price": price, "source": "coingecko", "live": True}
+        except Exception as e:
+            logger.warning("CoinGecko fetch failed for %s, falling back to Coinbase: %s", sym, e)
+            # fall through to Coinbase
+
+    # ---- Path 2: Coinbase public ticker (works for any Coinbase USD product) ----
+    cb_key = f"cb:{sym}"
+    cached = _CACHE.get(cb_key)
+    if cached and (now - cached[1]) < _CACHE_TTL:
+        return {"ok": True, "symbol": sym, "price": cached[0], "source": "coinbase (cached)", "live": True}
+
+    # Coinbase product IDs use BASE-USD form. If user passed BTCUSD, normalize.
+    product_id = sym if "-" in sym else (
+        f"{sym[:-3]}-USD" if sym.endswith("USD") and len(sym) > 3 else sym
+    )
+    url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
     try:
         with httpx.Client(timeout=10.0) as c:
-            r = c.get(url, params={"ids": coin_id, "vs_currencies": "usd"})
+            r = c.get(url)
             r.raise_for_status()
             data = r.json()
-        price = float(data[coin_id]["usd"])
-        _CACHE[coin_id] = (price, now)
-        return {"ok": True, "symbol": sym, "price": price, "source": "coingecko", "live": True}
+        price = float(data["price"])
+        _CACHE[cb_key] = (price, now)
+        return {"ok": True, "symbol": sym, "price": price, "source": "coinbase", "live": True}
     except Exception as e:
-        logger.warning("CoinGecko fetch failed for %s: %s", sym, e)
+        logger.warning("Coinbase ticker fetch failed for %s: %s", sym, e)
         return {"ok": False, "symbol": sym, "error": f"Live price fetch failed: {e}"}
 
 

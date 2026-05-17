@@ -6,8 +6,189 @@
 <div class="page-head">
   <div>
     <h1>Settings</h1>
-    <p>Application preferences and runtime status. Live trading is locked at the environment level for safety.</p>
+    <p>Application preferences, autonomous bot configuration, and runtime status.</p>
   </div>
+</div>
+
+<div class="card mb-4" style="border: 1px solid var(--border);">
+  <div class="card-header">
+    <div class="card-title">Risk &amp; Emergency Controls</div>
+    <div class="flex gap-2 items-center">
+      {% if kill_switch %}
+        <span class="badge badge-bad badge-dot">KILL SWITCH ENGAGED</span>
+      {% else %}
+        <span class="badge badge-good badge-dot">Kill switch off</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-muted mb-3">
+    The kill switch is a global, instant halt. While engaged, every paper and live
+    order is rejected by the risk manager and the bot tick short-circuits before
+    touching the network. Use it any time something feels off.
+  </p>
+
+  <div class="flex gap-2 items-center" style="flex-wrap: wrap;">
+    {% if kill_switch %}
+      <form method="post" action="/settings/risk/kill-switch">
+        <input type="hidden" name="action" value="release">
+        <button class="btn btn-primary" type="submit">Release Kill Switch</button>
+      </form>
+    {% else %}
+      <form method="post" action="/settings/risk/kill-switch"
+            onsubmit="return confirm('Engage the global kill switch? This halts ALL trading immediately.');">
+        <input type="hidden" name="action" value="engage">
+        <button class="btn btn-danger" type="submit">Engage Kill Switch</button>
+      </form>
+    {% endif %}
+
+    {% if paused_wallets %}
+      <form method="post" action="/settings/risk/unpause-all"
+            onsubmit="return confirm('Unpause all wallets? They were auto-paused for hitting risk caps.');">
+        <button class="btn" type="submit">Unpause All Wallets ({{ paused_wallets|length }})</button>
+      </form>
+    {% endif %}
+  </div>
+
+  {% if paused_wallets %}
+  <div class="banner banner-warn mt-3">
+    <strong>Auto-paused wallets:</strong>
+    {{ paused_wallets | map(attribute='name') | join(', ') }} —
+    these wallets hit a risk cap (typically the daily-loss circuit breaker) and the
+    bot will not touch them again until you unpause.
+  </div>
+  {% endif %}
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Autonomous Trading Bot</div>
+    <div class="flex gap-2 items-center">
+      {% if bot_status.scheduler_running %}
+        <span class="badge badge-good badge-dot">Scheduler running</span>
+      {% else %}
+        <span class="badge badge-bad badge-dot">Scheduler stopped</span>
+      {% endif %}
+      {% if bot_cfg.bot_enabled %}
+        <span class="badge badge-good">Bot: ON</span>
+      {% else %}
+        <span class="badge badge-warn">Bot: OFF</span>
+      {% endif %}
+      {% if bot_cfg.dry_run %}
+        <span class="badge badge-warn">Dry run</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-muted mb-3">
+    The bot wakes up on a configurable interval, walks the selected symbol universe,
+    asks the AI engine for a decision per symbol, and (when confidence is high enough)
+    routes a trade through the paper-trading engine. All wallet caps and the risk manager
+    still apply. Live trading remains gated by <span class="mono">LIVE_TRADING_ENABLED</span>.
+  </p>
+
+  <form method="post" action="/settings/bot/save" class="form-grid">
+    <div class="field">
+      <label>Bot Enabled</label>
+      <select class="select" name="bot_enabled">
+        <option value="true"  {{ 'selected' if bot_cfg.bot_enabled else '' }}>On — run on schedule</option>
+        <option value="false" {{ '' if bot_cfg.bot_enabled else 'selected' }}>Off — paused</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Wake-up Interval (seconds)</label>
+      <input class="input" type="number" name="bot_tick_seconds" min="5" step="5" value="{{ bot_cfg.tick_seconds }}">
+      <small class="text-muted">How often the bot re-evaluates the market. Minimum 5s.</small>
+    </div>
+    <div class="field">
+      <label>Symbol Universe</label>
+      <select class="select" name="bot_universe">
+        <option value="coinbase_usd" {{ 'selected' if bot_cfg.universe == 'coinbase_usd' else '' }}>All Coinbase USD pairs</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Max Symbols Per Tick</label>
+      <input class="input" type="number" name="bot_universe_limit" min="1" max="500" value="{{ bot_cfg.universe_limit }}">
+      <small class="text-muted">Caps how many symbols the bot scores in a single tick. Larger = slower ticks.</small>
+    </div>
+    <div class="field">
+      <label>Minimum AI Confidence</label>
+      <input class="input" type="number" name="bot_min_confidence" min="0" max="1" step="0.01" value="{{ '%.2f' % bot_cfg.min_confidence }}">
+      <small class="text-muted">0.0–1.0. Lower = more trades, higher = pickier.</small>
+    </div>
+    <div class="field">
+      <label>Default Strategy Type</label>
+      <select class="select" name="bot_default_strategy_type">
+        {% for st in ['Momentum', 'Mean Reversion', 'Probability Edge', 'Volatility Breakout'] %}
+          <option value="{{ st }}" {{ 'selected' if bot_cfg.default_strategy_type == st else '' }}>{{ st }}</option>
+        {% endfor %}
+      </select>
+      <small class="text-muted">Used when a wallet has no strategy assigned.</small>
+    </div>
+    <div class="field">
+      <label>Position Size (USD)</label>
+      <input class="input" type="number" name="bot_position_size_usd" min="1" step="1" value="{{ '%.2f' % bot_cfg.position_size_usd }}">
+      <small class="text-muted">Per-trade notional. Capped by wallet's max_position_usd.</small>
+    </div>
+    <div class="field">
+      <label>Max Open Positions / Wallet</label>
+      <input class="input" type="number" name="bot_max_open_per_wallet" min="1" max="50" value="{{ bot_cfg.max_open_per_wallet }}">
+    </div>
+    <div class="field">
+      <label>Mode</label>
+      <select class="select" name="bot_dry_run">
+        <option value="true"  {{ 'selected' if bot_cfg.dry_run else '' }}>Dry run — log decisions only</option>
+        <option value="false" {{ '' if bot_cfg.dry_run else 'selected' }}>Live paper — actually open trades</option>
+      </select>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Bot Settings</button>
+    </div>
+  </form>
+
+  <div class="flex gap-2 items-center mt-3" style="flex-wrap: wrap;">
+    <form method="post" action="/settings/bot/tick-now">
+      <button class="btn" type="submit">Run a tick now</button>
+    </form>
+    <span class="text-muted" style="font-size: 0.86rem;">
+      Next scheduled tick: <span class="mono">{{ bot_status.next_tick or '—' }}</span>
+    </span>
+  </div>
+
+  {% if recent_ticks %}
+  <div class="mt-4">
+    <div class="card-title" style="font-size: 0.95rem;">Recent ticks</div>
+    <div class="table-wrap mt-2">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Started</th>
+            <th class="num">Universe</th>
+            <th class="num">Wallets</th>
+            <th class="num">Decisions</th>
+            <th class="num">Actions</th>
+            <th class="num">Skipped</th>
+            <th class="num">Errors</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in recent_ticks %}
+          <tr>
+            <td class="mono" style="font-size: 0.78rem;">{{ t.started_at }}</td>
+            <td class="num">{{ t.universe_size }}</td>
+            <td class="num">{{ t.wallets_evaluated }}</td>
+            <td class="num">{{ t.decisions }}</td>
+            <td class="num">{{ t.actions }}</td>
+            <td class="num">{{ t.skipped }}</td>
+            <td class="num">{{ t.errors }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
 </div>
 
 <div class="grid grid-2-1 mb-4">

@@ -26,6 +26,8 @@ from analytics.portfolio import (
     pnl_by_wallet,
     portfolio_summary,
 )
+from config import bot_config
+from config.bot_config import BotConfig
 from config.settings import settings
 from connectors.live_prices import get_price as live_price
 from connectors.live_prices import known_symbols
@@ -41,13 +43,16 @@ from database.models import (
     Wallet,
 )
 from trading.backtester import run_backtest
+from trading.bot_engine import bot_engine
 from trading.market_scanner import scan_markets
 from trading.paper_trading_engine import PaperTradingEngine
+from trading.risk_manager import RiskManager
 from trading.strategy_manager import (
     create_strategy,
     delete_strategy,
     list_strategies,
 )
+from services.scheduler import bot_scheduler
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -836,13 +841,27 @@ def settings_page(request: Request) -> HTMLResponse:
         "max_concurrent_trades": _get_setting("max_concurrent_trades", "5"),
         "default_position_size": _get_setting("default_position_size", "1000"),
     }
+    bot_cfg = BotConfig.load()
+    bot_status = bot_scheduler.status()
+    recent_ticks = bot_engine.recent_ticks(limit=10)
+    kill_switch = RiskManager.kill_switch_status()
+    with session_scope() as s:
+        paused_wallets = [
+            {"id": w.id, "name": w.name}
+            for w in s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
+        ]
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
-            request,
-            active="settings",
-            prefs=prefs,
-            settings=settings,
-        ),
-)
+        request,
+        active="settings",
+        prefs=prefs,
+        bot_cfg=bot_cfg,
+        bot_status=bot_status,
+        recent_ticks=recent_ticks,
+        kill_switch=kill_switch,
+        paused_wallets=paused_wallets,
+        settings=settings,
+    ),
+    )
 
 
 @router.post("/settings/save")
@@ -864,6 +883,96 @@ def settings_save(
                 category="settings",
                 level="info",
                 message="Preferences updated.",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/save")
+def settings_bot_save(
+    bot_enabled: str = Form("false"),
+    bot_tick_seconds: str = Form("60"),
+    bot_universe: str = Form("coinbase_usd"),
+    bot_universe_limit: str = Form("30"),
+    bot_min_confidence: str = Form("0.65"),
+    bot_default_strategy_type: str = Form("Momentum"),
+    bot_position_size_usd: str = Form("100"),
+    bot_max_open_per_wallet: str = Form("5"),
+    bot_dry_run: str = Form("true"),
+) -> RedirectResponse:
+    """
+    Persist autonomous-bot settings and reload the scheduler so the new
+    interval / config takes effect immediately — no restart required.
+    """
+    # Checkboxes only post their value when checked. Normalize.
+    enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
+    dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
+
+    bot_config.set_many(
+        {
+            "bot_enabled": enabled,
+            "bot_tick_seconds": str(max(5, int(float(bot_tick_seconds or 60)))),
+            "bot_universe": bot_universe or "coinbase_usd",
+            "bot_universe_limit": str(max(1, int(float(bot_universe_limit or 30)))),
+            "bot_min_confidence": str(max(0.0, min(1.0, float(bot_min_confidence or 0.65)))),
+            "bot_default_strategy_type": bot_default_strategy_type or "Momentum",
+            "bot_position_size_usd": str(max(1.0, float(bot_position_size_usd or 100))),
+            "bot_max_open_per_wallet": str(max(1, int(float(bot_max_open_per_wallet or 5)))),
+            "bot_dry_run": dry,
+        }
+    )
+
+    # Apply the new tick interval to the running scheduler immediately.
+    bot_scheduler.reload()
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="settings",
+                level="info",
+                message=(
+                    f"Bot settings updated: enabled={enabled}, "
+                    f"tick={bot_tick_seconds}s, universe={bot_universe}, dry_run={dry}"
+                ),
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/tick-now")
+def settings_bot_tick_now() -> RedirectResponse:
+    """Run a single tick immediately (manual override, ignores bot_enabled)."""
+    bot_engine.tick(manual=True)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/risk/kill-switch")
+def settings_kill_switch(action: str = Form("engage")) -> RedirectResponse:
+    """
+    Engage / release the global kill switch.
+    When engaged, every paper and live order is rejected by RiskManager and
+    the bot tick short-circuits before hitting the network.
+    """
+    if action.lower() == "engage":
+        RiskManager.set_kill_switch(True, reason="manual via Settings")
+    else:
+        RiskManager.set_kill_switch(False, reason="manual via Settings")
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/risk/unpause-all")
+def settings_unpause_all() -> RedirectResponse:
+    """Clear the bot_paused flag on every wallet (after a daily-loss auto-pause)."""
+    with session_scope() as s:
+        wallets = s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
+        count = len(wallets)
+        for w in wallets:
+            w.bot_paused = False
+        s.add(
+            ActivityLog(
+                category="risk",
+                level="info",
+                message=f"Manually unpaused {count} wallet(s) from Settings.",
             )
         )
     return RedirectResponse(url="/settings", status_code=303)

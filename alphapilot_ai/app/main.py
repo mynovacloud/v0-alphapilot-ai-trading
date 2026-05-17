@@ -19,9 +19,11 @@ from fastapi.staticfiles import StaticFiles
 
 from app.web import router as web_router
 from backend.api import app as api_app
+from config.bot_config import ensure_defaults as ensure_bot_defaults
 from config.settings import settings
 from database.db import init_db
 from database.seed import seed_if_empty
+from services.scheduler import bot_scheduler
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -47,7 +49,14 @@ app.add_middleware(
 def _startup() -> None:
     init_db()
     seed_if_empty()
+    ensure_bot_defaults()
+    bot_scheduler.start()
     logger.info("AlphaPilot AI ready.")
+
+
+@app.on_event("shutdown")
+def _shutdown() -> None:
+    bot_scheduler.shutdown()
 
 
 # Static

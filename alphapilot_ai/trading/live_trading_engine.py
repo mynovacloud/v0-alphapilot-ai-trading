@@ -238,7 +238,14 @@ class LiveTradingEngine:
         if notional > 0 and not self._wallet_caps_ok(wallet_id, notional):
             return {"ok": False, "error": "Wallet cap exceeded (max_position_usd or max_daily_loss)."}
 
-        decision = self.risk.evaluate(wallet_id, risk_qty, risk_price, confidence, strategy_id)
+        decision = self.risk.evaluate_trade(
+            wallet_id=wallet_id,
+            qty=risk_qty,
+            entry_price=risk_price,
+            confidence=confidence,
+            strategy_id=strategy_id,
+            is_paper=False,
+        )
         if not decision and notional > 0:
             return {"ok": False, "error": f"Risk: {decision.reason}"}
 
