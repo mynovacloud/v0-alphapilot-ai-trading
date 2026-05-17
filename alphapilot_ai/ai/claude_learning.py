@@ -351,7 +351,27 @@ def readiness_score() -> dict[str, Any]:
     from datetime import datetime, timedelta
 
     with session_scope() as s:
-        all_trades = s.query(PaperTrade).all()
+        # Materialize ONLY the columns we read, while the session is still open.
+        # Holding ORM objects past `with session_scope()` triggers
+        # DetachedInstanceError the moment lazy-loading kicks in (e.g. when
+        # SQLAlchemy expires attributes after commit). The /training page
+        # crashed with exactly that error overnight after the session expired
+        # the cached attributes.
+        all_trades = [
+            {
+                "status": t.status,
+                "realized_pnl": float(t.realized_pnl or 0.0),
+                "symbol": t.symbol,
+                "opened_at": t.opened_at,
+                "closed_at": t.closed_at,
+                "side": t.side,
+                "entry_price": float(t.entry_price or 0.0),
+                "exit_price": float(t.exit_price or 0.0) if t.exit_price is not None else None,
+                "size_usd": float(t.size_usd or 0.0),
+                "unrealized_pnl": float(t.unrealized_pnl or 0.0),
+            }
+            for t in s.query(PaperTrade).all()
+        ]
         rules = s.query(AILearningMemory).count()
         reflections_total = s.query(TradeReflection).count()
         avg_score_row = (
@@ -368,23 +388,24 @@ def readiness_score() -> dict[str, Any]:
         wallets = s.query(Wallet).all()
         starting_bankroll = sum(float(w.paper_balance or 0.0) for w in wallets) or 0.0
 
-    # Partition trades.
-    closed = [t for t in all_trades if t.status == "closed"]
-    open_trades = [t for t in all_trades if t.status == "open"]
-    wins = [t for t in closed if (t.realized_pnl or 0) > 0]
-    losses = [t for t in closed if (t.realized_pnl or 0) < 0]
-    flats = [t for t in closed if (t.realized_pnl or 0) == 0]
+    # Partition trades. (`all_trades` is a list of plain dicts — see materialize
+    # block above. Using ORM objects here would crash with DetachedInstanceError.)
+    closed = [t for t in all_trades if t["status"] == "closed"]
+    open_trades = [t for t in all_trades if t["status"] == "open"]
+    wins = [t for t in closed if (t["realized_pnl"] or 0) > 0]
+    losses = [t for t in closed if (t["realized_pnl"] or 0) < 0]
+    flats = [t for t in closed if (t["realized_pnl"] or 0) == 0]
 
     closed_count = len(closed)
     win_count = len(wins)
     loss_count = len(losses)
 
-    realized_pnl = sum(float(t.realized_pnl or 0) for t in closed)
-    unrealized_pnl = sum(float(t.unrealized_pnl or 0) for t in open_trades)
+    realized_pnl = sum(float(t["realized_pnl"] or 0) for t in closed)
+    unrealized_pnl = sum(float(t["unrealized_pnl"] or 0) for t in open_trades)
     total_pnl = realized_pnl + unrealized_pnl
 
-    gross_win = sum(float(t.realized_pnl or 0) for t in wins)
-    gross_loss = abs(sum(float(t.realized_pnl or 0) for t in losses))
+    gross_win = sum(float(t["realized_pnl"] or 0) for t in wins)
+    gross_loss = abs(sum(float(t["realized_pnl"] or 0) for t in losses))
     avg_win = (gross_win / win_count) if win_count else 0.0
     avg_loss = (gross_loss / loss_count) if loss_count else 0.0
     profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (
@@ -399,7 +420,7 @@ def readiness_score() -> dict[str, Any]:
     # Equity curve & max drawdown across closed trades, ordered by close time.
     closed_sorted = sorted(
         closed,
-        key=lambda t: t.closed_at or t.opened_at or datetime.min,
+        key=lambda t: t["closed_at"] or t["opened_at"] or datetime.min,
     )
     equity = starting_bankroll
     peak = starting_bankroll if starting_bankroll else 0.0
@@ -407,8 +428,8 @@ def readiness_score() -> dict[str, Any]:
     max_dd_pct = 0.0
     pnl_series: list[float] = []
     for t in closed_sorted:
-        equity += float(t.realized_pnl or 0)
-        pnl_series.append(float(t.realized_pnl or 0))
+        equity += float(t["realized_pnl"] or 0)
+        pnl_series.append(float(t["realized_pnl"] or 0))
         if equity > peak:
             peak = equity
         drawdown = peak - equity
@@ -426,18 +447,18 @@ def readiness_score() -> dict[str, Any]:
 
     avg_hold_min = 0.0
     holds = [
-        ((t.closed_at - t.opened_at).total_seconds() / 60.0)
+        ((t["closed_at"] - t["opened_at"]).total_seconds() / 60.0)
         for t in closed
-        if t.closed_at and t.opened_at
+        if t["closed_at"] and t["opened_at"]
     ]
     if holds:
         avg_hold_min = sum(holds) / len(holds)
 
-    distinct_symbols = len({t.symbol for t in all_trades if t.symbol})
+    distinct_symbols = len({t["symbol"] for t in all_trades if t["symbol"]})
 
     # "Recency": did the bot trade within the last 7 days?
-    last_close = max((t.closed_at for t in closed if t.closed_at), default=None)
-    last_open = max((t.opened_at for t in all_trades if t.opened_at), default=None)
+    last_close = max((t["closed_at"] for t in closed if t["closed_at"]), default=None)
+    last_open = max((t["opened_at"] for t in all_trades if t["opened_at"]), default=None)
     last_activity = max([d for d in (last_close, last_open) if d], default=None)
     recency_days = (
         (datetime.utcnow() - last_activity).days if last_activity else 9999

@@ -103,7 +103,12 @@ class Reconciler:
             wallets = (
                 s.query(Wallet)
                 .filter(Wallet.platform.in_(["Coinbase"]))  # only platforms we have live trading for
-                .filter(Wallet.api_key.isnot(None))
+                # `api_key` lives on the ApiCredentialPlaceholder table, not on
+                # Wallet. The previous filter (Wallet.api_key.isnot(None))
+                # raised AttributeError every 30s in production. Filter by
+                # trading_mode instead — paper-only wallets never have live
+                # orders to reconcile, so skip them entirely.
+                .filter(Wallet.trading_mode.in_(["live", "live_shadow"]))
                 .all()
             )
             wallet_specs = [
