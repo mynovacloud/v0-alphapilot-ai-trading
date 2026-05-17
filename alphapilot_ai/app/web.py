@@ -1957,91 +1957,101 @@ def api_positions() -> JSONResponse:
     """
     Get all open positions with current P&L and SL/TP proximity.
     """
-    from connectors.live_prices import get_price
+    import logging
+    import traceback
+    
+    try:
+        from connectors.live_prices import get_price
 
-    with session_scope() as s:
-        trades = (
-            s.query(PaperTrade)
-            .filter(PaperTrade.status == "open")
-            .order_by(PaperTrade.opened_at.desc())
-            .all()
-        )
+        with session_scope() as s:
+            trades = (
+                s.query(PaperTrade)
+                .filter(PaperTrade.status == "open")
+                .order_by(PaperTrade.opened_at.desc())
+                .all()
+            )
 
-        positions = []
-        for t in trades:
-            entry = float(t.entry_price or 0)
-            qty = float(t.qty or 0)
-            side = (t.side or "BUY").upper()
+            positions = []
+            for t in trades:
+                try:
+                    entry = float(t.entry_price or 0)
+                    qty = float(t.qty or 0)
+                    side = (t.side or "BUY").upper()
 
-            # Get current price
-            p = get_price(t.symbol)
-            current = float(p.get("price") or 0) if p.get("ok") else entry
+                    # Get current price
+                    p = get_price(t.symbol)
+                    current = float(p.get("price") or 0) if p.get("ok") else entry
 
-            # Calculate P&L
-            if side == "BUY":
-                pnl = (current - entry) * qty
-                pnl_pct = (current - entry) / entry if entry > 0 else 0
-            else:
-                pnl = (entry - current) * qty
-                pnl_pct = (entry - current) / entry if entry > 0 else 0
+                    # Calculate P&L
+                    if side == "BUY":
+                        pnl = (current - entry) * qty
+                        pnl_pct = (current - entry) / entry if entry > 0 else 0
+                    else:
+                        pnl = (entry - current) * qty
+                        pnl_pct = (entry - current) / entry if entry > 0 else 0
 
-            # Calculate SL/TP proximity (0-1 where 1 = at the level)
-            sl_proximity = 0.0
-            tp_proximity = 0.0
+                    # Calculate SL/TP proximity (0-1 where 1 = at the level)
+                    sl_proximity = 0.0
+                    tp_proximity = 0.0
 
-            if t.stop_loss_price and entry > 0:
-                sl = float(t.stop_loss_price)
-                if side == "BUY":
-                    # Distance from current to SL, relative to entry-to-SL distance
-                    sl_range = entry - sl
-                    current_dist = current - sl
-                    sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
-                else:
-                    sl_range = sl - entry
-                    current_dist = sl - current
-                    sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+                    if t.stop_loss_price and entry > 0:
+                        sl = float(t.stop_loss_price)
+                        if side == "BUY":
+                            sl_range = entry - sl
+                            current_dist = current - sl
+                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+                        else:
+                            sl_range = sl - entry
+                            current_dist = sl - current
+                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
 
-            if t.take_profit_price and entry > 0:
-                tp = float(t.take_profit_price)
-                if side == "BUY":
-                    tp_range = tp - entry
-                    current_dist = tp - current
-                    tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
-                else:
-                    tp_range = entry - tp
-                    current_dist = current - tp
-                    tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+                    if t.take_profit_price and entry > 0:
+                        tp = float(t.take_profit_price)
+                        if side == "BUY":
+                            tp_range = tp - entry
+                            current_dist = tp - current
+                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+                        else:
+                            tp_range = entry - tp
+                            current_dist = current - tp
+                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
 
-            # Time in trade
-            opened = t.opened_at
-            time_in_trade_min = 0
-            if opened:
-                from utils.helpers import time_since_minutes
-                time_in_trade_min = time_since_minutes(opened)
+                    # Time in trade
+                    opened = t.opened_at
+                    time_in_trade_min = 0
+                    if opened:
+                        from utils.helpers import time_since_minutes
+                        time_in_trade_min = time_since_minutes(opened)
 
-            positions.append({
-                "id": t.id,
-                "wallet_id": t.wallet_id,
-                "symbol": t.symbol,
-                "side": side,
-                "qty": qty,
-                "entry_price": entry,
-                "current_price": current,
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct * 100, 2),
-                "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
-                "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
-                "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
-                "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
-                "sl_proximity": round(sl_proximity, 3),
-                "tp_proximity": round(tp_proximity, 3),
-                "max_loss_pct": float(t.max_loss_pct or 0.10),
-                "dca_count": t.dca_count or 0,
-                "time_in_trade_min": round(time_in_trade_min, 1),
-                "opened_at": t.opened_at.isoformat() if t.opened_at else None,
-            })
+                    positions.append({
+                        "id": t.id,
+                        "wallet_id": t.wallet_id,
+                        "symbol": t.symbol,
+                        "side": side,
+                        "qty": qty,
+                        "entry_price": entry,
+                        "current_price": current,
+                        "pnl": round(pnl, 2),
+                        "pnl_pct": round(pnl_pct * 100, 2),
+                        "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
+                        "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
+                        "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
+                        "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
+                        "sl_proximity": round(sl_proximity, 3),
+                        "tp_proximity": round(tp_proximity, 3),
+                        "max_loss_pct": float(t.max_loss_pct or 0.10),
+                        "dca_count": t.dca_count or 0,
+                        "time_in_trade_min": round(time_in_trade_min, 1),
+                        "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                    })
+                except Exception as e:
+                    logging.error(f"[POSITIONS] Error processing trade {t.id}: {e}")
+                    continue
 
-    return JSONResponse({"ok": True, "positions": positions})
+        return JSONResponse({"ok": True, "positions": positions})
+    except Exception as e:
+        logging.exception("[POSITIONS] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e), "positions": []}, status_code=200)
 
 
 @router.post("/v1/positions/{trade_id}/close")
@@ -2139,19 +2149,21 @@ def api_take_all_profits() -> JSONResponse:
     Perfect for scalping: take your wins, let losers run to stop-loss.
     """
     import logging
-    from connectors.live_prices import get_price
-    from trading.paper_trading_engine import PaperTradingEngine
-
-    engine = PaperTradingEngine()
+    import traceback
+    
     closed = 0
     skipped = 0
     errors = []
     total_pnl = 0.0
 
     try:
+        from connectors.live_prices import get_price
+        from trading.paper_trading_engine import PaperTradingEngine
+        engine = PaperTradingEngine()
+        
         with session_scope() as s:
             open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-            trade_info = [(t.id, t.symbol, t.side, float(t.entry_price), float(t.qty)) for t in open_trades]
+            trade_info = [(t.id, t.symbol, t.side, float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
         logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
 
@@ -2206,7 +2218,7 @@ def api_take_all_profits() -> JSONResponse:
             )
     except Exception as e:
         logging.exception("[TAKE_PROFITS] Fatal error")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "error": str(e), "traceback": traceback.format_exc()}, status_code=200)
 
     return JSONResponse({
         "ok": True,
