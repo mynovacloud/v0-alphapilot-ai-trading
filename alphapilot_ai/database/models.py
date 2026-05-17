@@ -33,6 +33,15 @@ class Wallet(Base):
     risk_profile = Column(String(40), default="Moderate")
     sandbox_mode = Column(Boolean, default=True)
     paper_trading_only = Column(Boolean, default=True)
+    # Trading mode: "paper" | "live" | "live_shadow"  (live_shadow = real order + paper copy)
+    trading_mode = Column(String(20), default="paper")
+    # Highest-level kill switch on the wallet. If True, the bot ignores this wallet entirely.
+    bot_paused = Column(Boolean, default=False)
+    # Hard caps the bot must respect for THIS wallet (overrides strategy caps).
+    max_position_usd = Column(Float, default=500.0)
+    max_open_positions = Column(Integer, default=3)
+    max_daily_loss_usd = Column(Float, default=200.0)
+    max_daily_trades = Column(Integer, default=10)
     connection_status = Column(String(40), default="disconnected")
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
@@ -90,6 +99,65 @@ class PaperTrade(Base):
     notes = Column(Text, default="")
 
     wallet = relationship("Wallet", back_populates="trades")
+    strategy = relationship("Strategy")
+
+
+class LiveOrder(Base):
+    """
+    A real order placed on a real exchange. The bot's autonomous loop creates
+    these. Every state change from the exchange is persisted here so we can
+    reconstruct what the bot did even after a process restart.
+    """
+
+    __tablename__ = "live_orders"
+
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False)
+    strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=True)
+
+    # Idempotency key sent to the exchange (UUID). Same key on retry => no dup order.
+    client_order_id = Column(String(64), unique=True, nullable=False, index=True)
+
+    # Set after the exchange accepts the order.
+    exchange_order_id = Column(String(120), nullable=True, index=True)
+
+    platform = Column(String(40), nullable=False)         # Coinbase / Binance / etc
+    symbol = Column(String(40), nullable=False)           # BTC-USD, ETH-USDT
+    side = Column(String(8), nullable=False)              # BUY / SELL
+    order_type = Column(String(20), nullable=False)       # market / limit / stop_limit / bracket
+    time_in_force = Column(String(8), default="GTC")      # GTC / IOC / GTD
+
+    # Sizing (one of base_qty or quote_size will be set depending on order type)
+    base_qty = Column(Float, nullable=True)
+    quote_size = Column(Float, nullable=True)
+
+    # Pricing (filled in for limit/stop variants)
+    limit_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    stop_loss_price = Column(Float, nullable=True)
+
+    # Status: pending_submit / open / partially_filled / filled / cancelled / rejected / failed
+    status = Column(String(24), default="pending_submit", index=True)
+    filled_qty = Column(Float, default=0.0)
+    avg_fill_price = Column(Float, default=0.0)
+    fees = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+
+    # Error/debug info from exchange
+    last_error = Column(Text, default="")
+    raw_payload = Column(Text, default="")  # last raw response from exchange (for debugging)
+
+    # Risk + bot context
+    confidence = Column(Float, default=0.5)
+    is_paper_shadow = Column(Boolean, default=False)  # if True, also recorded as PaperTrade
+
+    submitted_at = Column(DateTime, default=utcnow)
+    accepted_at = Column(DateTime, nullable=True)
+    filled_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+
+    wallet = relationship("Wallet")
     strategy = relationship("Strategy")
 
 
