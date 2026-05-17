@@ -83,6 +83,20 @@ Decision policy:
     nudged ±0.05 only if a corroborating or contradicting indicator is concretely \
     present in the payload.
 
+Social Sentiment Integration (when social_sentiment is provided):
+  - The payload may include a "social_sentiment" object from LunarCrush with:
+    * galaxy_score (0-100): Overall social health. >70 is strong, <40 is weak.
+    * sentiment: BULLISH/NEUTRAL/BEARISH based on social post analysis
+    * social_volume_change_24h: % change in mentions. >+50% signals breakout potential.
+    * alerts: Special conditions like HIGH_BUZZ, FADING_INTEREST, INFLUENCER_PUMP
+  - Use social data as a CONFIDENCE MODIFIER, not as a veto:
+    * BULLISH social + BUY technical = boost confidence by 0.05-0.10
+    * BEARISH social + BUY technical = reduce confidence by 0.05 (but still trade if above floor)
+    * HIGH_BUZZ alert = potential momentum, lean into the technical signal
+    * INFLUENCER_PUMP alert = caution flag, tighten stop-loss
+    * FADING_INTEREST alert = weakening momentum, consider tighter take-profit
+  - Social data is supplementary. If social_sentiment is null/missing, proceed on technicals alone.
+
 Hard rules (these are the only firm vetoes):
   1. NEVER recommend size_multiplier > 1.0 or leverage > the wallet's max_leverage.
   2. Stop-loss is REQUIRED on every BUY/SELL action (in [0.005, 0.20]).
@@ -344,6 +358,40 @@ def _build_user_prompt(
         "last_price": "most recent close",
     }
 
+    # Fetch social sentiment from LunarCrush (if available)
+    social_context = None
+    try:
+        from connectors.lunarcrush import get_social_metrics
+        social_metrics = get_social_metrics(symbol)
+        if social_metrics:
+            social_context = {
+                "galaxy_score": social_metrics.galaxy_score,
+                "alt_rank": social_metrics.alt_rank,
+                "sentiment": "BULLISH" if social_metrics.sentiment_score > 0.2 else (
+                    "BEARISH" if social_metrics.sentiment_score < -0.2 else "NEUTRAL"
+                ),
+                "sentiment_score": round(social_metrics.sentiment_score, 3),
+                "bullish_pct": round(social_metrics.bullish_pct, 1),
+                "bearish_pct": round(social_metrics.bearish_pct, 1),
+                "social_volume": social_metrics.social_volume,
+                "social_volume_change_24h": f"{social_metrics.social_volume_change_24h:+.1f}%",
+                "social_engagements": social_metrics.social_engagements,
+                "influencer_mentions": social_metrics.influencer_mentions,
+                "news_articles": social_metrics.news_articles,
+                "volume_trend": social_metrics.social_volume_trend,
+                "sentiment_trend": social_metrics.sentiment_trend,
+                "alerts": [],
+            }
+            if social_metrics.is_buzzing:
+                social_context["alerts"].append("HIGH_BUZZ: Social volume spiking - potential breakout")
+            if social_metrics.is_fading:
+                social_context["alerts"].append("FADING_INTEREST: Declining engagement - caution")
+            if social_metrics.has_influencer_pump:
+                social_context["alerts"].append("INFLUENCER_PUMP: Notable account activity - possible pump")
+    except Exception as e:
+        # Social data is optional - don't fail the decision
+        pass
+
     payload = {
         "operator_calibration": {
             # Tell Claude exactly what threshold the operator already set, so it
@@ -379,6 +427,7 @@ def _build_user_prompt(
                 "an empty history as a reason to refuse trading."
             ) if not recent_trades else "",
         },
+        "social_sentiment": social_context,
         "extra_context": extra_context,
         "now_utc": utcnow().isoformat(),
     }
