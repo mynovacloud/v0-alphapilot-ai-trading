@@ -66,6 +66,17 @@ def _migrate_schema() -> None:
             ("margin_used", "FLOAT DEFAULT 0.0"),
             ("liquidation_price", "FLOAT"),
             ("funding_paid", "FLOAT DEFAULT 0.0"),
+            # Position management columns (added for SL/TP/trailing/DCA support)
+            ("stop_loss_price", "FLOAT"),
+            ("take_profit_price", "FLOAT"),
+            ("trailing_stop_pct", "FLOAT"),
+            ("trailing_stop_price", "FLOAT"),
+            ("high_water_price", "FLOAT"),
+            ("max_loss_pct", "FLOAT DEFAULT 0.10"),
+            ("time_limit_hours", "FLOAT"),
+            ("dca_count", "INTEGER DEFAULT 0"),
+            ("original_entry", "FLOAT"),
+            ("exit_reason", "VARCHAR(30)"),
         ],
     }
 
