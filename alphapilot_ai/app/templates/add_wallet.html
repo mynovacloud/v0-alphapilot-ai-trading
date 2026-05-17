@@ -6,29 +6,35 @@
 <div class="page-head">
   <div>
     <h1>Add a wallet</h1>
-    <p>Wallets are paper-trading accounts. API keys are stored locally as placeholders for future live integration — they are never used to place real trades.</p>
+    <p>Wallets are paper-trading accounts. You can connect a real exchange (read-only) so the AI sees your real balances and prices, while every trade stays simulated.</p>
   </div>
   <a class="btn" href="/wallets">Cancel</a>
 </div>
 
-<div class="banner banner-warn">
-  Live trading is locked. Any keys you enter here are saved as placeholders only and will not be used until live trading is explicitly enabled.
+<div class="banner banner-info">
+  <strong>Live trading is locked.</strong> API keys you enter are used only to <em>read</em> account info and prices. No real orders are ever placed by this app.
 </div>
 
 <form method="post" action="/wallets/new" class="panel">
   <div class="form-grid">
     <div class="field">
       <label>Wallet Name</label>
-      <input class="input" name="name" required placeholder="e.g. Crypto.com Spot">
+      <input class="input" name="name" required placeholder="e.g. Coinbase Main">
     </div>
     <div class="field">
       <label>Platform</label>
-      <select class="select" name="platform" required>
-        {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+      <select class="select" name="platform" id="platform-select" required>
+        <optgroup label="Real API support (read-only)">
+          {% for p in platforms if p in real_auth_platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+        </optgroup>
+        <optgroup label="Coming soon (paper-only)">
+          {% for p in platforms if p not in real_auth_platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
+        </optgroup>
       </select>
+      <small>Real API support: <strong>Coinbase, Binance, Kraken</strong>. Other platforms are paper-only for now.</small>
     </div>
     <div class="field">
-      <label>Initial Paper Balance</label>
+      <label>Initial Paper Balance (USD)</label>
       <input class="input" name="paper_balance" type="number" step="0.01" value="10000.00">
       <small>Virtual cash for simulated trades.</small>
     </div>
@@ -44,16 +50,22 @@
         <option value="on" selected>On</option>
         <option value="off">Off</option>
       </select>
-      <small>Forces all connectors into mocked behavior.</small>
+      <small>Forces all connectors into safe read-only behavior.</small>
     </div>
   </div>
 
-  <h3 class="mt-4 mb-2">API Credentials (optional, placeholder only)</h3>
+  <h3 class="mt-4 mb-2">API Credentials (optional)</h3>
+  <div class="banner banner-warn" style="font-size: 0.85rem;">
+    <strong>Read-only keys recommended.</strong> When creating an exchange API key, enable only "View" / "Read" permissions. Do <em>not</em> grant trade or withdraw permissions — this app does not need them.
+  </div>
+
+  <div id="platform-help" class="text-muted" style="font-size: 0.82rem; margin-bottom: 0.6rem;"></div>
+
   <div class="form-grid">
-    <div class="field"><label>API Key</label><input class="input" name="api_key" type="password" autocomplete="off"></div>
-    <div class="field"><label>API Secret</label><input class="input" name="api_secret" type="password" autocomplete="off"></div>
-    <div class="field"><label>Passphrase</label><input class="input" name="api_passphrase" type="password" autocomplete="off"></div>
-    <div class="field"><label>Account ID</label><input class="input" name="account_id"></div>
+    <div class="field"><label>API Key</label><input class="input" name="api_key" type="password" autocomplete="off" placeholder="paste here"></div>
+    <div class="field"><label>API Secret</label><input class="input" name="api_secret" type="password" autocomplete="off" placeholder="paste here"></div>
+    <div class="field" id="passphrase-field"><label>Passphrase (Coinbase legacy only)</label><input class="input" name="api_passphrase" type="password" autocomplete="off"></div>
+    <div class="field"><label>Account ID (optional)</label><input class="input" name="account_id"></div>
   </div>
 
   <div class="flex gap-2 mt-4">
@@ -61,5 +73,21 @@
     <a class="btn" href="/wallets">Cancel</a>
   </div>
 </form>
+
+<script>
+  const helpText = {
+    "Coinbase": "Create an API key at <a href='https://www.coinbase.com/settings/api' target='_blank' rel='noopener'>coinbase.com/settings/api</a>. Use 'Advanced Trade' API. Permissions: View only.",
+    "Binance": "Create an API key at <a href='https://www.binance.com/en/my/settings/api-management' target='_blank' rel='noopener'>binance.com</a>. Permissions: Enable Reading only.",
+    "Kraken": "Create an API key at <a href='https://www.kraken.com/u/security/api' target='_blank' rel='noopener'>kraken.com/u/security/api</a>. Permissions: Query Funds + Query Open/Closed Orders only.",
+  };
+  const sel = document.getElementById('platform-select');
+  const help = document.getElementById('platform-help');
+  function update() {
+    const v = sel.value;
+    help.innerHTML = helpText[v] || "Real API auth isn't wired up for this platform yet — keys will be saved for future use, paper trading still works.";
+  }
+  sel.addEventListener('change', update);
+  update();
+</script>
 
 {% endblock %}

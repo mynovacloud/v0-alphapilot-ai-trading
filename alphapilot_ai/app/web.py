@@ -27,8 +27,10 @@ from analytics.portfolio import (
     portfolio_summary,
 )
 from config.settings import settings
-from connectors.registry import CONNECTOR_REGISTRY, get_connector
-from database.db import session_scope
+from connectors.live_prices import get_price as live_price
+from connectors.live_prices import known_symbols
+from connectors.registry import CONNECTOR_REGISTRY, REAL_AUTH_PLATFORMS, get_connector
+from database.db import reset_db, session_scope
 from database.models import (
     ActivityLog,
     AppSetting,
@@ -226,6 +228,7 @@ def add_wallet_page(request: Request) -> HTMLResponse:
             request,
             active="wallets",
             platforms=list(CONNECTOR_REGISTRY.keys()),
+            real_auth_platforms=sorted(REAL_AUTH_PLATFORMS),
             risk_profiles=["Conservative", "Moderate", "Aggressive", "Degenerate"],
         ),
     )
@@ -243,6 +246,26 @@ def add_wallet_submit(
     api_passphrase: str = Form(""),
     account_id: str = Form(""),
 ) -> RedirectResponse:
+    # If keys were provided AND the platform supports real auth, validate them
+    # before creating the wallet, so the user gets feedback immediately.
+    api_status = "no-keys"
+    connection_status = "ready (paper)"
+    if api_key and platform in REAL_AUTH_PLATFORMS:
+        connector = get_connector(
+            platform,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            account_id=account_id,
+        )
+        v = connector.validate_credentials()
+        if v.get("valid"):
+            api_status = "live (read-only)"
+            connection_status = "connected (live)"
+        else:
+            api_status = f"invalid: {v.get('error', 'auth failed')}"
+            connection_status = "auth failed"
+
     with session_scope() as s:
         w = Wallet(
             name=name,
@@ -251,8 +274,8 @@ def add_wallet_submit(
             risk_profile=risk_profile,
             sandbox_mode=sandbox_mode == "on",
             paper_trading_only=True,
-            connection_status="connected (mock)",
-            api_status="mock",
+            connection_status=connection_status,
+            api_status=api_status,
         )
         s.add(w)
         s.flush()
@@ -270,7 +293,10 @@ def add_wallet_submit(
                 category="wallet",
                 level="info",
                 wallet_id=w.id,
-                message=f"Wallet '{w.name}' ({w.platform}) created with paper balance ${paper_balance:.2f}",
+                message=(
+                    f"Wallet '{w.name}' ({w.platform}) created — "
+                    f"paper balance ${paper_balance:.2f}, api_status={api_status}"
+                ),
             )
         )
     return RedirectResponse(url="/wallets", status_code=303)
@@ -380,19 +406,101 @@ def wallet_test(request: Request, wallet_id: int) -> HTMLResponse:
         w = s.get(Wallet, wallet_id)
         if not w:
             return HTMLResponse("<span class='badge badge-bad'>Not found</span>")
-        connector = get_connector(w.platform, sandbox=w.sandbox_mode)
-        connector.connect()
+        creds = (
+            s.query(ApiCredentialPlaceholder)
+            .filter(ApiCredentialPlaceholder.wallet_id == wallet_id)
+            .first()
+        )
+        connector = get_connector(
+            w.platform,
+            api_key=creds.api_key if creds else "",
+            api_secret=creds.api_secret if creds else "",
+            api_passphrase=creds.api_passphrase if creds else "",
+            account_id=creds.account_id if creds else "",
+            sandbox=w.sandbox_mode,
+        )
+        result = connector.validate_credentials()
+        valid = bool(result.get("valid"))
+        msg = "Connection OK" if valid else f"Failed: {result.get('error', 'unknown')}"
+        if valid:
+            w.connection_status = "connected (live)" if result.get("live") else "connected (mock)"
+            w.api_status = "live (read-only)" if result.get("live") else "mock"
+        else:
+            w.connection_status = "auth failed"
+            w.api_status = "invalid"
+        w.last_synced = utcnow()
         s.add(
             ActivityLog(
                 category="api",
-                level="info",
+                level="info" if valid else "warn",
                 wallet_id=wallet_id,
-                message=f"Mock connection test for {w.platform}: ok",
+                message=f"API test for {w.platform}: {msg}",
             )
         )
-    return HTMLResponse(
-        "<span class='badge badge-good'>Connection OK (mock)</span>"
-    )
+        cls = "badge-good" if valid else "badge-bad"
+    return HTMLResponse(f"<span class='badge {cls}'>{msg}</span>")
+
+
+@router.post("/wallets/{wallet_id}/sync", response_class=HTMLResponse)
+def wallet_sync(request: Request, wallet_id: int) -> HTMLResponse:
+    """Pull live balances from the exchange (read-only) and update the wallet."""
+    with session_scope() as s:
+        w = s.get(Wallet, wallet_id)
+        if not w:
+            return HTMLResponse("<span class='badge badge-bad'>Not found</span>")
+        creds = (
+            s.query(ApiCredentialPlaceholder)
+            .filter(ApiCredentialPlaceholder.wallet_id == wallet_id)
+            .first()
+        )
+        if not creds or not creds.api_key:
+            return HTMLResponse(
+                "<span class='badge badge-warn'>No API keys saved — paper trading only</span>"
+            )
+        connector = get_connector(
+            w.platform,
+            api_key=creds.api_key,
+            api_secret=creds.api_secret,
+            api_passphrase=creds.api_passphrase,
+            account_id=creds.account_id,
+            sandbox=w.sandbox_mode,
+        )
+        bal = connector.fetch_balance()
+        if bal.get("live"):
+            w.real_balance_placeholder = float(bal.get("cash", 0.0))
+            w.connection_status = "connected (live)"
+            w.api_status = "live (read-only)"
+            w.last_synced = utcnow()
+            s.add(
+                ActivityLog(
+                    category="api",
+                    level="info",
+                    wallet_id=wallet_id,
+                    message=(
+                        f"Synced {w.platform}: live cash ${w.real_balance_placeholder:,.2f} "
+                        f"({len(bal.get('balances', []))} non-zero balances)"
+                    ),
+                )
+            )
+            return HTMLResponse(
+                f"<span class='badge badge-good'>Live cash ${w.real_balance_placeholder:,.2f}</span>"
+            )
+        err = bal.get("error", "unknown error")
+        s.add(
+            ActivityLog(
+                category="api",
+                level="warn",
+                wallet_id=wallet_id,
+                message=f"Sync failed for {w.platform}: {err}",
+            )
+        )
+        return HTMLResponse(f"<span class='badge badge-bad'>Sync failed: {err}</span>")
+
+
+@router.get("/api/price")
+def api_live_price(symbol: str) -> dict[str, Any]:
+    """Endpoint used by HTMX in templates to look up a live price."""
+    return live_price(symbol)
 
 
 @router.post("/wallets/{wallet_id}/trade")
@@ -401,10 +509,29 @@ def wallet_open_trade(
     symbol: str = Form(...),
     side: str = Form("BUY"),
     qty: float = Form(...),
-    entry_price: float = Form(...),
+    entry_price: float = Form(0.0),
     confidence: float = Form(0.6),
+    use_live_price: str = Form(""),
     strategy_id: int | None = Form(None),
 ) -> RedirectResponse:
+    # If user asked for live price OR didn't provide a price, look it up.
+    if use_live_price == "on" or entry_price <= 0:
+        lp = live_price(symbol)
+        if lp.get("ok"):
+            entry_price = float(lp["price"])
+        elif entry_price <= 0:
+            # Fall back to refusing — better than fake price.
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="paper_trade",
+                        level="warn",
+                        wallet_id=wallet_id,
+                        message=f"Trade rejected: live price unavailable for {symbol}",
+                    )
+                )
+            return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
+
     _engine.open_trade(
         wallet_id=wallet_id,
         symbol=symbol,
@@ -418,12 +545,22 @@ def wallet_open_trade(
 
 
 @router.post("/trades/{trade_id}/close")
-def trade_close(trade_id: int, exit_price: float = Form(...)) -> RedirectResponse:
+def trade_close(
+    trade_id: int,
+    exit_price: float = Form(0.0),
+    use_live_price: str = Form(""),
+) -> RedirectResponse:
     wallet_id = None
+    symbol = ""
     with session_scope() as s:
         t = s.get(PaperTrade, trade_id)
         if t:
             wallet_id = t.wallet_id
+            symbol = t.symbol
+    if (use_live_price == "on" or exit_price <= 0) and symbol:
+        lp = live_price(symbol)
+        if lp.get("ok"):
+            exit_price = float(lp["price"])
     _engine.close_trade(trade_id, exit_price)
     if wallet_id:
         return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
@@ -744,3 +881,17 @@ def settings_save(
             )
         )
     return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/reset-data")
+def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
+    """
+    DESTRUCTIVE: drop and recreate every table.
+
+    Use this to wipe all wallets, trades, AI memory, and settings when you
+    want to start fresh. Requires the user to type RESET in the confirm box.
+    """
+    if confirm.strip().upper() != "RESET":
+        return RedirectResponse(url="/settings?reset=denied", status_code=303)
+    reset_db()
+    return RedirectResponse(url="/wallets", status_code=303)

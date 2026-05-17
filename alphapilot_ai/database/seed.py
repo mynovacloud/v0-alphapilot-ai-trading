@@ -49,6 +49,17 @@ _LESSONS = [
 
 
 def seed_if_empty() -> None:
+    """
+    Seed mock data ONLY if explicitly requested via SEED_DEMO_DATA=true env var.
+
+    By default this is a no-op so the app starts empty and the user can
+    create their own real wallets. To re-enable demos for development,
+    set SEED_DEMO_DATA=true in your .env.
+    """
+    import os
+    if os.getenv("SEED_DEMO_DATA", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+
     with session_scope() as s:
         if s.query(Wallet).count() > 0:
             return
