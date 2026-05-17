@@ -612,8 +612,10 @@ class BotEngine:
             wallet_ids = [w[0] for w in wallet_ids]
 
         closed_count = 0
+        self._log("bot", f"[MONITOR] Checking {len(wallet_ids)} wallets, {len(price_map)} prices available", level="debug")
         for wallet_id in wallet_ids:
             exits = self.position_monitor.check_all_positions(wallet_id, price_map)
+            self._log("bot", f"[MONITOR] Wallet {wallet_id}: {len(exits)} exit signals", level="debug")
             for exit_signal in exits:
                 # Close the position through the paper engine
                 outcome = self.paper.close_trade(

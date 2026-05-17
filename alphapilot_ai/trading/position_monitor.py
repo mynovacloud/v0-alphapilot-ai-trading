@@ -117,14 +117,28 @@ class PositionMonitor:
         # =====================================================================
         # SCALPER MODE: Check micro-profit target (highest priority for profits)
         # =====================================================================
-        wallet = trade.wallet
-        trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
-        micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-        min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+        # Get wallet settings - use explicit query to ensure fresh data
+        from database.models import Wallet
+        wallet = session.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+        
+        # Default values if columns don't exist yet
+        trading_style = 'hybrid'
+        micro_target_usd = 0.25
+        min_profit_pct = 0.003
+        
+        if wallet:
+            trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
+            micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
+            min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+        
+        # Log for debugging
+        import logging
+        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl_usd=${pnl_usd:.4f}, target=${micro_target_usd}, style={trading_style}")
         
         if pnl_usd > 0:  # Only check if we're in profit
             # Scalper mode: take ANY profit that hits the USD target
             if trading_style == "scalper" and pnl_usd >= micro_target_usd:
+                logging.info(f"[SCALPER] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f} >= target=${micro_target_usd}")
                 self._log_exit(session, trade, "micro_profit", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
@@ -138,6 +152,7 @@ class PositionMonitor:
             # Hybrid mode: use both USD and percentage targets
             if trading_style == "hybrid":
                 if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
+                    logging.info(f"[HYBRID] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f}, pnl_pct={pnl_pct:.4%}")
                     self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
                     return ExitSignal(
                         trade_id=trade.id,
@@ -147,6 +162,9 @@ class PositionMonitor:
                         trigger_price=None,
                         pnl_pct=pnl_pct,
                     )
+            
+            # Swing mode: only use percentage-based targets (traditional SL/TP)
+            # Falls through to the standard SL/TP checks below
 
         # 1. Check max loss (hard cap)
         max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)
