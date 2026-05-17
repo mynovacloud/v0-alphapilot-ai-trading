@@ -277,7 +277,7 @@
   // Portfolio Intelligence polling
   async function pollPortfolioIntel() {
     try {
-      const res = await fetch("/api/portfolio-intel");
+      const res = await fetch("/v1/portfolio-intel");
       if (!res.ok) return;
       const data = await res.json();
       if (!data.ok) return;

@@ -1952,7 +1952,7 @@ def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
 # ============================================================================ #
 
 
-@router.get("/api/positions")
+@router.get("/v1/positions")
 def api_positions() -> JSONResponse:
     """
     Get all open positions with current P&L and SL/TP proximity.
@@ -2044,7 +2044,7 @@ def api_positions() -> JSONResponse:
     return JSONResponse({"ok": True, "positions": positions})
 
 
-@router.post("/api/positions/{trade_id}/close")
+@router.post("/v1/positions/{trade_id}/close")
 def api_close_position(trade_id: int) -> JSONResponse:
     """
     Close a single position at current market price.
@@ -2081,7 +2081,7 @@ def api_close_position(trade_id: int) -> JSONResponse:
         return JSONResponse({"ok": False, "error": result.get("error", "Unknown error")}, status_code=500)
 
 
-@router.post("/api/positions/close-all")
+@router.post("/v1/positions/close-all")
 def api_close_all_positions() -> JSONResponse:
     """
     Close all open positions at current market prices.
@@ -2132,7 +2132,7 @@ def api_close_all_positions() -> JSONResponse:
     })
 
 
-@router.post("/api/positions/take-profits")
+@router.post("/v1/positions/take-profits")
 def api_take_all_profits() -> JSONResponse:
     """
     Close only PROFITABLE positions - lock in gains immediately.
@@ -2197,7 +2197,7 @@ def api_take_all_profits() -> JSONResponse:
     })
 
 
-@router.post("/api/wallet/trading-style")
+@router.post("/v1/wallet/trading-style")
 def api_update_trading_style(
     trading_style: str = Form(...),  # scalper, swing, hybrid
     micro_profit_target_usd: float = Form(0.25),
@@ -2244,7 +2244,7 @@ def api_update_trading_style(
     })
 
 
-@router.get("/api/wallet/trading-style")
+@router.get("/v1/wallet/trading-style")
 def api_get_trading_style() -> JSONResponse:
     """Get current wallet trading style settings."""
     with session_scope() as s:
@@ -2262,7 +2262,7 @@ def api_get_trading_style() -> JSONResponse:
         })
 
 
-@router.post("/api/positions/{trade_id}/close-partial")
+@router.post("/v1/positions/{trade_id}/close-partial")
 def api_close_partial(
     trade_id: int,
     fraction: float = Form(...),
@@ -2333,7 +2333,7 @@ def api_close_partial(
     })
 
 
-@router.post("/api/positions/{trade_id}/sl-tp")
+@router.post("/v1/positions/{trade_id}/sl-tp")
 def api_update_sl_tp(
     trade_id: int,
     stop_loss_price: float | None = Form(None),
@@ -2366,7 +2366,7 @@ def api_update_sl_tp(
     return JSONResponse({"ok": True})
 
 
-@router.post("/api/positions/{trade_id}/trailing")
+@router.post("/v1/positions/{trade_id}/trailing")
 def api_set_trailing_stop(
     trade_id: int,
     trailing_stop_pct: float = Form(...),
@@ -2421,7 +2421,7 @@ def api_set_trailing_stop(
     return JSONResponse({"ok": True, "trailing_stop_price": trade.trailing_stop_price})
 
 
-@router.post("/api/positions/{trade_id}/dca")
+@router.post("/v1/positions/{trade_id}/dca")
 def api_dca_position(
     trade_id: int,
     add_usd: float = Form(...),
@@ -2470,7 +2470,7 @@ def api_dca_position(
         return JSONResponse({"ok": False, "error": "DCA failed"}, status_code=500)
 
 
-@router.post("/api/positions/emergency-exit")
+@router.post("/v1/positions/emergency-exit")
 def api_emergency_exit() -> JSONResponse:
     """
     Emergency exit: Close all positions AND engage kill switch.
@@ -2501,7 +2501,7 @@ def api_emergency_exit() -> JSONResponse:
     })
 
 
-@router.get("/api/portfolio-intel")
+@router.get("/v1/portfolio-intel")
 def api_portfolio_intel() -> JSONResponse:
     """
     Get portfolio intelligence state - whether recovery mode is active,
@@ -2579,4 +2579,86 @@ def api_portfolio_intel() -> JSONResponse:
         "total_pnl_usd": round(total_pnl, 2),
         "portfolios": portfolio_states,
         "recent_actions": recent_actions,
+    })
+
+
+@router.get("/v1/pnl-stats")
+def api_pnl_stats(period: str = "today") -> JSONResponse:
+    """
+    Get realized P&L stats for a given time period.
+    
+    period: today, 3days, week, 2weeks, month, all
+    """
+    from datetime import datetime, timedelta
+    
+    now = datetime.utcnow()
+    
+    # Calculate start date based on period
+    if period == "today":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "3days":
+        start_date = (now - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start_date = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "2weeks":
+        start_date = (now - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "month":
+        start_date = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:  # all
+        start_date = None
+    
+    with session_scope() as s:
+        query = s.query(PaperTrade).filter(PaperTrade.status == "closed")
+        
+        if start_date:
+            query = query.filter(PaperTrade.closed_at >= start_date)
+        
+        closed_trades = query.all()
+        
+        # Calculate stats
+        total_pnl = 0.0
+        wins = 0
+        losses = 0
+        best_trade = 0.0
+        worst_trade = 0.0
+        total_volume = 0.0
+        
+        for trade in closed_trades:
+            pnl = float(trade.realized_pnl or 0)
+            total_pnl += pnl
+            total_volume += float(trade.entry_price or 0) * float(trade.qty or 0)
+            
+            if pnl > 0:
+                wins += 1
+                if pnl > best_trade:
+                    best_trade = pnl
+            elif pnl < 0:
+                losses += 1
+                if pnl < worst_trade:
+                    worst_trade = pnl
+        
+        trade_count = len(closed_trades)
+        win_rate = (wins / trade_count * 100) if trade_count > 0 else 0
+        avg_trade = (total_pnl / trade_count) if trade_count > 0 else 0
+        
+        # Calculate daily average if not "today"
+        if start_date and period != "today":
+            days = (now - start_date).days or 1
+            daily_avg = total_pnl / days
+        else:
+            daily_avg = total_pnl
+    
+    return JSONResponse({
+        "ok": True,
+        "period": period,
+        "total_pnl": round(total_pnl, 2),
+        "trade_count": trade_count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 1),
+        "avg_trade": round(avg_trade, 2),
+        "best_trade": round(best_trade, 2),
+        "worst_trade": round(worst_trade, 2),
+        "daily_avg": round(daily_avg, 2),
+        "total_volume": round(total_volume, 2),
     })

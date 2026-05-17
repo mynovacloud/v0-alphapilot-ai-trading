@@ -196,6 +196,127 @@ function recordIntelAction(type, symbol, reason) {
 </div>
 
 <!-- ============================================================ -->
+<!-- P&L BY TIME PERIOD                                            -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="pnl-period-card">
+  <div class="card-header">
+    <div class="card-title">Performance by Period</div>
+    <div class="flex gap-1" id="pnl-period-filters">
+      <button type="button" class="btn btn-sm btn-outline pnl-filter active" data-period="today">Today</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="3days">3 Days</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="week">This Week</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="2weeks">2 Weeks</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="month">Month</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="all">All Time</button>
+    </div>
+  </div>
+  
+  <div class="grid" style="grid-template-columns: repeat(6, 1fr); gap: 1rem; padding-top: 0.5rem;">
+    <!-- Total P&L -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Total P&L</div>
+      <div id="pnl-total" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--text);">$0.00</div>
+    </div>
+    
+    <!-- Trade Count -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Trades</div>
+      <div id="pnl-trades" class="mono" style="font-size: 1.5rem; font-weight: 800;">0</div>
+      <div id="pnl-wl" class="text-dim" style="font-size: 0.72rem;">0W / 0L</div>
+    </div>
+    
+    <!-- Win Rate -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Win Rate</div>
+      <div id="pnl-winrate" class="mono" style="font-size: 1.5rem; font-weight: 800;">0%</div>
+    </div>
+    
+    <!-- Avg Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Avg Trade</div>
+      <div id="pnl-avg" class="mono" style="font-size: 1.5rem; font-weight: 800;">$0.00</div>
+    </div>
+    
+    <!-- Best Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Best Trade</div>
+      <div id="pnl-best" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--good);">$0.00</div>
+    </div>
+    
+    <!-- Worst Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Worst Trade</div>
+      <div id="pnl-worst" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--bad);">$0.00</div>
+    </div>
+  </div>
+  
+  <div style="margin-top: 0.8rem; padding-top: 0.6rem; border-top: 1px solid var(--border);">
+    <span class="text-dim" style="font-size: 0.72rem;">
+      Daily average: <span id="pnl-daily-avg" class="mono">$0.00</span> · 
+      Volume traded: <span id="pnl-volume" class="mono">$0.00</span>
+    </span>
+  </div>
+</div>
+
+<script>
+// P&L Period Stats
+async function loadPnlStats(period = 'today') {
+  try {
+    const res = await fetch(`/v1/pnl-stats?period=${period}`);
+    const data = await res.json();
+    if (!data.ok) return;
+    
+    const totalEl = document.getElementById('pnl-total');
+    const pnl = data.total_pnl;
+    totalEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    totalEl.style.color = pnl > 0 ? 'var(--good)' : (pnl < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-trades').textContent = data.trade_count;
+    document.getElementById('pnl-wl').textContent = `${data.wins}W / ${data.losses}L`;
+    
+    const wrEl = document.getElementById('pnl-winrate');
+    wrEl.textContent = data.win_rate.toFixed(1) + '%';
+    wrEl.style.color = data.win_rate >= 55 ? 'var(--good)' : (data.win_rate >= 40 ? 'var(--warn)' : 'var(--bad)');
+    
+    const avgEl = document.getElementById('pnl-avg');
+    avgEl.textContent = (data.avg_trade >= 0 ? '+' : '') + '$' + data.avg_trade.toFixed(2);
+    avgEl.style.color = data.avg_trade > 0 ? 'var(--good)' : (data.avg_trade < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-best').textContent = '+$' + data.best_trade.toFixed(2);
+    document.getElementById('pnl-worst').textContent = '-$' + Math.abs(data.worst_trade).toFixed(2);
+    
+    const dailyEl = document.getElementById('pnl-daily-avg');
+    dailyEl.textContent = (data.daily_avg >= 0 ? '+' : '') + '$' + data.daily_avg.toFixed(2);
+    dailyEl.style.color = data.daily_avg > 0 ? 'var(--good)' : (data.daily_avg < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-volume').textContent = '$' + data.total_volume.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  } catch (err) {
+    console.error('Failed to load P&L stats:', err);
+  }
+}
+
+// Filter button handlers
+document.querySelectorAll('.pnl-filter').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.pnl-filter').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    loadPnlStats(btn.dataset.period);
+  });
+});
+
+// Load initial stats
+loadPnlStats('today');
+</script>
+
+<style>
+.pnl-filter.active {
+  background: var(--accent) !important;
+  color: white !important;
+  border-color: var(--accent) !important;
+}
+</style>
+
+<!-- ============================================================ -->
 <!-- LIVE TRADING SESSION                                            -->
 <!-- Real-time paper trading with the autonomous engine running.     -->
 <!-- ============================================================ -->
@@ -471,7 +592,7 @@ let positionsData = [];
 
 async function refreshPositions() {
   try {
-    const res = await fetch('/api/positions');
+    const res = await fetch('/v1/positions');
     const data = await res.json();
     if (data.ok) {
       positionsData = data.positions;
@@ -544,7 +665,7 @@ function renderPositions(positions) {
 async function closePosition(tradeId) {
   if (!confirm('Close this position at market price?')) return;
   try {
-    const res = await fetch(`/api/positions/${tradeId}/close`, { method: 'POST' });
+    const res = await fetch(`/v1/positions/${tradeId}/close`, { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Position closed. Realized P&L: $${data.realized_pnl.toFixed(2)}`);
@@ -560,7 +681,7 @@ async function closePosition(tradeId) {
 async function closeAllPositions() {
   if (!confirm('Close ALL open positions? This cannot be undone.')) return;
   try {
-    const res = await fetch('/api/positions/close-all', { method: 'POST' });
+    const res = await fetch('/v1/positions/close-all', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Closed ${data.closed} positions. Total P&L: $${data.total_pnl.toFixed(2)}`);
@@ -576,7 +697,7 @@ async function closeAllPositions() {
 async function emergencyExit() {
   if (!confirm('EMERGENCY EXIT: This will close ALL positions AND engage the kill switch. Continue?')) return;
   try {
-    const res = await fetch('/api/positions/emergency-exit', { method: 'POST' });
+    const res = await fetch('/v1/positions/emergency-exit', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Emergency exit complete.\n- Positions closed: ${data.positions_closed}\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Kill switch: ENGAGED`);
@@ -592,7 +713,7 @@ async function emergencyExit() {
 async function takeProfits() {
   if (!confirm('Close ALL profitable positions? This will lock in gains on all winning trades.')) return;
   try {
-    const res = await fetch('/api/positions/take-profits', { method: 'POST' });
+    const res = await fetch('/v1/positions/take-profits', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Profits taken!\n- Closed: ${data.closed} winners\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Held: ${data.skipped} positions`);
@@ -609,7 +730,7 @@ async function openTradingStyleModal() {
   // Fetch current settings
   let settings = { trading_style: 'hybrid', micro_profit_target_usd: 0.25, min_profit_pct: 0.003, auto_reinvest: true, max_daily_trades: 100 };
   try {
-    const res = await fetch('/api/wallet/trading-style');
+    const res = await fetch('/v1/wallet/trading-style');
     const data = await res.json();
     if (data.ok) settings = data;
   } catch (err) {}
@@ -669,7 +790,7 @@ async function saveTradingStyle() {
   formData.append('auto_reinvest', reinvest);
   
   try {
-    const res = await fetch('/api/wallet/trading-style', { method: 'POST', body: formData });
+    const res = await fetch('/v1/wallet/trading-style', { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Trading style updated!\n- Mode: ${mode}\n- Micro-target: $${microUsd}\n- Max trades/day: ${maxTrades}`);
@@ -805,7 +926,7 @@ async function updateSlTp(tradeId, type) {
   if ((type === 'tp' || type === 'both') && tpVal) formData.append('take_profit_price', tpVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/sl-tp`, {
+    const res = await fetch(`/v1/positions/${tradeId}/sl-tp`, {
       method: 'POST',
       body: formData
     });
@@ -846,7 +967,7 @@ async function setTrailingQuick(tradeId, pct) {
   const formData = new FormData();
   formData.append('trailing_stop_pct', pct);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/trailing`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/trailing`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Trailing stop set at $${data.trailing_stop_price.toFixed(4)}`);
@@ -861,7 +982,7 @@ async function quickDca(tradeId, amount) {
   const formData = new FormData();
   formData.append('add_usd', amount);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/dca`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/dca`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Added $${amount}. New avg: $${data.new_entry.toFixed(4)}`);
@@ -893,7 +1014,7 @@ async function closePartial(tradeId, fraction) {
   const formData = new FormData();
   formData.append('fraction', fraction);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/close-partial`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/close-partial`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Closed ${(fraction*100).toFixed(0)}%. Realized: $${data.realized_pnl.toFixed(2)}`);
@@ -916,7 +1037,7 @@ async function setTrailing(tradeId) {
   formData.append('trailing_stop_pct', trailVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/trailing`, {
+    const res = await fetch(`/v1/positions/${tradeId}/trailing`, {
       method: 'POST',
       body: formData
     });
@@ -944,7 +1065,7 @@ async function executeDca(tradeId) {
   formData.append('add_usd', dcaVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/dca`, {
+    const res = await fetch(`/v1/positions/${tradeId}/dca`, {
       method: 'POST',
       body: formData
     });
