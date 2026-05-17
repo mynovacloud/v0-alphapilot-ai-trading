@@ -76,27 +76,27 @@ class PortfolioIntelligence:
     
     def __init__(
         self,
-        # DCA settings
-        dca_at_loss_pct: float = 0.03,  # DCA when down 3%+
-        dca_size_pct: float = 0.5,  # Add 50% of original position
-        max_dca_per_position: int = 3,
+        # DCA settings - MORE AGGRESSIVE
+        dca_at_loss_pct: float = 0.02,  # DCA when down 2%+ (was 3%)
+        dca_size_pct: float = 0.75,  # Add 75% of original position (was 50%)
+        max_dca_per_position: int = 5,  # Allow up to 5 DCAs (was 3)
         
         # Scale-in settings (adding to winners)
-        scale_in_at_profit_pct: float = 0.03,  # Scale in when up 3%+
-        scale_in_size_pct: float = 0.3,  # Add 30% to winners
-        max_scale_ins: int = 2,
+        scale_in_at_profit_pct: float = 0.02,  # Scale in when up 2%+ (was 3%)
+        scale_in_size_pct: float = 0.5,  # Add 50% to winners (was 30%)
+        max_scale_ins: int = 3,  # Allow 3 scale-ins (was 2)
         
-        # Offset trading
-        offset_when_portfolio_down_pct: float = 0.02,  # Start offset trades when portfolio down 2%+
-        offset_trade_size_pct: float = 0.5,  # Offset trades are 50% normal size
+        # Offset trading - MORE AGGRESSIVE
+        offset_when_portfolio_down_pct: float = 0.01,  # Start offset trades when portfolio down 1%+ (was 2%)
+        offset_trade_size_pct: float = 0.75,  # Offset trades are 75% normal size (was 50%)
         
         # Recovery mode thresholds
-        recovery_mode_threshold_pct: float = 0.05,  # Portfolio down 5% = recovery mode
-        aggressive_dca_multiplier: float = 1.5,  # In recovery mode, DCA 1.5x normal
+        recovery_mode_threshold_pct: float = 0.03,  # Portfolio down 3% = recovery mode (was 5%)
+        aggressive_dca_multiplier: float = 2.0,  # In recovery mode, DCA 2x normal (was 1.5x)
         
         # Risk limits
-        max_portfolio_concentration_pct: float = 0.4,  # No single position > 40% of portfolio
-        min_diversification_count: int = 3,  # Try to have at least 3 different assets
+        max_portfolio_concentration_pct: float = 0.30,  # No single position > 30% of portfolio (was 40%)
+        min_diversification_count: int = 5,  # Try to have at least 5 different assets (was 3)
     ):
         self.dca_at_loss_pct = dca_at_loss_pct
         self.dca_size_pct = dca_size_pct

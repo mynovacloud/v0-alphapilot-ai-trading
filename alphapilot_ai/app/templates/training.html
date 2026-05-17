@@ -591,45 +591,106 @@ function openSettings(tradeId) {
   const p = positionsData.find(pos => pos.id === tradeId);
   if (!p) return;
 
-  document.getElementById('modal-title').textContent = `Settings: ${p.symbol} ${p.side}`;
+  const pnlClass = p.pnl >= 0 ? 'text-good' : 'text-bad';
+  const dcaRemaining = 5 - (p.dca_count || 0);  // Allow up to 5 DCAs
+
+  document.getElementById('modal-title').textContent = `${p.symbol} ${p.side}`;
   document.getElementById('modal-content').innerHTML = `
-    <div class="flex flex-col gap-3">
-      <div>
-        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Stop Loss Price</label>
-        <div class="flex gap-2">
-          <input type="number" id="modal-sl" class="input" style="flex:1;" step="0.01" value="${p.stop_loss_price || ''}" placeholder="Not set">
-          <button class="btn btn-outline btn-sm" onclick="updateSlTp(${p.id}, 'sl')">Set SL</button>
+    <!-- Position Summary -->
+    <div style="background: var(--bg-elev); border-radius: var(--radius); padding: 0.8rem; margin-bottom: 1rem;">
+      <div class="flex justify-between" style="margin-bottom: 0.5rem;">
+        <span class="text-muted">Current P&L</span>
+        <span class="mono ${pnlClass}" style="font-size: 1.1rem; font-weight: 600;">
+          ${p.pnl >= 0 ? '+' : ''}$${p.pnl.toFixed(2)} (${p.pnl_pct >= 0 ? '+' : ''}${p.pnl_pct.toFixed(2)}%)
+        </span>
+      </div>
+      <div class="flex justify-between" style="font-size: 0.8rem;">
+        <span class="text-muted">Entry: <span class="mono">$${p.entry_price.toFixed(4)}</span></span>
+        <span class="text-muted">Now: <span class="mono">$${p.current_price.toFixed(4)}</span></span>
+      </div>
+      <div class="flex justify-between" style="font-size: 0.8rem; margin-top: 0.3rem;">
+        <span class="text-muted">Size: <span class="mono">${p.qty.toFixed(6)}</span></span>
+        <span class="text-muted">Value: <span class="mono">$${(p.qty * p.current_price).toFixed(2)}</span></span>
+      </div>
+    </div>
+
+    <!-- Quick Actions -->
+    <div style="margin-bottom: 1rem;">
+      <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.5rem;font-weight:600;">QUICK ACTIONS</label>
+      <div class="flex gap-2 flex-wrap">
+        <button class="btn btn-sm btn-outline" onclick="quickDca(${p.id}, 25)" title="Add $25 to position">+$25</button>
+        <button class="btn btn-sm btn-outline" onclick="quickDca(${p.id}, 50)" title="Add $50 to position">+$50</button>
+        <button class="btn btn-sm btn-outline" onclick="quickDca(${p.id}, 100)" title="Add $100 to position">+$100</button>
+        <button class="btn btn-sm btn-outline" onclick="quickDca(${p.id}, 250)" title="Add $250 to position">+$250</button>
+        <button class="btn btn-sm" style="background: var(--good); color: white;" onclick="doubleDown(${p.id})" title="Double your position size">2x Position</button>
+      </div>
+      <div class="text-dim" style="font-size:0.7rem;margin-top:0.4rem;">
+        DCA Count: ${p.dca_count || 0}/5 | ${dcaRemaining > 0 ? dcaRemaining + ' adds remaining' : 'Max DCAs reached'}
+      </div>
+    </div>
+
+    <hr style="border-color:var(--border);margin:0.5rem 0;">
+
+    <!-- Stop Loss / Take Profit -->
+    <div style="margin-bottom: 1rem;">
+      <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.5rem;font-weight:600;">STOP LOSS / TAKE PROFIT</label>
+      <div class="flex gap-2" style="margin-bottom: 0.5rem;">
+        <div style="flex:1;">
+          <label class="text-dim" style="font-size:0.68rem;">Stop Loss</label>
+          <input type="number" id="modal-sl" class="input" style="width:100%;" step="0.01" value="${p.stop_loss_price || ''}" placeholder="Price">
+        </div>
+        <div style="flex:1;">
+          <label class="text-dim" style="font-size:0.68rem;">Take Profit</label>
+          <input type="number" id="modal-tp" class="input" style="width:100%;" step="0.01" value="${p.take_profit_price || ''}" placeholder="Price">
         </div>
       </div>
-      <div>
-        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Take Profit Price</label>
-        <div class="flex gap-2">
-          <input type="number" id="modal-tp" class="input" style="flex:1;" step="0.01" value="${p.take_profit_price || ''}" placeholder="Not set">
-          <button class="btn btn-outline btn-sm" onclick="updateSlTp(${p.id}, 'tp')">Set TP</button>
-        </div>
+      <div class="flex gap-2">
+        <button class="btn btn-sm btn-outline" style="flex:1;" onclick="updateSlTp(${p.id}, 'both')">Update SL/TP</button>
+        <button class="btn btn-sm btn-outline" onclick="setQuickSl(${p.id}, 0.02)">-2% SL</button>
+        <button class="btn btn-sm btn-outline" onclick="setQuickSl(${p.id}, 0.05)">-5% SL</button>
+        <button class="btn btn-sm btn-outline" onclick="setQuickTp(${p.id}, 0.05)">+5% TP</button>
+        <button class="btn btn-sm btn-outline" onclick="setQuickTp(${p.id}, 0.10)">+10% TP</button>
       </div>
-      <div>
-        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">Trailing Stop %</label>
-        <div class="flex gap-2">
-          <input type="number" id="modal-trail" class="input" style="flex:1;" step="0.001" min="0.01" max="0.5" value="${p.trailing_stop_pct || ''}" placeholder="e.g. 0.03 for 3%">
-          <button class="btn btn-outline btn-sm" onclick="setTrailing(${p.id})">Set Trailing</button>
-        </div>
-        <div class="text-dim" style="font-size:0.7rem;margin-top:0.2rem;">
-          Current trailing price: ${p.trailing_stop_price ? '$'+p.trailing_stop_price.toFixed(4) : '—'}
-        </div>
+    </div>
+
+    <hr style="border-color:var(--border);margin:0.5rem 0;">
+
+    <!-- Trailing Stop -->
+    <div style="margin-bottom: 1rem;">
+      <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.5rem;font-weight:600;">TRAILING STOP</label>
+      <div class="flex gap-2">
+        <input type="number" id="modal-trail" class="input" style="flex:1;" step="0.001" min="0.01" max="0.5" value="${p.trailing_stop_pct || ''}" placeholder="e.g. 0.03 for 3%">
+        <button class="btn btn-sm btn-outline" onclick="setTrailing(${p.id})">Set</button>
+        <button class="btn btn-sm btn-outline" onclick="setTrailingQuick(${p.id}, 0.02)">2%</button>
+        <button class="btn btn-sm btn-outline" onclick="setTrailingQuick(${p.id}, 0.03)">3%</button>
+        <button class="btn btn-sm btn-outline" onclick="setTrailingQuick(${p.id}, 0.05)">5%</button>
       </div>
-      <hr style="border-color:var(--border);margin:0.5rem 0;">
-      <div>
-        <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.3rem;">DCA - Add to Position ($USD)</label>
-        <div class="flex gap-2">
-          <input type="number" id="modal-dca" class="input" style="flex:1;" step="10" min="10" placeholder="Amount in USD">
-          <button class="btn btn-outline btn-sm" onclick="executeDca(${p.id})" ${p.dca_count >= 3 ? 'disabled' : ''}>
-            Add (${3 - p.dca_count} left)
-          </button>
-        </div>
-        <div class="text-dim" style="font-size:0.7rem;margin-top:0.2rem;">
-          Current avg entry: $${p.entry_price.toFixed(4)} | Current price: $${p.current_price.toFixed(4)}
-        </div>
+      <div class="text-dim" style="font-size:0.7rem;margin-top:0.3rem;">
+        ${p.trailing_stop_price ? 'Active trailing stop at $'+p.trailing_stop_price.toFixed(4) : 'No trailing stop set'}
+      </div>
+    </div>
+
+    <hr style="border-color:var(--border);margin:0.5rem 0;">
+
+    <!-- Custom DCA -->
+    <div style="margin-bottom: 1rem;">
+      <label class="text-muted" style="font-size:0.75rem;display:block;margin-bottom:0.5rem;font-weight:600;">CUSTOM DCA AMOUNT</label>
+      <div class="flex gap-2">
+        <input type="number" id="modal-dca" class="input" style="flex:1;" step="10" min="10" placeholder="Amount in USD">
+        <button class="btn btn-sm" style="background: var(--accent); color: white;" onclick="executeDca(${p.id})" ${dcaRemaining <= 0 ? 'disabled' : ''}>
+          Add to Position
+        </button>
+      </div>
+    </div>
+
+    <!-- Danger Zone -->
+    <div style="border: 1px solid var(--bad); border-radius: var(--radius); padding: 0.8rem; margin-top: 1rem;">
+      <label class="text-bad" style="font-size:0.75rem;display:block;margin-bottom:0.5rem;font-weight:600;">CLOSE POSITION</label>
+      <div class="flex gap-2">
+        <button class="btn btn-sm btn-outline" onclick="closePartial(${p.id}, 0.25)">Close 25%</button>
+        <button class="btn btn-sm btn-outline" onclick="closePartial(${p.id}, 0.50)">Close 50%</button>
+        <button class="btn btn-sm btn-outline" onclick="closePartial(${p.id}, 0.75)">Close 75%</button>
+        <button class="btn btn-sm btn-bad" onclick="closePosition(${p.id}); closeModal();">Close 100%</button>
       </div>
     </div>
   `;
@@ -645,8 +706,8 @@ async function updateSlTp(tradeId, type) {
   const tpVal = document.getElementById('modal-tp').value;
 
   const formData = new FormData();
-  if (type === 'sl' && slVal) formData.append('stop_loss_price', slVal);
-  if (type === 'tp' && tpVal) formData.append('take_profit_price', tpVal);
+  if ((type === 'sl' || type === 'both') && slVal) formData.append('stop_loss_price', slVal);
+  if ((type === 'tp' || type === 'both') && tpVal) formData.append('take_profit_price', tpVal);
 
   try {
     const res = await fetch(`/api/positions/${tradeId}/sl-tp`, {
@@ -655,7 +716,7 @@ async function updateSlTp(tradeId, type) {
     });
     const data = await res.json();
     if (data.ok) {
-      alert(`${type.toUpperCase()} updated successfully`);
+      alert(`SL/TP updated successfully`);
       closeModal();
       refreshPositions();
     } else {
@@ -664,6 +725,89 @@ async function updateSlTp(tradeId, type) {
   } catch (err) {
     alert('Failed to update: ' + err.message);
   }
+}
+
+// Quick SL/TP setters
+function setQuickSl(tradeId, pct) {
+  const p = positionsData.find(pos => pos.id === tradeId);
+  if (!p) return;
+  const slPrice = p.side === 'BUY' 
+    ? p.entry_price * (1 - pct) 
+    : p.entry_price * (1 + pct);
+  document.getElementById('modal-sl').value = slPrice.toFixed(4);
+}
+
+function setQuickTp(tradeId, pct) {
+  const p = positionsData.find(pos => pos.id === tradeId);
+  if (!p) return;
+  const tpPrice = p.side === 'BUY' 
+    ? p.entry_price * (1 + pct) 
+    : p.entry_price * (1 - pct);
+  document.getElementById('modal-tp').value = tpPrice.toFixed(4);
+}
+
+// Quick trailing stop
+async function setTrailingQuick(tradeId, pct) {
+  const formData = new FormData();
+  formData.append('trailing_stop_pct', pct);
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/trailing`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Trailing stop set at $${data.trailing_stop_price.toFixed(4)}`);
+      closeModal();
+      refreshPositions();
+    }
+  } catch (err) { alert('Failed: ' + err.message); }
+}
+
+// Quick DCA
+async function quickDca(tradeId, amount) {
+  const formData = new FormData();
+  formData.append('add_usd', amount);
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/dca`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Added $${amount}. New avg: $${data.new_entry.toFixed(4)}`);
+      closeModal();
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown'));
+    }
+  } catch (err) { alert('Failed: ' + err.message); }
+}
+
+// Double down on position
+async function doubleDown(tradeId) {
+  const p = positionsData.find(pos => pos.id === tradeId);
+  if (!p) return;
+  if (!confirm(`Double your ${p.symbol} position by adding ~$${(p.qty * p.current_price).toFixed(0)}?`)) return;
+  const amount = p.qty * p.current_price;
+  await quickDca(tradeId, Math.round(amount));
+}
+
+// Partial close
+async function closePartial(tradeId, fraction) {
+  const p = positionsData.find(pos => pos.id === tradeId);
+  if (!p) return;
+  const closeQty = p.qty * fraction;
+  const closeValue = closeQty * p.current_price;
+  if (!confirm(`Close ${(fraction*100).toFixed(0)}% of ${p.symbol} (~$${closeValue.toFixed(2)})?`)) return;
+  
+  const formData = new FormData();
+  formData.append('fraction', fraction);
+  try {
+    const res = await fetch(`/api/positions/${tradeId}/close-partial`, { method: 'POST', body: formData });
+    const data = await res.json();
+    if (data.ok) {
+      alert(`Closed ${(fraction*100).toFixed(0)}%. Realized: $${data.realized_pnl.toFixed(2)}`);
+      closeModal();
+      refreshPositions();
+    } else {
+      alert('Error: ' + (data.error || 'Unknown'));
+    }
+  } catch (err) { alert('Failed: ' + err.message); }
 }
 
 async function setTrailing(tradeId) {

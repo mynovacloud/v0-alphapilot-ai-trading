@@ -221,6 +221,12 @@ class BotEngine:
                 )
                 .count()
             )
+            # Get symbols we already hold to ensure diversification
+            held_symbols = set(
+                row[0] for row in s.query(PaperTrade.symbol)
+                .filter(PaperTrade.wallet_id == wallet["id"], PaperTrade.status == "open")
+                .all()
+            )
             # Pick the wallet's "default" strategy if any (the first one assigned to it).
             strat = (
                 s.query(Strategy)
@@ -231,17 +237,24 @@ class BotEngine:
             strategy_id = strat.id if strat else None
             strategy_type = strat.strategy_type if strat else cfg.default_strategy_type
 
-        cap = min(wallet["max_open_positions"] or 0, cfg.max_open_per_wallet)
+        # USE cfg.max_open_per_wallet as the limit (not wallet's limit which may be lower).
+        # This allows the user to set high diversification via bot config.
+        cap = cfg.max_open_per_wallet
+        if wallet["max_open_positions"] and wallet["max_open_positions"] > 0:
+            cap = max(cap, wallet["max_open_positions"])  # Take the HIGHER value for diversity
+        
         slots_left = max(0, cap - open_count)
+        
+        # Even if slots are full, log but DON'T return - Portfolio Intelligence
+        # can still DCA into existing positions below.
         if slots_left <= 0:
-            result.skipped += 1
             self._log(
                 "bot",
-                f"{wallet['name']}: skipped (no open slots — {open_count}/{cap} used).",
+                f"{wallet['name']}: No new entry slots ({open_count}/{cap}), but checking for DCA opportunities.",
                 wallet_id=wallet["id"],
                 level="info",
             )
-            return
+            # Note: We continue so portfolio intelligence can still act on existing positions
 
         # Track best per-tick candidate so we always log a useful summary
         # even when nothing crosses the confidence threshold.
@@ -250,11 +263,16 @@ class BotEngine:
         below_conf = 0
 
         # Sweep the universe. Stop once we've used all available slots.
+        # DIVERSIFICATION: Prioritize symbols we DON'T already hold.
         for product in universe:
             if slots_left <= 0:
                 break
 
             symbol = product["product_id"]
+            
+            # Skip symbols we already hold for NEW entries (DCA handled separately)
+            if symbol in held_symbols:
+                continue
             price_payload = get_price(symbol)
             if not price_payload.get("ok"):
                 result.skipped += 1
