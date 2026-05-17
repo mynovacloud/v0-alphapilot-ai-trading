@@ -22,19 +22,24 @@ from connectors.kalshi_connector import KalshiConnector
 from connectors.polymarket_connector import PolymarketConnector
 
 CONNECTOR_REGISTRY: dict[str, Type[BaseConnector]] = {
-    "Polymarket": PolymarketConnector,
-    "Kalshi": KalshiConnector,
-    "Webull": WebullConnector,
-    "Crypto.com": CryptocomConnector,
-    "Robinhood": RobinhoodConnector,
-    "E*TRADE": ETradeConnector,
     "Coinbase": CoinbaseConnector,
     "Binance": BinanceConnector,
     "Kraken": KrakenConnector,
+    "Crypto.com": CryptocomConnector,
+    "Polymarket": PolymarketConnector,
+    "Kalshi": KalshiConnector,
+    "Webull": WebullConnector,
+    "Robinhood": RobinhoodConnector,
+    "E*TRADE": ETradeConnector,
     "Fidelity": FidelityConnector,
     "Interactive Brokers": IBKRConnector,
     "Custom API": CustomConnector,
 }
+
+# Platforms with REAL authenticated read-only API support today.
+# When the user adds a wallet on one of these and provides API keys, we
+# actually validate the keys and can pull live balances.
+REAL_AUTH_PLATFORMS: set[str] = {"Coinbase", "Binance", "Kraken"}
 
 
 def get_connector(platform: str, **kwargs) -> BaseConnector:

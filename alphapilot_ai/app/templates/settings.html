@@ -58,4 +58,18 @@
   <p class="text-muted">All API credentials are stored as encrypted-at-rest placeholders. Replace the placeholder columns in <span class="mono">api_credentials_placeholder</span> with real encrypted storage (e.g. <span class="mono">cryptography.fernet</span> or an OS keychain) before going live.</p>
 </div>
 
+<div class="card mt-4">
+  <div class="card-header"><div class="card-title">Reset All Data</div></div>
+  <div class="banner banner-warn">
+    Destructive action. This deletes <strong>every</strong> wallet, paper trade, AI training session, lesson, activity log, and saved setting. Type <span class="mono">RESET</span> below to confirm.
+  </div>
+  <form method="post" action="/settings/reset-data" onsubmit="return confirm('This wipes all wallets, trades, and AI data. Are you absolutely sure?');" class="flex gap-2 items-end">
+    <div class="field">
+      <label>Confirmation</label>
+      <input class="input" name="confirm" placeholder="Type RESET" autocomplete="off" required>
+    </div>
+    <button class="btn btn-danger" type="submit">Wipe All Data</button>
+  </form>
+</div>
+
 {% endblock %}

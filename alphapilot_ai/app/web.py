@@ -27,8 +27,10 @@ from analytics.portfolio import (
     portfolio_summary,
 )
 from config.settings import settings
-from connectors.registry import CONNECTOR_REGISTRY, get_connector
-from database.db import session_scope
+from connectors.live_prices import get_price as live_price
+from connectors.live_prices import known_symbols
+from connectors.registry import CONNECTOR_REGISTRY, REAL_AUTH_PLATFORMS, get_connector
+from database.db import reset_db, session_scope
 from database.models import (
     ActivityLog,
     AppSetting,
@@ -173,9 +175,7 @@ def dashboard(request: Request) -> HTMLResponse:
             for t in trades
         ]
 
-    return templates.TemplateResponse(
-        "dashboard.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="dashboard.html", context=_ctx(
             request,
             active="dashboard",
             summary=summary,
@@ -185,7 +185,7 @@ def dashboard(request: Request) -> HTMLResponse:
             recent_logs=recent_logs,
             recent_trades=recent_trades,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -212,20 +212,17 @@ def wallets_page(request: Request) -> HTMLResponse:
             label = f"{w['name']} ({w['platform']})"
             w["pnl"] = pnl_map.get(label, 0.0)
 
-    return templates.TemplateResponse(
-        "wallets.html",
-        _ctx(request, active="wallets", wallets=wallets),
-    )
+    return templates.TemplateResponse(request=request, name="wallets.html", context=_ctx(request, active="wallets", wallets=wallets),
+)
 
 
 @router.get("/wallets/new", response_class=HTMLResponse)
 def add_wallet_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
-        "add_wallet.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="add_wallet.html", context=_ctx(
             request,
             active="wallets",
             platforms=list(CONNECTOR_REGISTRY.keys()),
+            real_auth_platforms=sorted(REAL_AUTH_PLATFORMS),
             risk_profiles=["Conservative", "Moderate", "Aggressive", "Degenerate"],
         ),
     )
@@ -243,6 +240,26 @@ def add_wallet_submit(
     api_passphrase: str = Form(""),
     account_id: str = Form(""),
 ) -> RedirectResponse:
+    # If keys were provided AND the platform supports real auth, validate them
+    # before creating the wallet, so the user gets feedback immediately.
+    api_status = "no-keys"
+    connection_status = "ready (paper)"
+    if api_key and platform in REAL_AUTH_PLATFORMS:
+        connector = get_connector(
+            platform,
+            api_key=api_key,
+            api_secret=api_secret,
+            api_passphrase=api_passphrase,
+            account_id=account_id,
+        )
+        v = connector.validate_credentials()
+        if v.get("valid"):
+            api_status = "live (read-only)"
+            connection_status = "connected (live)"
+        else:
+            api_status = f"invalid: {v.get('error', 'auth failed')}"
+            connection_status = "auth failed"
+
     with session_scope() as s:
         w = Wallet(
             name=name,
@@ -251,8 +268,8 @@ def add_wallet_submit(
             risk_profile=risk_profile,
             sandbox_mode=sandbox_mode == "on",
             paper_trading_only=True,
-            connection_status="connected (mock)",
-            api_status="mock",
+            connection_status=connection_status,
+            api_status=api_status,
         )
         s.add(w)
         s.flush()
@@ -270,7 +287,10 @@ def add_wallet_submit(
                 category="wallet",
                 level="info",
                 wallet_id=w.id,
-                message=f"Wallet '{w.name}' ({w.platform}) created with paper balance ${paper_balance:.2f}",
+                message=(
+                    f"Wallet '{w.name}' ({w.platform}) created — "
+                    f"paper balance ${paper_balance:.2f}, api_status={api_status}"
+                ),
             )
         )
     return RedirectResponse(url="/wallets", status_code=303)
@@ -341,8 +361,9 @@ def wallet_detail(request: Request, wallet_id: int) -> HTMLResponse:
         strategies = [{"id": st.id, "name": st.name} for st in s.query(Strategy).all()]
 
     return templates.TemplateResponse(
-        "wallet_detail.html",
-        _ctx(
+        request=request,
+        name="wallet_detail.html",
+        context=_ctx(
             request,
             active="wallets",
             wallet=wallet,
@@ -380,19 +401,101 @@ def wallet_test(request: Request, wallet_id: int) -> HTMLResponse:
         w = s.get(Wallet, wallet_id)
         if not w:
             return HTMLResponse("<span class='badge badge-bad'>Not found</span>")
-        connector = get_connector(w.platform, sandbox=w.sandbox_mode)
-        connector.connect()
+        creds = (
+            s.query(ApiCredentialPlaceholder)
+            .filter(ApiCredentialPlaceholder.wallet_id == wallet_id)
+            .first()
+        )
+        connector = get_connector(
+            w.platform,
+            api_key=creds.api_key if creds else "",
+            api_secret=creds.api_secret if creds else "",
+            api_passphrase=creds.api_passphrase if creds else "",
+            account_id=creds.account_id if creds else "",
+            sandbox=w.sandbox_mode,
+        )
+        result = connector.validate_credentials()
+        valid = bool(result.get("valid"))
+        msg = "Connection OK" if valid else f"Failed: {result.get('error', 'unknown')}"
+        if valid:
+            w.connection_status = "connected (live)" if result.get("live") else "connected (mock)"
+            w.api_status = "live (read-only)" if result.get("live") else "mock"
+        else:
+            w.connection_status = "auth failed"
+            w.api_status = "invalid"
+        w.last_synced = utcnow()
         s.add(
             ActivityLog(
                 category="api",
-                level="info",
+                level="info" if valid else "warn",
                 wallet_id=wallet_id,
-                message=f"Mock connection test for {w.platform}: ok",
+                message=f"API test for {w.platform}: {msg}",
             )
         )
-    return HTMLResponse(
-        "<span class='badge badge-good'>Connection OK (mock)</span>"
-    )
+        cls = "badge-good" if valid else "badge-bad"
+    return HTMLResponse(f"<span class='badge {cls}'>{msg}</span>")
+
+
+@router.post("/wallets/{wallet_id}/sync", response_class=HTMLResponse)
+def wallet_sync(request: Request, wallet_id: int) -> HTMLResponse:
+    """Pull live balances from the exchange (read-only) and update the wallet."""
+    with session_scope() as s:
+        w = s.get(Wallet, wallet_id)
+        if not w:
+            return HTMLResponse("<span class='badge badge-bad'>Not found</span>")
+        creds = (
+            s.query(ApiCredentialPlaceholder)
+            .filter(ApiCredentialPlaceholder.wallet_id == wallet_id)
+            .first()
+        )
+        if not creds or not creds.api_key:
+            return HTMLResponse(
+                "<span class='badge badge-warn'>No API keys saved — paper trading only</span>"
+            )
+        connector = get_connector(
+            w.platform,
+            api_key=creds.api_key,
+            api_secret=creds.api_secret,
+            api_passphrase=creds.api_passphrase,
+            account_id=creds.account_id,
+            sandbox=w.sandbox_mode,
+        )
+        bal = connector.fetch_balance()
+        if bal.get("live"):
+            w.real_balance_placeholder = float(bal.get("cash", 0.0))
+            w.connection_status = "connected (live)"
+            w.api_status = "live (read-only)"
+            w.last_synced = utcnow()
+            s.add(
+                ActivityLog(
+                    category="api",
+                    level="info",
+                    wallet_id=wallet_id,
+                    message=(
+                        f"Synced {w.platform}: live cash ${w.real_balance_placeholder:,.2f} "
+                        f"({len(bal.get('balances', []))} non-zero balances)"
+                    ),
+                )
+            )
+            return HTMLResponse(
+                f"<span class='badge badge-good'>Live cash ${w.real_balance_placeholder:,.2f}</span>"
+            )
+        err = bal.get("error", "unknown error")
+        s.add(
+            ActivityLog(
+                category="api",
+                level="warn",
+                wallet_id=wallet_id,
+                message=f"Sync failed for {w.platform}: {err}",
+            )
+        )
+        return HTMLResponse(f"<span class='badge badge-bad'>Sync failed: {err}</span>")
+
+
+@router.get("/_price")
+def api_live_price(symbol: str) -> dict[str, Any]:
+    """Endpoint used by JS in templates to look up a live price."""
+    return live_price(symbol)
 
 
 @router.post("/wallets/{wallet_id}/trade")
@@ -401,10 +504,29 @@ def wallet_open_trade(
     symbol: str = Form(...),
     side: str = Form("BUY"),
     qty: float = Form(...),
-    entry_price: float = Form(...),
+    entry_price: float = Form(0.0),
     confidence: float = Form(0.6),
+    use_live_price: str = Form(""),
     strategy_id: int | None = Form(None),
 ) -> RedirectResponse:
+    # If user asked for live price OR didn't provide a price, look it up.
+    if use_live_price == "on" or entry_price <= 0:
+        lp = live_price(symbol)
+        if lp.get("ok"):
+            entry_price = float(lp["price"])
+        elif entry_price <= 0:
+            # Fall back to refusing — better than fake price.
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="paper_trade",
+                        level="warn",
+                        wallet_id=wallet_id,
+                        message=f"Trade rejected: live price unavailable for {symbol}",
+                    )
+                )
+            return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
+
     _engine.open_trade(
         wallet_id=wallet_id,
         symbol=symbol,
@@ -418,12 +540,22 @@ def wallet_open_trade(
 
 
 @router.post("/trades/{trade_id}/close")
-def trade_close(trade_id: int, exit_price: float = Form(...)) -> RedirectResponse:
+def trade_close(
+    trade_id: int,
+    exit_price: float = Form(0.0),
+    use_live_price: str = Form(""),
+) -> RedirectResponse:
     wallet_id = None
+    symbol = ""
     with session_scope() as s:
         t = s.get(PaperTrade, trade_id)
         if t:
             wallet_id = t.wallet_id
+            symbol = t.symbol
+    if (use_live_price == "on" or exit_price <= 0) and symbol:
+        lp = live_price(symbol)
+        if lp.get("ok"):
+            exit_price = float(lp["price"])
     _engine.close_trade(trade_id, exit_price)
     if wallet_id:
         return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
@@ -436,18 +568,17 @@ def trade_close(trade_id: int, exit_price: float = Form(...)) -> RedirectRespons
 
 @router.get("/scanner", response_class=HTMLResponse)
 def scanner_page(request: Request) -> HTMLResponse:
-    return templates.TemplateResponse(
-        "scanner.html",
-        _ctx(request, active="scanner", opportunities=[]),
-    )
+    return templates.TemplateResponse(request=request, name="scanner.html", context=_ctx(request, active="scanner", opportunities=[]),
+)
 
 
 @router.post("/scanner/run", response_class=HTMLResponse)
 def scanner_run(request: Request, n: int = Form(20)) -> HTMLResponse:
     opps = scan_markets(n=n)
     return templates.TemplateResponse(
-        "_scanner_table.html",
-        {"request": request, "opportunities": opps},
+        request=request,
+        name="_scanner_table.html",
+        context={"request": request, "opportunities": opps},
     )
 
 
@@ -462,9 +593,7 @@ def strategies_page(request: Request) -> HTMLResponse:
     pnl_map = {row["strategy"]: float(row["pnl"]) for _, row in pnl_df.iterrows()} if not pnl_df.empty else {}
     for s in strategies:
         s["pnl"] = pnl_map.get(s["name"], 0.0)
-    return templates.TemplateResponse(
-        "strategies.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="strategies.html", context=_ctx(
             request,
             active="strategies",
             strategies=strategies,
@@ -479,7 +608,7 @@ def strategies_page(request: Request) -> HTMLResponse:
             ],
             market_types=["Crypto", "Stocks", "Prediction Markets", "Options"],
         ),
-    )
+)
 
 
 @router.post("/strategies/new")
@@ -526,8 +655,9 @@ def strategies_delete(strategy_id: int) -> RedirectResponse:
 def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form(200)) -> HTMLResponse:
     result = run_backtest(strategy_id, n_trades=n_trades)
     return templates.TemplateResponse(
-        "_backtest_result.html",
-        {"request": request, "result": result},
+        request=request,
+        name="_backtest_result.html",
+        context={"request": request, "result": result},
     )
 
 
@@ -540,9 +670,7 @@ def training_page(request: Request) -> HTMLResponse:
     wallets = get_wallets()
     strategies = list_strategies()
     lessons = _memory.list_lessons(limit=20)
-    return templates.TemplateResponse(
-        "training.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
             wallets=wallets,
@@ -551,7 +679,7 @@ def training_page(request: Request) -> HTMLResponse:
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
-    )
+)
 
 
 @router.post("/training/run", response_class=HTMLResponse)
@@ -577,8 +705,9 @@ def training_run(
     for d in result.decisions:
         eq.append(d.get("balance", eq[-1]))
     return templates.TemplateResponse(
-        "_training_result.html",
-        {"request": request, "result": result, "equity": eq},
+        request=request,
+        name="_training_result.html",
+        context={"request": request, "result": result, "equity": eq},
     )
 
 
@@ -627,9 +756,7 @@ def analytics_page(request: Request) -> HTMLResponse:
                     bucket = min(9, max(0, int((v - lo) / rng * 10)))
                     histogram[bucket] += 1
 
-    return templates.TemplateResponse(
-        "analytics.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
             request,
             active="analytics",
             summary=summary,
@@ -639,7 +766,7 @@ def analytics_page(request: Request) -> HTMLResponse:
             strategy_pnl=strategy_pnl,
             histogram=histogram,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -668,9 +795,7 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
         categories = sorted({r[0] for r in s.query(ActivityLog.category).distinct().all() if r[0]})
         levels = sorted({r[0] for r in s.query(ActivityLog.level).distinct().all() if r[0]})
 
-    return templates.TemplateResponse(
-        "activity.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="activity.html", context=_ctx(
             request,
             active="activity",
             logs=logs,
@@ -679,7 +804,7 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
             current_category=category,
             current_level=level,
         ),
-    )
+)
 
 
 # ----------------------------------------------------------------------
@@ -711,15 +836,13 @@ def settings_page(request: Request) -> HTMLResponse:
         "max_concurrent_trades": _get_setting("max_concurrent_trades", "5"),
         "default_position_size": _get_setting("default_position_size", "1000"),
     }
-    return templates.TemplateResponse(
-        "settings.html",
-        _ctx(
+    return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
             request,
             active="settings",
             prefs=prefs,
             settings=settings,
         ),
-    )
+)
 
 
 @router.post("/settings/save")
@@ -744,3 +867,17 @@ def settings_save(
             )
         )
     return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/reset-data")
+def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
+    """
+    DESTRUCTIVE: drop and recreate every table.
+
+    Use this to wipe all wallets, trades, AI memory, and settings when you
+    want to start fresh. Requires the user to type RESET in the confirm box.
+    """
+    if confirm.strip().upper() != "RESET":
+        return RedirectResponse(url="/settings?reset=denied", status_code=303)
+    reset_db()
+    return RedirectResponse(url="/wallets", status_code=303)
