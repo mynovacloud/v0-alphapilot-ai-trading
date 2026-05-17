@@ -1,3 +1,5 @@
 2026-05-17 02:54:22,167 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
 2026-05-17 02:54:22,201 | INFO    | database.seed | Seeding mock data...
 2026-05-17 02:54:22,209 | INFO    | database.seed | Seed complete.
+2026-05-17 02:54:48,264 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
+2026-05-17 02:54:48,306 | INFO    | httpx | HTTP Request: GET http://testserver/health "HTTP/1.1 200 OK"

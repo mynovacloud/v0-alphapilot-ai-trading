@@ -102,13 +102,14 @@ def platforms() -> list[str]:
 # ----------------------------------------------------------------------
 
 @app.get("/wallets", response_model=list[WalletOut])
-def list_wallets() -> list[Wallet]:
+def list_wallets() -> list[WalletOut]:
     with session_scope() as s:
-        return s.query(Wallet).order_by(Wallet.created_at.asc()).all()
+        rows = s.query(Wallet).order_by(Wallet.created_at.asc()).all()
+        return [WalletOut.model_validate(w) for w in rows]
 
 
 @app.post("/wallets", response_model=WalletOut)
-def create_wallet(payload: WalletCreate) -> Wallet:
+def create_wallet(payload: WalletCreate) -> WalletOut:
     with session_scope() as s:
         w = Wallet(
             name=payload.name,
@@ -140,17 +141,18 @@ def create_wallet(payload: WalletCreate) -> Wallet:
                 message=f"Wallet '{w.name}' ({w.platform}) created with paper balance ${payload.paper_balance:.2f}",
             )
         )
+        s.flush()
         s.refresh(w)
-        return w
+        return WalletOut.model_validate(w)
 
 
 @app.get("/wallets/{wallet_id}", response_model=WalletOut)
-def get_wallet(wallet_id: int) -> Wallet:
+def get_wallet(wallet_id: int) -> WalletOut:
     with session_scope() as s:
         w = s.get(Wallet, wallet_id)
         if not w:
             raise HTTPException(404, "Wallet not found")
-        return w
+        return WalletOut.model_validate(w)
 
 
 @app.delete("/wallets/{wallet_id}")
@@ -245,10 +247,10 @@ def get_strategies() -> list[dict[str, Any]]:
 
 
 @app.post("/strategies", response_model=StrategyOut)
-def add_strategy(payload: StrategyCreate) -> Strategy:
+def add_strategy(payload: StrategyCreate) -> StrategyOut:
     sid = create_strategy(payload.model_dump())
     with session_scope() as s:
-        return s.get(Strategy, sid)
+        return StrategyOut.model_validate(s.get(Strategy, sid))
 
 
 @app.delete("/strategies/{strategy_id}")
