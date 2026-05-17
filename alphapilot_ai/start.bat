@@ -1,0 +1,14 @@
+@echo off
+REM AlphaPilot AI launcher for Windows.
+REM Double-click this file or run "start.bat" from PowerShell.
+
+cd /d "%~dp0"
+
+if exist ".venv\Scripts\python.exe" (
+    set "PY=.venv\Scripts\python.exe"
+) else (
+    set "PY=python"
+)
+
+"%PY%" run.py
+pause

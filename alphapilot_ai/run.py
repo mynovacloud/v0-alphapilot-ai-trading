@@ -40,8 +40,17 @@ def _check_python() -> None:
         sys.exit(1)
 
 
+def _pip_install(args: list[str]) -> None:
+    cmd = [sys.executable, "-m", "pip", "install", *args]
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        print("ERROR: pip install failed:", e)
+        sys.exit(1)
+
+
 def _ensure_dependencies() -> None:
-    """Install requirements.txt if any required package is missing."""
+    """Install requirements.txt if any required package is missing or broken."""
     required = [
         "streamlit",
         "fastapi",
@@ -52,26 +61,29 @@ def _ensure_dependencies() -> None:
         "numpy",
         "plotly",
         "httpx",
-        "loguru",
     ]
-    missing = []
+    missing: list[str] = []
+    broken: list[str] = []
     for pkg in required:
         try:
             __import__(pkg)
         except ImportError:
             missing.append(pkg)
+        except Exception:
+            # e.g. a half-installed/corrupted package raising at import time
+            broken.append(pkg)
 
-    if not missing:
-        return
+    if missing:
+        _banner(f"Installing missing packages: {', '.join(missing)}")
+        req_file = ROOT / "requirements.txt"
+        _pip_install(["-q", "-r", str(req_file)])
 
-    _banner(f"Installing missing packages: {', '.join(missing)}")
-    req_file = ROOT / "requirements.txt"
-    cmd = [sys.executable, "-m", "pip", "install", "-q", "-r", str(req_file)]
-    try:
-        subprocess.check_call(cmd)
-    except subprocess.CalledProcessError as e:
-        print("ERROR: pip install failed:", e)
-        sys.exit(1)
+    if broken:
+        _banner(f"Repairing broken packages: {', '.join(broken)}")
+        # force a clean reinstall of just the broken ones
+        _pip_install(["--force-reinstall", "--no-deps", *broken])
+        req_file = ROOT / "requirements.txt"
+        _pip_install(["-q", "-r", str(req_file)])
 
 
 def _init_database() -> None:
