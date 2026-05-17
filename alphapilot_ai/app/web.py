@@ -2133,6 +2133,77 @@ def api_close_all_positions() -> JSONResponse:
     })
 
 
+@router.post("/api/positions/{trade_id}/close-partial")
+def api_close_partial(
+    trade_id: int,
+    fraction: float = Form(...),
+) -> JSONResponse:
+    """
+    Partially close a position (e.g., close 25%, 50%, 75%).
+    """
+    from connectors.live_prices import get_price
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    if fraction <= 0 or fraction >= 1:
+        return JSONResponse({"ok": False, "error": "Fraction must be between 0 and 1"}, status_code=400)
+
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if not trade:
+            return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
+        if trade.status != "open":
+            return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
+
+        symbol = trade.symbol
+        current_qty = float(trade.qty)
+        entry_price = float(trade.entry_price)
+        side = (trade.side or "BUY").upper()
+
+    # Get current price
+    p = get_price(symbol)
+    if not p.get("ok"):
+        return JSONResponse({"ok": False, "error": "Could not fetch current price"}, status_code=500)
+    current_price = float(p["price"])
+
+    # Calculate partial close
+    close_qty = current_qty * fraction
+    remaining_qty = current_qty - close_qty
+
+    # Calculate P&L for the closed portion
+    if side == "BUY":
+        realized_pnl = (current_price - entry_price) * close_qty
+    else:
+        realized_pnl = (entry_price - current_price) * close_qty
+
+    with session_scope() as s:
+        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+        if trade:
+            # Update the position to reflect partial close
+            trade.qty = remaining_qty
+            # Add to realized P&L (track partial closes)
+            trade.realized_pnl = float(trade.realized_pnl or 0) + realized_pnl
+            # Update wallet balance
+            wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+            if wallet:
+                wallet.paper_balance = float(wallet.paper_balance or 0) + (close_qty * current_price) + realized_pnl
+
+            s.add(
+                ActivityLog(
+                    category="positions",
+                    level="info",
+                    message=f"Partial close {fraction*100:.0f}% of {symbol}: realized ${realized_pnl:+.2f}",
+                    wallet_id=trade.wallet_id,
+                )
+            )
+
+    return JSONResponse({
+        "ok": True,
+        "realized_pnl": round(realized_pnl, 2),
+        "remaining_qty": round(remaining_qty, 6),
+        "closed_qty": round(close_qty, 6),
+    })
+
+
 @router.post("/api/positions/{trade_id}/sl-tp")
 def api_update_sl_tp(
     trade_id: int,
@@ -2241,8 +2312,8 @@ def api_dca_position(
             return JSONResponse({"ok": False, "error": "Trade not found"}, status_code=404)
         if trade.status != "open":
             return JSONResponse({"ok": False, "error": "Trade is not open"}, status_code=400)
-        if (trade.dca_count or 0) >= 3:
-            return JSONResponse({"ok": False, "error": "Max DCA count (3) reached"}, status_code=400)
+        if (trade.dca_count or 0) >= 5:
+            return JSONResponse({"ok": False, "error": "Max DCA count (5) reached"}, status_code=400)
 
         symbol = trade.symbol
 

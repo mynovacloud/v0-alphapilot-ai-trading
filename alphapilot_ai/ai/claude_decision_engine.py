@@ -61,11 +61,11 @@ DECISION_TEMPERATURE = 0.2  # decisions should be near-deterministic
 
 SYSTEM_PROMPT_BASE = """You are AlphaPilot, an autonomous trading copilot operating in PAPER mode.
 
-Your job is to convert a technical signal + market context into a tradeable decision. \
-You are NOT a passive analyst — the operator wants you to trade actively when the \
-technical engine surfaces a directional signal, so they can observe the resulting \
-fills, reflect on outcomes, and improve over time. Refusing to trade on every \
-borderline signal produces zero learning and is the WORST possible outcome.
+Your job is to convert a technical signal + comprehensive market intelligence into a \
+tradeable decision. You are NOT a passive analyst — the operator wants you to trade \
+actively when the technical engine surfaces a directional signal, so they can observe \
+the resulting fills, reflect on outcomes, and improve over time. Refusing to trade on \
+every borderline signal produces zero learning and is the WORST possible outcome.
 
 Decision policy:
   - When the technical signal direction is BUY or SELL and the technical \
@@ -79,9 +79,78 @@ Decision policy:
     under recent_history.last_10_closed_trades in the user payload. If that \
     list is empty, you have no history. Do not invent rules about "high-confidence \
     trades that lost money" or "consecutive losses" — these are hallucinations.
-  - Confidence in your output should mirror the technical_confidence, optionally \
-    nudged ±0.05 only if a corroborating or contradicting indicator is concretely \
-    present in the payload.
+  - Use the confidence_adjustments.adjusted_confidence as your starting point, \
+    which already factors in MTF alignment, derivatives sentiment, and Fear & Greed.
+
+=== MARKET INTELLIGENCE INTEGRATION ===
+
+You now receive comprehensive market intelligence. Use it to REFINE confidence and \
+risk parameters, NOT to veto trades that meet the floor.
+
+1. ADVANCED INDICATORS (advanced_indicators):
+   - rsi_14: Relative Strength Index. <30 = oversold (buy), >70 = overbought (sell)
+   - macd_histogram: Momentum. Positive = bullish, Negative = bearish
+   - stoch_k/stoch_d: Stochastic. <20 = oversold, >80 = overbought
+   - bollinger_percent_b: Price position in bands. >1 = above upper, <0 = below lower
+   - adx_trend_strength: Trend strength. >25 = trending, <20 = ranging
+   - relative_volume: Volume vs average. >1.5 = high volume confirms move
+   - trend_direction/momentum_signal: Derived signals (BULLISH/BEARISH/NEUTRAL)
+   - volatility_state: HIGH/NORMAL/LOW
+   - volume_confirmation: True if volume supports the move
+
+2. MULTI-TIMEFRAME ANALYSIS (multi_timeframe_analysis):
+   - overall_bias: Aggregate trend across 5m, 15m, 1h, 4h, 1d
+   - alignment_score: 0-1, how aligned timeframes are (>0.7 = strong)
+   - entry_timing: NOW, WAIT_PULLBACK, WAIT_BREAKOUT, NO_TRADE
+   - higher_tf_support: True if higher timeframes confirm direction
+   - divergence_warning: True if lower TF diverging from higher (caution!)
+   - Use confidence_boost to adjust confidence (already in adjusted_confidence)
+
+3. MARKET REGIME (market_regime):
+   - regime: TRENDING_UP, TRENDING_DOWN, RANGING, VOLATILE, ACCUMULATION, DISTRIBUTION
+   - recommended_strategy: What strategy works best in this regime
+   - position_size_multiplier: Suggested size adjustment for regime
+   - trading_rules: Specific rules for this regime (bias, stop multipliers, etc.)
+   - For VOLATILE regime: Reduce size, widen stops
+   - For RANGING: Use mean reversion, trade at support/resistance
+   - For TRENDING: Use momentum, trail stops
+
+4. DERIVATIVES INTELLIGENCE (derivatives_intelligence):
+   - funding_rate_pct: Perpetual funding rate. Very negative = shorts paying = bullish
+   - long_ratio/short_ratio: Market positioning. Extreme = contrarian signal
+   - overall_signal: BULLISH, BEARISH, NEUTRAL from derivatives data
+   - warnings: Specific alerts like "Extreme shorts - potential squeeze"
+
+5. FEAR & GREED INDEX (fear_greed_index):
+   - value: 0-100 (0=extreme fear, 100=extreme greed)
+   - sentiment: EXTREME_FEAR, FEAR, NEUTRAL, GREED, EXTREME_GREED
+   - signal: STRONG_BUY (extreme fear), BUY, NEUTRAL, SELL, STRONG_SELL (extreme greed)
+   - CONTRARIAN: Buy in fear, sell in greed
+   - Extreme Fear (<25) = +0.15 confidence boost (buying opportunity)
+   - Extreme Greed (>75) = -0.12 confidence penalty (caution)
+
+6. SOCIAL SENTIMENT (social_sentiment):
+   - galaxy_score: 0-100 social health
+   - sentiment: BULLISH/NEUTRAL/BEARISH from social posts
+   - alerts: HIGH_BUZZ, FADING_INTEREST, INFLUENCER_PUMP
+
+=== HOW TO USE INTELLIGENCE ===
+
+For BUY signals:
+- Boost confidence if: MTF aligned bullish, derivatives bullish, fear/greed in fear
+- Reduce confidence if: MTF divergence warning, extreme greed, low volume
+- Adjust stop_loss: Wider in high volatility, tighter in low volatility
+- Adjust take_profit: Larger in trending regime, smaller in ranging
+
+For SELL signals:
+- Boost confidence if: MTF aligned bearish, derivatives bearish, fear/greed in greed
+- Similar adjustments apply
+
+Position Sizing:
+- Use market_regime.position_size_multiplier as a guide
+- In VOLATILE regime: size_multiplier = 0.5-0.7
+- In TRENDING regime with confirmation: size_multiplier = 1.0
+- If volume_confirmation = False: reduce size_multiplier by 0.2
 
 Hard rules (these are the only firm vetoes):
   1. NEVER recommend size_multiplier > 1.0 or leverage > the wallet's max_leverage.
@@ -89,9 +158,7 @@ Hard rules (these are the only firm vetoes):
   3. Take-profit is REQUIRED on every BUY/SELL action (in [0.005, 0.50]).
   4. If the kill switch is engaged or daily loss budget is spent (only when EXPLICITLY \
      stated in extra_context), return HOLD.
-  5. Do not invent indicators or history that are not in the provided payload. \
-     The absence of optional indicators is normal and is NOT, by itself, a reason \
-     to refuse a trade — the technical engine has already done its job.
+  5. Do not invent indicators or history that are not in the provided payload.
 
 Your output MUST be a single JSON object with exactly these keys:
   action, confidence, size_multiplier, stop_loss_pct, take_profit_pct,
@@ -334,15 +401,204 @@ def _build_user_prompt(
 
     indicators = {k: _round_or_str(v) for k, v in sig_meta.items()}
     indicators_doc = {
-        "ema_fast": "EMA-12 of close (1-bar)",
-        "ema_slow": "EMA-26 of close (1-bar)",
+        "ema_fast": "EMA-12 of close (short-term trend)",
+        "ema_slow": "EMA-26 of close (medium-term trend)",
         "ret_6": "6-bar log return (positive=bullish)",
         "ret_24": "24-bar log return",
         "atr_pct": "ATR/price (volatility proxy)",
         "bars": "candles available for this lookback",
         "granularity_s": "candle granularity in seconds",
         "last_price": "most recent close",
+        # Note: Advanced indicators are in a separate advanced_indicators block
+        # with RSI, MACD, Bollinger, ADX, Stochastic, Volume analysis
     }
+
+    # Fetch social sentiment from LunarCrush (if available)
+    social_context = None
+    try:
+        from connectors.lunarcrush import get_social_metrics
+        social_metrics = get_social_metrics(symbol)
+        if social_metrics:
+            social_context = {
+                "galaxy_score": social_metrics.galaxy_score,
+                "alt_rank": social_metrics.alt_rank,
+                "sentiment": "BULLISH" if social_metrics.sentiment_score > 0.2 else (
+                    "BEARISH" if social_metrics.sentiment_score < -0.2 else "NEUTRAL"
+                ),
+                "sentiment_score": round(social_metrics.sentiment_score, 3),
+                "bullish_pct": round(social_metrics.bullish_pct, 1),
+                "bearish_pct": round(social_metrics.bearish_pct, 1),
+                "social_volume": social_metrics.social_volume,
+                "social_volume_change_24h": f"{social_metrics.social_volume_change_24h:+.1f}%",
+                "social_engagements": social_metrics.social_engagements,
+                "influencer_mentions": social_metrics.influencer_mentions,
+                "news_articles": social_metrics.news_articles,
+                "volume_trend": social_metrics.social_volume_trend,
+                "sentiment_trend": social_metrics.sentiment_trend,
+                "alerts": [],
+            }
+            if social_metrics.is_buzzing:
+                social_context["alerts"].append("HIGH_BUZZ: Social volume spiking - potential breakout")
+            if social_metrics.is_fading:
+                social_context["alerts"].append("FADING_INTEREST: Declining engagement - caution")
+            if social_metrics.has_influencer_pump:
+                social_context["alerts"].append("INFLUENCER_PUMP: Notable account activity - possible pump")
+    except Exception as e:
+        # Social data is optional - don't fail the decision
+        pass
+
+    # =========================================================================
+    # NEW: Advanced Market Intelligence
+    # =========================================================================
+    
+    # 1. Multi-Timeframe Analysis
+    mtf_context = None
+    try:
+        from trading.multi_timeframe import get_mtf_signal_boost
+        mtf_data = get_mtf_signal_boost(symbol)
+        if mtf_data and mtf_data.get("bias") != "UNKNOWN":
+            mtf_context = {
+                "overall_bias": mtf_data["bias"],
+                "alignment_score": round(mtf_data.get("alignment", 0), 2),
+                "entry_timing": mtf_data.get("entry_timing", "UNKNOWN"),
+                "confidence_boost": mtf_data.get("boost", 0),
+                "higher_tf_support": mtf_data.get("higher_tf_support", False),
+                "divergence_warning": mtf_data.get("divergence_warning", False),
+                "summary": mtf_data.get("summary", ""),
+                "timeframe_details": mtf_data.get("details", {}),
+            }
+    except Exception:
+        pass
+    
+    # 2. Derivatives Intelligence (Funding Rates, Long/Short Ratios)
+    derivatives_context = None
+    try:
+        from connectors.coinglass import get_funding_signal
+        deriv_data = get_funding_signal(symbol)
+        if deriv_data:
+            derivatives_context = {
+                "overall_signal": deriv_data.get("overall_signal", "NEUTRAL"),
+                "confidence_adjustment": deriv_data.get("confidence_adjustment", 0),
+                "funding_rate_pct": deriv_data.get("funding_rate"),
+                "funding_sentiment": deriv_data.get("funding_sentiment"),
+                "long_ratio": deriv_data.get("long_ratio"),
+                "short_ratio": deriv_data.get("short_ratio"),
+                "long_short_sentiment": deriv_data.get("ls_sentiment"),
+                "warnings": deriv_data.get("warnings", []),
+                "summary": deriv_data.get("summary", ""),
+            }
+    except Exception:
+        pass
+    
+    # 3. Fear & Greed Index (Market Sentiment)
+    fear_greed_context = None
+    try:
+        from connectors.fear_greed import get_fear_greed_signal
+        fg_data = get_fear_greed_signal()
+        if fg_data and fg_data.get("available"):
+            fear_greed_context = {
+                "value": fg_data.get("value"),
+                "classification": fg_data.get("classification"),
+                "sentiment": fg_data.get("sentiment"),
+                "signal": fg_data.get("signal"),
+                "confidence_adjustment": fg_data.get("confidence_adjustment", 0),
+                "trend": fg_data.get("trend"),
+                "yesterday": fg_data.get("yesterday"),
+                "last_week": fg_data.get("last_week"),
+                "interpretation": fg_data.get("interpretation", ""),
+                "summary": fg_data.get("summary", ""),
+            }
+    except Exception:
+        pass
+    
+    # 4. Market Regime Detection
+    market_regime_context = None
+    try:
+        from connectors.coinbase import get_candles
+        from trading.market_regime import detect_regime, get_regime_trading_rules
+        import numpy as np
+        
+        candle_data = get_candles(symbol, granularity=900, limit=100)
+        if candle_data and candle_data.get("candles") and len(candle_data["candles"]) >= 50:
+            candles = candle_data["candles"]
+            high = np.array([c["high"] for c in candles], dtype=float)
+            low = np.array([c["low"] for c in candles], dtype=float)
+            close = np.array([c["close"] for c in candles], dtype=float)
+            volume = np.array([c["volume"] for c in candles], dtype=float)
+            
+            regime = detect_regime(high, low, close, volume)
+            if regime:
+                rules = get_regime_trading_rules(regime.regime)
+                market_regime_context = {
+                    "regime": regime.regime.value,
+                    "confidence": round(regime.confidence, 2),
+                    "trend_direction": regime.trend_direction,
+                    "trend_strength": round(regime.trend_strength, 1),
+                    "volatility_percentile": round(regime.volatility_percentile, 1),
+                    "volatility_expanding": regime.is_expanding,
+                    "range_bound": regime.range_bound,
+                    "range_high": round(regime.range_high, 2),
+                    "range_low": round(regime.range_low, 2),
+                    "recommended_strategy": regime.recommended_strategy,
+                    "position_size_multiplier": regime.position_size_multiplier,
+                    "trading_rules": rules,
+                    "metrics": regime.metrics,
+                }
+    except Exception:
+        pass
+    
+    # 5. Advanced Technical Indicators
+    advanced_indicators = None
+    try:
+        from connectors.coinbase import get_candles
+        from trading.indicators import compute_all_indicators
+        import numpy as np
+        
+        candle_data = get_candles(symbol, granularity=900, limit=250)
+        if candle_data and candle_data.get("candles") and len(candle_data["candles"]) >= 50:
+            candles = candle_data["candles"]
+            high = np.array([c["high"] for c in candles], dtype=float)
+            low = np.array([c["low"] for c in candles], dtype=float)
+            close = np.array([c["close"] for c in candles], dtype=float)
+            volume = np.array([c["volume"] for c in candles], dtype=float)
+            
+            suite = compute_all_indicators(high, low, close, volume)
+            if suite:
+                advanced_indicators = {
+                    "rsi_14": round(suite.rsi_14, 1),
+                    "macd_histogram": round(suite.macd_histogram, 6),
+                    "macd_signal_cross": "BULLISH" if suite.macd_line > suite.macd_signal else "BEARISH",
+                    "stoch_k": round(suite.stoch_k, 1) if suite.stoch_k else None,
+                    "stoch_d": round(suite.stoch_d, 1) if suite.stoch_d else None,
+                    "bollinger_percent_b": round(suite.bb_percent_b, 2),
+                    "bollinger_bandwidth": round(suite.bb_bandwidth, 4),
+                    "adx_trend_strength": round(suite.adx, 1),
+                    "plus_di": round(suite.plus_di, 1) if suite.plus_di else None,
+                    "minus_di": round(suite.minus_di, 1) if suite.minus_di else None,
+                    "relative_volume": round(suite.relative_volume, 2),
+                    "vwap": round(suite.vwap, 2),
+                    "atr_percent": round(suite.atr_pct, 2),
+                    "trend_direction": suite.trend_direction,
+                    "trend_strength": suite.trend_strength,
+                    "momentum_signal": suite.momentum_signal,
+                    "volatility_state": suite.volatility_state,
+                    "volume_confirmation": suite.volume_confirmation,
+                }
+    except Exception:
+        pass
+    
+    # Calculate aggregate confidence adjustment from all sources
+    confidence_adjustments = []
+    if mtf_context and mtf_context.get("confidence_boost"):
+        confidence_adjustments.append(("MTF", mtf_context["confidence_boost"]))
+    if derivatives_context and derivatives_context.get("confidence_adjustment"):
+        confidence_adjustments.append(("Derivatives", derivatives_context["confidence_adjustment"]))
+    if fear_greed_context and fear_greed_context.get("confidence_adjustment"):
+        confidence_adjustments.append(("Fear&Greed", fear_greed_context["confidence_adjustment"]))
+    
+    total_adjustment = sum(adj for _, adj in confidence_adjustments)
+    # Cap total adjustment to ±0.25
+    total_adjustment = max(-0.25, min(0.25, total_adjustment))
 
     payload = {
         "operator_calibration": {
@@ -378,6 +634,28 @@ def _build_user_prompt(
                 "That is normal at the start of a training session — do NOT treat "
                 "an empty history as a reason to refuse trading."
             ) if not recent_trades else "",
+        },
+        # =====================================================================
+        # MARKET INTELLIGENCE SUITE
+        # =====================================================================
+        "advanced_indicators": advanced_indicators,
+        "multi_timeframe_analysis": mtf_context,
+        "market_regime": market_regime_context,
+        "derivatives_intelligence": derivatives_context,
+        "fear_greed_index": fear_greed_context,
+        "social_sentiment": social_context,
+        # Aggregate confidence adjustment from all intelligence sources
+        "confidence_adjustments": {
+            "sources": confidence_adjustments,
+            "total_adjustment": round(total_adjustment, 3),
+            "adjusted_confidence": round(
+                min(1.0, max(0.0, float(technical_signal.confidence or 0) + total_adjustment)), 4
+            ),
+            "note": (
+                "This is the sum of confidence boosts/penalties from MTF alignment, "
+                "derivatives sentiment, and Fear & Greed index. Apply to your final "
+                "confidence output."
+            ),
         },
         "extra_context": extra_context,
         "now_utc": utcnow().isoformat(),

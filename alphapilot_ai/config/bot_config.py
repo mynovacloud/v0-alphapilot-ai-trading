@@ -21,9 +21,15 @@ DEFAULTS: dict[str, str] = {
     "bot_min_confidence": "0.65",          # minimum AI confidence to act
     "bot_default_strategy_type": "Momentum",
     "bot_position_size_usd": "100",        # default per-trade notional in USD
-    "bot_max_open_per_wallet": "5",
+    "bot_max_open_per_wallet": "10",       # max concurrent positions (was 5, now 10 for diversity)
     "bot_max_ticks_log": "200",            # how many tick rows to keep visible
     "bot_dry_run": "true",                 # if true, decisions are logged only (paper layer ignored)
+    # Aggressive trading settings
+    "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
+    "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+
+    "bot_auto_scale_in_enabled": "true",   # automatically add to winning positions
+    "bot_diversification_target": "5",     # try to hold at least this many different assets
+    "bot_recovery_mode_enabled": "true",   # enable aggressive recovery when portfolio is down
     # Notifier settings
     "notifier_provider": "none",           # "telegram" | "discord" | "none"
     "notifier_telegram_bot_token": "",
@@ -63,6 +69,12 @@ class BotConfig:
     position_size_usd: float
     max_open_per_wallet: int
     dry_run: bool
+    # Aggressive trading settings
+    auto_dca_enabled: bool
+    auto_dca_threshold_pct: float
+    auto_scale_in_enabled: bool
+    diversification_target: int
+    recovery_mode_enabled: bool
 
     @classmethod
     def load(cls) -> "BotConfig":
@@ -75,8 +87,14 @@ class BotConfig:
             min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.65))),
             default_strategy_type=raw.get("bot_default_strategy_type") or "Momentum",
             position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 100)),
-            max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 5))),
+            max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 10))),
             dry_run=_b(raw.get("bot_dry_run"), default=True),
+            # Aggressive trading
+            auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
+            auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),
+            auto_scale_in_enabled=_b(raw.get("bot_auto_scale_in_enabled"), default=True),
+            diversification_target=max(1, int(float(raw.get("bot_diversification_target") or 5))),
+            recovery_mode_enabled=_b(raw.get("bot_recovery_mode_enabled"), default=True),
         )
 
 
