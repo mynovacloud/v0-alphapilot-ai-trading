@@ -584,6 +584,23 @@ class BotEngine:
             if price_payload.get("ok"):
                 price_map[symbol] = float(price_payload["price"])
 
+        # CRITICAL: Also fetch prices for ANY open position symbols NOT in universe
+        # This ensures we don't miss exit checks just because a symbol rotated out
+        with session_scope() as s:
+            open_symbols = (
+                s.query(PaperTrade.symbol)
+                .filter(PaperTrade.status == "open")
+                .distinct()
+                .all()
+            )
+            open_symbols = [row[0] for row in open_symbols]
+        
+        for symbol in open_symbols:
+            if symbol not in price_map:
+                price_payload = get_price(symbol)
+                if price_payload.get("ok"):
+                    price_map[symbol] = float(price_payload["price"])
+
         # Fetch all wallets with open positions
         with session_scope() as s:
             wallet_ids = (
@@ -606,11 +623,20 @@ class BotEngine:
                 )
                 if outcome.get("ok"):
                     closed_count += 1
+                    result.actions += 1
                     # Update the exit_reason on the trade record
                     with session_scope() as s:
                         trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()
                         if trade:
                             trade.exit_reason = exit_signal.reason
+                    # Log it
+                    self._log(
+                        "bot",
+                        f"AUTO-EXIT ({exit_signal.reason}): {exit_signal.symbol} "
+                        f"closed at ${exit_signal.current_price:.4f} "
+                        f"(P&L: {exit_signal.pnl_pct:+.2%})",
+                        level="info",
+                    )
                     # Notify
                     try:
                         from services.notifier import notify
