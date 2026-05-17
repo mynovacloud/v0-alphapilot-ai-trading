@@ -11,8 +11,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ai.ai_engine import AIEngine
@@ -133,43 +133,56 @@ def _ctx(request: Request, **extra: Any) -> dict[str, Any]:
 # ----------------------------------------------------------------------
 
 @router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request) -> HTMLResponse:
-    summary = portfolio_summary()
+def dashboard(request: Request, mode: str = "all") -> HTMLResponse:
+    mode = mode if mode in {"all", "paper", "live"} else "all"
+    summary = portfolio_summary(mode)
     perf = performance_metrics()
     wallets = get_wallets()
+    wallet_modes = {w["id"]: (w.get("trading_mode") or "paper").lower() for w in wallets}
 
-    # Equity curve points for the SVG chart
-    eq = equity_curve_df()
+    # Equity curve points for the SVG chart (scoped to selected mode)
+    eq = equity_curve_df(mode)
     points: list[dict[str, Any]] = []
     if not eq.empty:
         for _, row in eq.iterrows():
             points.append({"date": str(row["date"]), "equity": float(row["equity"])})
 
-    # Recent activity
+    # IDs to filter on, based on mode
+    if mode == "paper":
+        scoped_wids = {wid for wid, m in wallet_modes.items() if m == "paper"}
+    elif mode == "live":
+        scoped_wids = {wid for wid, m in wallet_modes.items() if m in {"live", "live_shadow"}}
+    else:
+        scoped_wids = set(wallet_modes.keys())
+
+    # Recent activity (scoped: also filter by wallet_id when scoping to a mode)
     with session_scope() as s:
-        logs = (
-            s.query(ActivityLog)
-            .order_by(ActivityLog.created_at.desc())
-            .limit(8)
-            .all()
-        )
+        log_q = s.query(ActivityLog)
+        if mode != "all":
+            # ActivityLog rows from trade engine carry wallet_id; system rows
+            # without wallet_id are kept so the user still sees scheduler events.
+            log_q = log_q.filter(
+                (ActivityLog.wallet_id == None)  # noqa: E711
+                | (ActivityLog.wallet_id.in_(scoped_wids if scoped_wids else {-1}))
+            )
+        logs = log_q.order_by(ActivityLog.created_at.desc()).limit(8).all()
         recent_logs = [
             {
                 "category": l.category,
                 "level": l.level,
                 "message": l.message,
                 "created_at": l.created_at,
+                "wallet_id": l.wallet_id,
+                "trading_mode": wallet_modes.get(l.wallet_id, ""),
             }
             for l in logs
         ]
 
-        # Recent trades
-        trades = (
-            s.query(PaperTrade)
-            .order_by(PaperTrade.opened_at.desc())
-            .limit(8)
-            .all()
-        )
+        # Recent trades, filtered by mode
+        trade_q = s.query(PaperTrade)
+        if mode != "all":
+            trade_q = trade_q.filter(PaperTrade.wallet_id.in_(scoped_wids if scoped_wids else {-1}))
+        trades = trade_q.order_by(PaperTrade.opened_at.desc()).limit(8).all()
         wallet_names = {w["id"]: w["name"] for w in wallets}
         recent_trades = [
             {
@@ -178,13 +191,22 @@ def dashboard(request: Request) -> HTMLResponse:
                 "side": t.side,
                 "qty": t.qty,
                 "entry_price": t.entry_price,
+                "exit_price": t.exit_price,
                 "status": t.status,
                 "realized_pnl": t.realized_pnl,
+                "unrealized_pnl": t.unrealized_pnl,
                 "wallet": wallet_names.get(t.wallet_id, "?"),
+                "wallet_id": t.wallet_id,
+                "trading_mode": wallet_modes.get(t.wallet_id, "paper"),
                 "opened_at": t.opened_at,
+                "closed_at": t.closed_at,
             }
             for t in trades
         ]
+
+    # Live training session indicator so the dashboard can show "session running"
+    from config.bot_config import get as cfg_get
+    session_active = str(cfg_get("training_session_active") or "").lower() in {"1", "true", "yes"}
 
     return templates.TemplateResponse(request=request, name="dashboard.html", context=_ctx(
             request,
@@ -195,6 +217,8 @@ def dashboard(request: Request) -> HTMLResponse:
             equity_points=points,
             recent_logs=recent_logs,
             recent_trades=recent_trades,
+            current_mode=mode,
+            session_active=session_active,
         ),
 )
 
@@ -732,6 +756,64 @@ def training_page(request: Request) -> HTMLResponse:
     from services.claude_client import is_configured as claude_is_configured
     wallets = get_wallets()
     strategies = list_strategies()
+    # Symbols the bot has actually traded (open or closed paper trades).
+    # Used to populate the Positions Lab grid on the page.
+    with session_scope() as s:
+        rows = (
+            s.query(
+                PaperTrade.symbol,
+                PaperTrade.wallet_id,
+            )
+            .all()
+        )
+        wallet_names = {w["id"]: w["name"] for w in wallets}
+        seen: dict[tuple[str, int], dict[str, Any]] = {}
+        for sym, wid in rows:
+            key = (sym, wid)
+            if key in seen:
+                continue
+            seen[key] = {
+                "symbol": sym,
+                "wallet_id": wid,
+                "wallet_name": wallet_names.get(wid, "?"),
+            }
+        traded_symbols = sorted(seen.values(), key=lambda r: (r["wallet_name"], r["symbol"]))
+
+        # Portfolio P&L roll-up across every paper trade (powers the bold
+        # money-strip at the top of the Training Center).
+        all_trades = s.query(PaperTrade).all()
+        starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
+        realized = 0.0
+        unrealized = 0.0
+        invested_open = 0.0
+        wins = 0
+        losses = 0
+        for t in all_trades:
+            if t.status == "closed":
+                pnl = t.realized_pnl or 0.0
+                realized += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+            else:
+                unrealized += (t.unrealized_pnl or 0.0)
+                invested_open += (t.entry_price or 0.0) * (t.qty or 0.0)
+        closed_count = wins + losses
+        portfolio = {
+            "starting": starting,
+            "realized": realized,
+            "unrealized": unrealized,
+            "current": starting + realized + unrealized,
+            "total_pl": realized + unrealized,
+            "total_pl_pct": ((realized + unrealized) / starting * 100.0) if starting else 0.0,
+            "invested_open": invested_open,
+            "open_trades": len(all_trades) - closed_count,
+            "closed_trades": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / closed_count) if closed_count else 0.0,
+        }
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
@@ -742,10 +824,480 @@ def training_page(request: Request) -> HTMLResponse:
             recent_decisions=recent_decisions(limit=20),
             recent_reflections=recent_reflections(limit=15),
             claude_configured=claude_is_configured(),
+            traded_symbols=traded_symbols,
+            portfolio=portfolio,
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
 )
+
+
+@router.get("/training/chart-data")
+def training_chart_data(
+    symbol: str = Query(..., min_length=1),
+    wallet_id: int | None = Query(None),
+    granularity: int = Query(900, ge=60, le=86400),
+) -> JSONResponse:
+    """
+    Return everything the Positions Lab chart needs in one payload:
+      - candles:    OHLC bars from Coinbase (public endpoint, no key needed)
+      - trades:     every paper trade for (symbol, wallet?) with entry+exit
+      - decisions:  every Claude decision (BUY/SELL/HOLD/CLOSE) the bot made
+      - stats:      symbol-level KPIs (P&L, win rate, hold time, best/worst)
+    The frontend draws candles + entry/exit markers + a decision overlay.
+    """
+    from connectors.candles import get_candles
+    from database.models import ClaudeDecision
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return JSONResponse({"ok": False, "error": "missing symbol"}, status_code=400)
+
+    candles = get_candles(sym, granularity=granularity, limit=300)
+
+    with session_scope() as s:
+        q = s.query(PaperTrade).filter(PaperTrade.symbol == sym)
+        if wallet_id:
+            q = q.filter(PaperTrade.wallet_id == wallet_id)
+        trades = q.order_by(PaperTrade.opened_at.asc()).all()
+
+        trade_rows: list[dict[str, Any]] = []
+        for t in trades:
+            trade_rows.append(
+                {
+                    "id": t.id,
+                    "side": t.side,
+                    "qty": t.qty,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "realized_pnl": t.realized_pnl or 0.0,
+                    "unrealized_pnl": t.unrealized_pnl or 0.0,
+                    "confidence": t.confidence or 0.0,
+                    "status": t.status,
+                    "opened_at_ts": int(t.opened_at.timestamp()) if t.opened_at else None,
+                    "closed_at_ts": int(t.closed_at.timestamp()) if t.closed_at else None,
+                    "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                    "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+                    "notes": (t.notes or "")[:300],
+                    "is_perp": bool(t.is_perp),
+                    "leverage": t.leverage or 1.0,
+                }
+            )
+
+        dq = s.query(ClaudeDecision).filter(ClaudeDecision.symbol == sym)
+        if wallet_id:
+            dq = dq.filter(ClaudeDecision.wallet_id == wallet_id)
+        decisions = (
+            dq.order_by(ClaudeDecision.created_at.desc()).limit(150).all()
+        )
+        decision_rows: list[dict[str, Any]] = []
+        for d in decisions:
+            decision_rows.append(
+                {
+                    "id": d.id,
+                    "ts": int(d.created_at.timestamp()) if d.created_at else None,
+                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                    "action": d.action,
+                    "confidence": d.confidence or 0.0,
+                    "size_multiplier": d.size_multiplier or 1.0,
+                    "stop_loss_pct": d.stop_loss_pct or 0.0,
+                    "take_profit_pct": d.take_profit_pct or 0.0,
+                    "technical_side": d.technical_side,
+                    "technical_confidence": d.technical_confidence or 0.0,
+                    "price": d.price or 0.0,
+                    "rationale": (d.rationale or "")[:500],
+                    "source": d.source,
+                }
+            )
+        decision_rows.reverse()  # oldest -> newest for charting
+
+    closed = [t for t in trade_rows if t["status"] == "closed"]
+    realized = sum(t["realized_pnl"] for t in closed)
+    wins = [t for t in closed if t["realized_pnl"] > 0]
+    losses = [t for t in closed if t["realized_pnl"] < 0]
+    best = max((t["realized_pnl"] for t in closed), default=0.0)
+    worst = min((t["realized_pnl"] for t in closed), default=0.0)
+    avg_hold_min = 0.0
+    holds = [
+        (t["closed_at_ts"] - t["opened_at_ts"]) / 60.0
+        for t in closed
+        if t["opened_at_ts"] and t["closed_at_ts"]
+    ]
+    if holds:
+        avg_hold_min = sum(holds) / len(holds)
+
+    open_trades = [t for t in trade_rows if t["status"] == "open"]
+
+    stats = {
+        "total_trades": len(trade_rows),
+        "open_trades": len(open_trades),
+        "closed_trades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": (len(wins) / len(closed)) if closed else 0.0,
+        "realized_pnl": realized,
+        "best_pnl": best,
+        "worst_pnl": worst,
+        "avg_hold_minutes": avg_hold_min,
+        "avg_confidence": (
+            sum(t["confidence"] for t in trade_rows) / len(trade_rows)
+            if trade_rows
+            else 0.0
+        ),
+    }
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "symbol": sym,
+            "granularity": granularity,
+            "candles": candles,
+            "trades": trade_rows,
+            "decisions": decision_rows,
+            "stats": stats,
+        }
+    )
+
+
+# ============================================================
+# LIVE TRAINING SESSION
+# ============================================================
+# When the user clicks "Start Live Session" on the Training Center, we:
+#   1. Snapshot the current autonomous-bot config so we can restore later.
+#   2. Force paper trading ON (dry_run = false), bot_enabled = true, and
+#      drop the tick interval to a session-friendly cadence (default 15s).
+#   3. Reload the scheduler so the new interval takes effect immediately.
+#   4. Stamp `training_session_active = true` so the UI knows to poll the
+#      live feed.
+# Stopping reverses all of the above and restores the user's previous knobs.
+# Polling is deliberately HTTP rather than websocket so it works behind any
+# reverse proxy without additional configuration.
+
+def _truthy(v: str | None) -> bool:
+    return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+@router.post("/training/session/start")
+def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
+    from config.bot_config import get as cfg_get
+    from config.bot_config import set_many as cfg_set
+    from services.claude_client import is_configured as claude_is_configured
+    from services.scheduler import bot_scheduler
+
+    if _truthy(cfg_get("training_session_active")):
+        return JSONResponse({"ok": True, "already_running": True})
+
+    tick = max(5, min(120, int(tick_seconds or 15)))
+
+    # Snapshot the values we're about to overwrite so Stop can restore.
+    prev_enabled = cfg_get("bot_enabled")
+    prev_dry = cfg_get("bot_dry_run")
+    prev_tick = cfg_get("bot_tick_seconds")
+
+    cfg_set(
+        {
+            "training_session_active": "true",
+            "training_session_started_at": utcnow().isoformat(),
+            "training_session_tick_seconds": str(tick),
+            "training_session_prev_bot_enabled": prev_enabled or "",
+            "training_session_prev_dry_run": prev_dry or "",
+            "training_session_prev_tick_seconds": prev_tick or "",
+            # Force the autonomous loop ON in paper-live mode.
+            "bot_enabled": "true",
+            "bot_dry_run": "false",
+            "bot_tick_seconds": str(tick),
+        }
+    )
+
+    bot_scheduler.reload()  # picks up the new tick interval
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="bot",
+                level="info",
+                message=(
+                    f"Live training session started "
+                    f"(tick={tick}s, paper-live={'YES' if claude_is_configured() else 'YES (no Claude — fallback signals)'})"
+                ),
+            )
+        )
+    return JSONResponse(
+        {
+            "ok": True,
+            "tick_seconds": tick,
+            "claude_configured": claude_is_configured(),
+        }
+    )
+
+
+@router.post("/training/session/stop")
+def training_session_stop() -> JSONResponse:
+    from config.bot_config import get as cfg_get
+    from config.bot_config import set_many as cfg_set
+    from services.scheduler import bot_scheduler
+
+    if not _truthy(cfg_get("training_session_active")):
+        return JSONResponse({"ok": True, "already_stopped": True})
+
+    prev_enabled = cfg_get("training_session_prev_bot_enabled") or "false"
+    prev_dry = cfg_get("training_session_prev_dry_run") or "true"
+    prev_tick = cfg_get("training_session_prev_tick_seconds") or "60"
+
+    cfg_set(
+        {
+            "training_session_active": "false",
+            "training_session_started_at": "",
+            "training_session_prev_bot_enabled": "",
+            "training_session_prev_dry_run": "",
+            "training_session_prev_tick_seconds": "",
+            # Restore the user's prior config.
+            "bot_enabled": prev_enabled,
+            "bot_dry_run": prev_dry,
+            "bot_tick_seconds": prev_tick,
+        }
+    )
+    bot_scheduler.reload()
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="bot",
+                level="info",
+                message="Live training session stopped — bot config restored.",
+            )
+        )
+    return JSONResponse({"ok": True})
+
+
+@router.post("/training/session/tick")
+def training_session_tick_now() -> JSONResponse:
+    """Force a tick immediately so the user doesn't have to wait. Returns the result."""
+    from trading.bot_engine import bot_engine
+
+    res = bot_engine.tick(manual=True)
+    return JSONResponse(
+        {
+            "ok": True,
+            "result": {
+                "started_at": res.started_at,
+                "ended_at": res.ended_at,
+                "universe_size": res.universe_size,
+                "wallets_evaluated": res.wallets_evaluated,
+                "decisions": res.decisions,
+                "actions": res.actions,
+                "skipped": res.skipped,
+                "errors": res.errors,
+                "notes": res.notes,
+            },
+        }
+    )
+
+
+@router.get("/training/session/feed")
+def training_session_feed(
+    since_decision_id: int = Query(0, ge=0),
+    since_log_id: int = Query(0, ge=0),
+    since_trade_id: int = Query(0, ge=0),
+) -> JSONResponse:
+    """
+    Polled every 2s by the Training Center while a live session is running.
+
+    Returns:
+      - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
+      - portfolio: live mark-to-market P&L across every wallet
+      - decisions: new ClaudeDecision rows (BUY / SELL / HOLD / CLOSE) with rationale
+      - fills:     newly opened or closed paper trades
+      - logs:      bot/trade/system activity logs (the streaming console)
+      - ticks:     last 5 tick summaries for the "what just happened" panel
+    """
+    from config.bot_config import get as cfg_get
+    from connectors.live_prices import get_price
+    from database.models import ClaudeDecision
+    from services.scheduler import bot_scheduler
+    from trading.bot_engine import bot_engine
+
+    sched = bot_scheduler.status()
+    session_active = _truthy(cfg_get("training_session_active"))
+    started_at = cfg_get("training_session_started_at") or None
+
+    with session_scope() as s:
+        # ---- Live portfolio mark-to-market ----
+        wallets = s.query(Wallet).all()
+        starting = sum(float(w.paper_balance or 0) for w in wallets)
+
+        all_trades = s.query(PaperTrade).all()
+        realized = 0.0
+        unrealized = 0.0
+        invested_open = 0.0
+        wins = 0
+        losses = 0
+        # Re-mark every open position to the latest live price so the
+        # "Currently Sitting At" number truly updates in real time.
+        symbol_prices: dict[str, float] = {}
+        for t in all_trades:
+            if t.status == "closed":
+                pnl = float(t.realized_pnl or 0)
+                realized += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+                continue
+            entry = float(t.entry_price or 0)
+            qty = float(t.qty or 0)
+            invested_open += entry * qty
+            mark = symbol_prices.get(t.symbol)
+            if mark is None:
+                p = get_price(t.symbol)
+                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
+                symbol_prices[t.symbol] = mark
+            if mark > 0 and entry > 0:
+                if (t.side or "").upper() == "BUY":
+                    unrealized += (mark - entry) * qty
+                else:  # SELL / SHORT
+                    unrealized += (entry - mark) * qty
+
+        closed_count = wins + losses
+        total_pl = realized + unrealized
+        portfolio = {
+            "starting": round(starting, 2),
+            "realized": round(realized, 2),
+            "unrealized": round(unrealized, 2),
+            "current": round(starting + total_pl, 2),
+            "total_pl": round(total_pl, 2),
+            "total_pl_pct": round((total_pl / starting * 100.0) if starting else 0.0, 3),
+            "invested_open": round(invested_open, 2),
+            "open_trades": len(all_trades) - closed_count,
+            "closed_trades": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": round((wins / closed_count) if closed_count else 0.0, 4),
+        }
+
+        # ---- New Claude decisions since the client's last cursor ----
+        new_decisions = (
+            s.query(ClaudeDecision)
+            .filter(ClaudeDecision.id > since_decision_id)
+            .order_by(ClaudeDecision.id.asc())
+            .limit(50)
+            .all()
+        )
+        decisions_payload = [
+            {
+                "id": d.id,
+                "ts": int(d.created_at.timestamp()) if d.created_at else None,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "wallet_id": d.wallet_id,
+                "symbol": d.symbol,
+                "action": d.action,
+                "confidence": float(d.confidence or 0),
+                "size_multiplier": float(d.size_multiplier or 1),
+                "stop_loss_pct": float(d.stop_loss_pct or 0),
+                "take_profit_pct": float(d.take_profit_pct or 0),
+                "technical_side": d.technical_side,
+                "technical_confidence": float(d.technical_confidence or 0),
+                "price": float(d.price or 0),
+                "rationale": (d.rationale or "")[:400],
+                "source": d.source,
+            }
+            for d in new_decisions
+        ]
+
+        # ---- Newly opened or closed paper trades ----
+        # Use a max(opened_id, closed_id) cursor so the client gets both events.
+        new_trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.id > since_trade_id)
+            .order_by(PaperTrade.id.asc())
+            .limit(40)
+            .all()
+        )
+        fills_payload = []
+        for t in new_trades:
+            mark = symbol_prices.get(t.symbol)
+            if mark is None:
+                p = get_price(t.symbol)
+                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
+            fills_payload.append(
+                {
+                    "id": t.id,
+                    "wallet_id": t.wallet_id,
+                    "symbol": t.symbol,
+                    "side": t.side,
+                    "qty": float(t.qty or 0),
+                    "entry_price": float(t.entry_price or 0),
+                    "exit_price": float(t.exit_price or 0) if t.exit_price else None,
+                    "mark_price": mark,
+                    "status": t.status,
+                    "realized_pnl": float(t.realized_pnl or 0),
+                    "unrealized_pnl": float(t.unrealized_pnl or 0),
+                    "confidence": float(t.confidence or 0),
+                    "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                    "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+                    "notes": (t.notes or "")[:200],
+                }
+            )
+
+        # ---- Activity logs (the live console) ----
+        new_logs = (
+            s.query(ActivityLog)
+            .filter(ActivityLog.id > since_log_id)
+            .order_by(ActivityLog.id.asc())
+            .limit(80)
+            .all()
+        )
+        logs_payload = [
+            {
+                "id": l.id,
+                "ts": int(l.created_at.timestamp()) if l.created_at else None,
+                "category": l.category,
+                "level": l.level,
+                "wallet_id": l.wallet_id,
+                "message": l.message,
+            }
+            for l in new_logs
+        ]
+
+    ticks_payload = [
+        {
+            "started_at": t.started_at,
+            "ended_at": t.ended_at,
+            "decisions": t.decisions,
+            "actions": t.actions,
+            "skipped": t.skipped,
+            "errors": t.errors,
+            "universe_size": t.universe_size,
+            "notes": t.notes[:5],
+        }
+        for t in bot_engine.recent_ticks(limit=8)
+    ]
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "session": {
+                "active": session_active,
+                "started_at": started_at,
+                "tick_seconds": sched.get("tick_seconds"),
+                "next_tick": sched.get("next_tick"),
+                "scheduler_running": sched.get("scheduler_running"),
+                "dry_run": sched.get("dry_run"),
+                "bot_enabled": sched.get("bot_enabled"),
+            },
+            "portfolio": portfolio,
+            "decisions": decisions_payload,
+            "fills": fills_payload,
+            "logs": logs_payload,
+            "ticks": ticks_payload,
+            # Cursors the client should send back next poll.
+            "cursors": {
+                "decision_id": (decisions_payload[-1]["id"] if decisions_payload else since_decision_id),
+                "log_id": (logs_payload[-1]["id"] if logs_payload else since_log_id),
+                "trade_id": (fills_payload[-1]["id"] if fills_payload else since_trade_id),
+            },
+        }
+    )
 
 
 @router.post("/training/run", response_class=HTMLResponse)
@@ -878,14 +1430,44 @@ def analytics_page(request: Request) -> HTMLResponse:
 # ----------------------------------------------------------------------
 
 @router.get("/activity", response_class=HTMLResponse)
-def activity_page(request: Request, category: str = "", level: str = "") -> HTMLResponse:
+def activity_page(
+    request: Request,
+    category: str = "",
+    level: str = "",
+    mode: str = "",
+    wallet_id: int | None = None,
+) -> HTMLResponse:
+    wallets = get_wallets()
+    wallet_lookup = {w["id"]: w for w in wallets}
+    wallet_modes = {wid: (w.get("trading_mode") or "paper").lower() for wid, w in wallet_lookup.items()}
+
+    # Resolve which wallet ids the mode filter should hit.
+    mode_norm = (mode or "").lower()
+    mode_wids: set[int] | None
+    if mode_norm == "paper":
+        mode_wids = {wid for wid, m in wallet_modes.items() if m == "paper"}
+    elif mode_norm == "live":
+        mode_wids = {wid for wid, m in wallet_modes.items() if m in {"live", "live_shadow"}}
+    else:
+        mode_wids = None
+
+    # Pull recent paper trades to merge into the timeline so users see every
+    # buy/sell/close inline with the bot's narration on a single page.
     with session_scope() as s:
-        q = s.query(ActivityLog)
+        log_q = s.query(ActivityLog)
         if category:
-            q = q.filter(ActivityLog.category == category)
+            log_q = log_q.filter(ActivityLog.category == category)
         if level:
-            q = q.filter(ActivityLog.level == level)
-        rows = q.order_by(ActivityLog.created_at.desc()).limit(300).all()
+            log_q = log_q.filter(ActivityLog.level == level)
+        if wallet_id:
+            log_q = log_q.filter(ActivityLog.wallet_id == wallet_id)
+        elif mode_wids is not None:
+            # Keep system events with no wallet_id so scheduler/heartbeat lines stay visible.
+            log_q = log_q.filter(
+                (ActivityLog.wallet_id == None)  # noqa: E711
+                | (ActivityLog.wallet_id.in_(mode_wids if mode_wids else {-1}))
+            )
+        rows = log_q.order_by(ActivityLog.created_at.desc()).limit(300).all()
         logs = [
             {
                 "id": r.id,
@@ -893,20 +1475,58 @@ def activity_page(request: Request, category: str = "", level: str = "") -> HTML
                 "level": r.level,
                 "message": r.message,
                 "created_at": r.created_at,
+                "wallet_id": r.wallet_id,
+                "wallet_name": (wallet_lookup.get(r.wallet_id) or {}).get("name") if r.wallet_id else None,
+                "trading_mode": wallet_modes.get(r.wallet_id, "") if r.wallet_id else "system",
             }
             for r in rows
         ]
         categories = sorted({r[0] for r in s.query(ActivityLog.category).distinct().all() if r[0]})
         levels = sorted({r[0] for r in s.query(ActivityLog.level).distinct().all() if r[0]})
 
+        # Trade executions to render in the "Executions" tab.
+        ex_q = s.query(PaperTrade)
+        if wallet_id:
+            ex_q = ex_q.filter(PaperTrade.wallet_id == wallet_id)
+        elif mode_wids is not None:
+            ex_q = ex_q.filter(PaperTrade.wallet_id.in_(mode_wids if mode_wids else {-1}))
+        trades_recent = (
+            ex_q.order_by(PaperTrade.id.desc()).limit(150).all()
+        )
+        executions = [
+            {
+                "id": t.id,
+                "wallet": (wallet_lookup.get(t.wallet_id) or {}).get("name", "?"),
+                "wallet_id": t.wallet_id,
+                "trading_mode": wallet_modes.get(t.wallet_id, "paper"),
+                "symbol": t.symbol,
+                "side": t.side,
+                "qty": float(t.qty or 0),
+                "entry_price": float(t.entry_price or 0),
+                "exit_price": float(t.exit_price or 0) if t.exit_price else None,
+                "status": t.status,
+                "realized_pnl": float(t.realized_pnl or 0),
+                "unrealized_pnl": float(t.unrealized_pnl or 0),
+                "confidence": float(t.confidence or 0),
+                "opened_at": t.opened_at,
+                "closed_at": t.closed_at,
+                "notes": (t.notes or "")[:240],
+            }
+            for t in trades_recent
+        ]
+
     return templates.TemplateResponse(request=request, name="activity.html", context=_ctx(
             request,
             active="activity",
             logs=logs,
+            executions=executions,
+            wallets=wallets,
             categories=categories,
             levels=levels,
             current_category=category,
             current_level=level,
+            current_mode=mode_norm or "all",
+            current_wallet_id=wallet_id,
         ),
 )
 

@@ -62,6 +62,8 @@ def get_wallets() -> list[dict[str, Any]]:
                 "risk_profile": w.risk_profile,
                 "sandbox_mode": w.sandbox_mode,
                 "paper_trading_only": w.paper_trading_only,
+                # Authoritative mode flag used across the UI ("paper" | "live" | "live_shadow").
+                "trading_mode": (w.trading_mode or "paper"),
                 "connection_status": w.connection_status,
                 "api_status": w.api_status,
                 "last_synced": w.last_synced,
@@ -71,9 +73,40 @@ def get_wallets() -> list[dict[str, Any]]:
         ]
 
 
-def portfolio_summary() -> dict[str, Any]:
-    wallets = get_wallets()
+def _wallets_in_mode(mode: str) -> set[int]:
+    """Return wallet ids that match a mode filter.
+
+    `mode` is one of: "all", "paper", "live".
+    "live" includes both `live` and `live_shadow` wallets so users see real
+    money activity grouped together. "paper" only includes pure paper wallets.
+    """
+    mode = (mode or "all").lower()
+    ids: set[int] = set()
+    for w in get_wallets():
+        wm = (w.get("trading_mode") or "paper").lower()
+        if mode == "all":
+            ids.add(w["id"])
+        elif mode == "paper" and wm == "paper":
+            ids.add(w["id"])
+        elif mode == "live" and wm in {"live", "live_shadow"}:
+            ids.add(w["id"])
+    return ids
+
+
+def portfolio_summary(mode: str = "all") -> dict[str, Any]:
+    """Aggregate portfolio metrics, optionally scoped to one trading mode.
+
+    `mode` is "all" (default), "paper", or "live". The returned dict always
+    includes a `by_mode` breakdown so the UI can show paper vs. live side-by-side.
+    """
+    wallets_all = get_wallets()
+    wallet_mode_map = {w["id"]: (w.get("trading_mode") or "paper").lower() for w in wallets_all}
+    selected_ids = _wallets_in_mode(mode)
+    wallets = [w for w in wallets_all if w["id"] in selected_ids]
+
     trades_df = get_all_trades_df()
+    if not trades_df.empty:
+        trades_df = trades_df[trades_df["wallet_id"].isin(selected_ids)]
     closed = trades_df[trades_df["status"] == "closed"] if not trades_df.empty else trades_df
     open_ = trades_df[trades_df["status"] == "open"] if not trades_df.empty else trades_df
 
@@ -147,7 +180,44 @@ def portfolio_summary() -> dict[str, Any]:
         denom = np.maximum(np.abs(peak), 1)
         drawdown = float(((peak - equity) / denom).max())
 
+    # Breakdown of paper vs live (regardless of selected `mode`) so the
+    # Dashboard can show both columns side-by-side without a second query.
+    by_mode: dict[str, dict[str, float]] = {
+        "paper": {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "open": 0, "closed": 0,
+                  "wins": 0, "losses": 0, "balance": 0.0, "wallets": 0},
+        "live":  {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "open": 0, "closed": 0,
+                  "wins": 0, "losses": 0, "balance": 0.0, "wallets": 0},
+    }
+    full_df = get_all_trades_df()
+    for w in wallets_all:
+        bucket = "live" if (w.get("trading_mode") or "paper").lower() in {"live", "live_shadow"} else "paper"
+        by_mode[bucket]["wallets"] += 1
+        # For "live" wallets the canonical bankroll lives in real_balance_placeholder.
+        if bucket == "live":
+            by_mode[bucket]["balance"] += float(w.get("real_balance_placeholder") or 0)
+        else:
+            by_mode[bucket]["balance"] += float(w.get("paper_balance") or 0)
+    if not full_df.empty:
+        full_df = full_df.assign(
+            _mode=full_df["wallet_id"].map(
+                lambda wid: "live" if wallet_mode_map.get(wid, "paper") in {"live", "live_shadow"} else "paper"
+            )
+        )
+        for bucket in ("paper", "live"):
+            sub = full_df[full_df["_mode"] == bucket]
+            sub_closed = sub[sub["status"] == "closed"]
+            sub_open = sub[sub["status"] == "open"]
+            by_mode[bucket]["realized_pnl"] = round(float(sub_closed["realized_pnl"].sum()) if not sub_closed.empty else 0.0, 2)
+            by_mode[bucket]["unrealized_pnl"] = round(float(sub_open["unrealized_pnl"].sum()) if not sub_open.empty else 0.0, 2)
+            by_mode[bucket]["open"] = int(len(sub_open))
+            by_mode[bucket]["closed"] = int(len(sub_closed))
+            by_mode[bucket]["wins"] = int((sub_closed["realized_pnl"] > 0).sum()) if not sub_closed.empty else 0
+            by_mode[bucket]["losses"] = int((sub_closed["realized_pnl"] <= 0).sum()) if not sub_closed.empty else 0
+            by_mode[bucket]["balance"] = round(by_mode[bucket]["balance"], 2)
+
     return {
+        "mode": mode,
+        "by_mode": by_mode,
         "total_paper_value": round(total_paper_value, 2),
         "total_portfolio_value": round(total_paper_value + unrealized, 2),
         "total_pnl": round(total_pnl, 2),
@@ -174,11 +244,13 @@ def portfolio_summary() -> dict[str, Any]:
     }
 
 
-def equity_curve_df() -> pd.DataFrame:
-    """Return a date-indexed cumulative-PnL series across all closed paper trades."""
+def equity_curve_df(mode: str = "all") -> pd.DataFrame:
+    """Return a date-indexed cumulative-PnL series across closed paper trades, optionally scoped by mode."""
     df = get_all_trades_df()
     if df.empty:
         return pd.DataFrame(columns=["date", "equity"])
+    selected = _wallets_in_mode(mode)
+    df = df[df["wallet_id"].isin(selected)]
     closed = df[(df["status"] == "closed") & df["closed_at"].notna()].copy()
     if closed.empty:
         return pd.DataFrame(columns=["date", "equity"])

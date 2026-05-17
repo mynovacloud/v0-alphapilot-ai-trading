@@ -35,6 +35,16 @@ DEFAULTS: dict[str, str] = {
     # Anthropic / Claude
     "anthropic_api_key": "",
     "anthropic_model": "claude-sonnet-4-6",
+    # Live training session (Training Center "Start Live Session" button).
+    # When active, the scheduler runs at session_tick_seconds with paper trading
+    # ON. Stopping the session restores the previous bot_enabled / dry_run /
+    # tick_seconds values so the user's normal config isn't disturbed.
+    "training_session_active": "false",
+    "training_session_started_at": "",
+    "training_session_tick_seconds": "15",
+    "training_session_prev_bot_enabled": "",
+    "training_session_prev_dry_run": "",
+    "training_session_prev_tick_seconds": "",
 }
 
 

@@ -26,7 +26,298 @@
 {% endif %}
 
 <!-- ============================================================ -->
-<!-- READINESS SCORE                                                -->
+<!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->
+<!-- ============================================================ -->
+{% set pl = portfolio.total_pl %}
+{% set pl_color = 'var(--good)' if pl > 0.005 else ('var(--bad)' if pl < -0.005 else 'var(--text-muted)') %}
+{% set pl_sign = '+' if pl >= 0 else '−' %}
+<div class="card mb-4" id="paper-money-strip"
+     style="background: linear-gradient(135deg, var(--bg-elev), var(--bg)); border: 1px solid var(--border);">
+  <div class="grid" style="grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr; gap: 1rem; align-items: stretch;">
+
+    <!-- HERO: current paper equity + P&L -->
+    <div style="padding: 0.6rem 0.4rem;">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Paper Portfolio</div>
+      <div class="mono" style="font-size: 2.6rem; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em;">
+        ${{ '{:,.2f}'.format(portfolio.current) }}
+      </div>
+      <div class="flex items-center gap-2" style="margin-top: 0.35rem;">
+        <span class="mono" style="font-size: 1.15rem; font-weight: 700; color: {{ pl_color }};">
+          {{ pl_sign }}${{ '{:,.2f}'.format(pl|abs) }}
+        </span>
+        <span class="mono" style="font-size: 0.95rem; font-weight: 600; color: {{ pl_color }};">
+          ({{ pl_sign }}{{ '%.2f' | format(portfolio.total_pl_pct|abs) }}%)
+        </span>
+        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} seeded</span>
+      </div>
+    </div>
+
+    <!-- Realized P&L -->
+    {% set rcol = 'var(--good)' if portfolio.realized > 0.005 else ('var(--bad)' if portfolio.realized < -0.005 else 'var(--text)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Realized P&amp;L</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ rcol }};">
+        {{ '+' if portfolio.realized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.realized|abs) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.closed_trades }} closed · {{ portfolio.wins }}W / {{ portfolio.losses }}L</div>
+    </div>
+
+    <!-- Unrealized P&L -->
+    {% set ucol = 'var(--good)' if portfolio.unrealized > 0.005 else ('var(--bad)' if portfolio.unrealized < -0.005 else 'var(--text)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Unrealized P&amp;L</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ ucol }};">
+        {{ '+' if portfolio.unrealized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.unrealized|abs) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open positions</div>
+    </div>
+
+    <!-- Capital deployed -->
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Capital Deployed</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800;">
+        ${{ '{:,.2f}'.format(portfolio.invested_open) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">
+        {% if portfolio.current %}{{ '%.1f' | format(portfolio.invested_open / portfolio.current * 100) }}% of equity{% else %}—{% endif %}
+      </div>
+    </div>
+
+    <!-- Win rate -->
+    {% set wcol = 'var(--good)' if portfolio.win_rate >= 0.55 else ('var(--warn)' if portfolio.win_rate >= 0.4 else 'var(--bad)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Win Rate</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ wcol if portfolio.closed_trades else 'var(--text)' }};">
+        {{ '%.1f' | format(portfolio.win_rate * 100) }}%
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">across all paper trades</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- LIVE TRADING SESSION                                            -->
+<!-- Real-time paper trading with the autonomous engine running.     -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="live-session" data-claude-configured="{{ 'true' if claude_configured else 'false' }}">
+  <div class="card-header">
+    <div class="card-title">
+      <span id="live-pulse" style="display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--text-muted);margin-right:0.5rem;vertical-align:middle;"></span>
+      Live Trading Session
+      <span id="live-status-badge" class="badge" style="margin-left:0.6rem;">Idle</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <label class="text-muted" style="font-size:0.78rem;">Tick</label>
+      <select id="live-tick-seconds" class="select" style="width:90px;">
+        <option value="5">5s</option>
+        <option value="10">10s</option>
+        <option value="15" selected>15s</option>
+        <option value="30">30s</option>
+        <option value="60">60s</option>
+      </select>
+      <button id="live-start-btn" class="btn btn-primary" type="button">Start Live Session</button>
+      <button id="live-stop-btn" class="btn btn-danger" type="button" style="display:none;">Stop Session</button>
+      <button id="live-tick-btn" class="btn" type="button" title="Force one tick now">Tick&nbsp;Now</button>
+    </div>
+  </div>
+
+  <p class="text-muted mb-3" style="font-size:0.85rem;max-width:780px;">
+    Watch the bot trade in real time on paper money. Starting a session forces the autonomous engine to wake up
+    every few seconds, route Claude's decisions through the paper trading layer, and stream every BUY, SELL, HOLD,
+    and exit straight onto this page. Stop any time. We perfect this here before live capital.
+  </p>
+
+  <!-- Live equity strip — these numbers tick every poll -->
+  <div class="grid mb-3" style="grid-template-columns:1.4fr repeat(4,1fr);gap:0.6rem;">
+    <div class="kpi" id="live-kpi-equity"
+         style="background:linear-gradient(135deg,var(--bg-elev),var(--bg));border-left:3px solid var(--accent,#4aa3ff);">
+      <div class="kpi-label">Currently Sitting At</div>
+      <div class="kpi-value mono" id="live-equity" style="font-size:2.2rem;font-weight:800;letter-spacing:-0.02em;">$0.00</div>
+      <div class="text-dim mono" id="live-equity-sub" style="font-size:0.78rem;">— vs. seeded —</div>
+    </div>
+    <div class="kpi" id="live-kpi-pl">
+      <div class="kpi-label">Total P&amp;L</div>
+      <div class="kpi-value mono" id="live-total-pl" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-total-pl-pct" style="font-size:0.72rem;">0.00%</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Realized</div>
+      <div class="kpi-value mono" id="live-realized" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-realized-sub" style="font-size:0.72rem;">0 closed</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Unrealized</div>
+      <div class="kpi-value mono" id="live-unrealized" style="font-size:1.5rem;font-weight:800;">$0.00</div>
+      <div class="text-dim mono" id="live-unrealized-sub" style="font-size:0.72rem;">0 open · marked live</div>
+    </div>
+    <div class="kpi">
+      <div class="kpi-label">Win Rate</div>
+      <div class="kpi-value mono" id="live-winrate" style="font-size:1.5rem;font-weight:800;">0%</div>
+      <div class="text-dim mono" id="live-winrate-sub" style="font-size:0.72rem;">0W / 0L</div>
+    </div>
+  </div>
+
+  <!-- Three streams: Decisions · Fills · Console -->
+  <div class="grid" style="grid-template-columns:1.1fr 1fr 1fr;gap:0.75rem;">
+    <!-- Claude decision feed -->
+    <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">Claude decisions</div>
+        <span class="text-dim" id="live-decision-count" style="font-size:0.72rem;">0</span>
+      </div>
+      <div id="live-decision-feed" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.78rem;display:flex;flex-direction:column-reverse;gap:0.35rem;">
+        <div class="text-dim">Decisions will stream here.</div>
+      </div>
+    </div>
+
+    <!-- Fills -->
+    <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">Fills (open / close)</div>
+        <span class="text-dim" id="live-fill-count" style="font-size:0.72rem;">0</span>
+      </div>
+      <div id="live-fill-feed" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.78rem;display:flex;flex-direction:column-reverse;gap:0.35rem;">
+        <div class="text-dim">Buys and sells will appear here.</div>
+      </div>
+    </div>
+
+    <!-- Console / activity log -->
+    <div style="background:#0a0a0a;border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
+      <div class="flex items-center justify-between mb-2">
+        <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:#888;">Console</div>
+        <span id="live-tick-info" class="mono" style="font-size:0.72rem;color:#aaa;">tick —</span>
+      </div>
+      <div id="live-console" class="mono"
+           style="height:340px;overflow-y:auto;font-size:0.74rem;color:#d6d6d6;display:flex;flex-direction:column-reverse;gap:0.2rem;">
+        <div style="color:#666;">Console output will appear here.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- POSITIONS LAB                                                   -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="positions-lab">
+  <div class="card-header">
+    <div class="card-title">Positions Lab</div>
+    <div class="flex gap-2 items-center">
+      <span class="badge badge-info">live candles + bot trades + decisions</span>
+      <select id="lab-granularity" class="select" style="width: 120px;">
+        <option value="300">5m</option>
+        <option value="900" selected>15m</option>
+        <option value="3600">1h</option>
+        <option value="21600">6h</option>
+        <option value="86400">1d</option>
+      </select>
+    </div>
+  </div>
+  <p class="text-muted mb-3" style="font-size: 0.85rem;">
+    Pick any symbol the bot has touched. The chart shows real Coinbase candles with green up-arrows where the bot opened longs, red down-arrows for shorts, and X marks at the exits colored by P&amp;L. The faint dots are every Claude decision (including HOLDs) so you can see what the bot considered but skipped.
+  </p>
+
+  <div class="grid" style="grid-template-columns: 240px 1fr; gap: 1rem; align-items: start;">
+    <!-- Symbol list -->
+    <div class="flex flex-col gap-1" id="lab-symbol-list" style="max-height: 540px; overflow-y: auto;">
+      {% for row in traded_symbols %}
+        <button type="button"
+                class="lab-symbol"
+                data-symbol="{{ row.symbol }}"
+                data-wallet-id="{{ row.wallet_id }}"
+                data-wallet-name="{{ row.wallet_name }}"
+                style="text-align: left; padding: 0.55rem 0.7rem; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; color: var(--text);">
+          <div class="mono" style="font-size: 0.9rem; font-weight: 600;">{{ row.symbol }}</div>
+          <div class="text-dim" style="font-size: 0.72rem;">{{ row.wallet_name }}</div>
+        </button>
+      {% else %}
+        <div class="empty">No paper trades yet. Once the bot opens a position, the symbol appears here.</div>
+      {% endfor %}
+    </div>
+
+    <!-- Chart + stats + ledger -->
+    <div class="flex flex-col gap-3" id="lab-pane">
+      <div id="lab-empty" class="empty" style="padding: 4rem 2rem;">
+        Select a symbol on the left to see the bot&apos;s entries, exits, and decisions plotted on the live chart.
+      </div>
+
+      <div id="lab-content" style="display: none;">
+        <!-- KPI strip: bold entry/exit dollar amounts up front -->
+        <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+          <!-- Bought-In total -->
+          <div class="kpi" style="background: linear-gradient(135deg, rgba(38,194,129,0.10), var(--bg-elev)); border-left: 3px solid var(--good);">
+            <div class="kpi-label">Bought In (paper)</div>
+            <div class="kpi-value mono" id="lab-kpi-bought" style="font-size: 1.6rem; font-weight: 800; color: var(--good);">$0.00</div>
+            <div class="text-dim" id="lab-kpi-bought-sub" style="font-size: 0.72rem;">— entries</div>
+          </div>
+          <!-- Sold-At total -->
+          <div class="kpi" style="background: linear-gradient(135deg, rgba(74,163,255,0.10), var(--bg-elev)); border-left: 3px solid var(--accent, #4aa3ff);">
+            <div class="kpi-label">Sold At (paper)</div>
+            <div class="kpi-value mono" id="lab-kpi-sold" style="font-size: 1.6rem; font-weight: 800; color: var(--accent, #4aa3ff);">$0.00</div>
+            <div class="text-dim" id="lab-kpi-sold-sub" style="font-size: 0.72rem;">— exits</div>
+          </div>
+          <!-- Realized P&L for THIS symbol -->
+          <div class="kpi" style="border-left: 3px solid var(--border);">
+            <div class="kpi-label">Realized P&amp;L</div>
+            <div class="kpi-value mono" id="lab-kpi-pnl" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
+            <div class="text-dim" id="lab-kpi-pnl-sub" style="font-size: 0.72rem;">best — / worst —</div>
+          </div>
+          <!-- Currently open in this symbol -->
+          <div class="kpi" style="border-left: 3px solid var(--border);">
+            <div class="kpi-label">Currently Open</div>
+            <div class="kpi-value mono" id="lab-kpi-openval" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
+            <div class="text-dim" id="lab-kpi-openval-sub" style="font-size: 0.72rem;">0 positions · unreal —</div>
+          </div>
+        </div>
+
+        <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+          <div class="kpi"><div class="kpi-label">Symbol</div><div class="kpi-value mono" id="lab-kpi-symbol">—</div></div>
+          <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value mono" id="lab-kpi-winrate">0%</div></div>
+          <div class="kpi"><div class="kpi-label">Trades</div><div class="kpi-value mono" id="lab-kpi-trades">0</div></div>
+          <div class="kpi"><div class="kpi-label">Avg Hold</div><div class="kpi-value mono" id="lab-kpi-hold">—</div></div>
+        </div>
+
+        <!-- Chart canvas -->
+        <div style="position: relative; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.5rem;">
+          <canvas id="lab-chart" style="width: 100%; height: 460px; display: block;"></canvas>
+          <div id="lab-tooltip" style="position: absolute; pointer-events: none; display: none; background: rgba(15,17,21,0.96); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: var(--text); max-width: 320px; z-index: 5;"></div>
+          <div style="position: absolute; bottom: 0.6rem; right: 0.8rem; display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--text-muted);">
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--good);border-radius:2px;margin-right:4px;"></span>Long entry</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--bad);border-radius:2px;margin-right:4px;"></span>Short entry</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--accent, #4aa3ff);border-radius:50%;margin-right:4px;"></span>Decision</span>
+            <span><span style="display:inline-block;width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:8px solid var(--text-muted);margin-right:4px;"></span>Exit</span>
+          </div>
+        </div>
+
+        <!-- Trade ledger for this symbol -->
+        <div>
+          <h4 style="font-size: 0.85rem; margin: 0 0 0.4rem 0;">Trade ledger for <span id="lab-ledger-symbol" class="mono">—</span></h4>
+          <div style="overflow-x: auto;">
+            <table class="table" style="width: 100%; font-size: 0.82rem;">
+              <thead>
+                <tr>
+                  <th>#</th><th>Side</th><th>Qty</th>
+                  <th style="text-align: right;">Bought&nbsp;$</th>
+                  <th style="text-align: right;">Sold&nbsp;$</th>
+                  <th style="text-align: right;">P&amp;L</th>
+                  <th>Conf</th><th>Status</th><th>Opened</th><th>Closed</th><th>Notes</th>
+                </tr>
+              </thead>
+              <tbody id="lab-ledger-body">
+                <tr><td colspan="11" class="empty">No trades for this symbol yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- READINESS SCORE                                                 -->
 <!-- ============================================================ -->
 <div class="card mb-4">
   <div class="card-header">
@@ -39,6 +330,12 @@
       <span class="badge badge-bad">Keep paper trading</span>
     {% endif %}
   </div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem; max-width: 720px;">
+    Composite score from the entire simulation history: sample size, profitability (win rate &amp; profit factor),
+    edge magnitude (expectancy), risk discipline (drawdown, payoff, consistency), and process quality
+    (reflections, playbook depth, symbol coverage, recency, Claude config). The bot only graduates to live
+    money when this number stays above 75 with a healthy underlying sample.
+  </p>
 
   <div class="flex items-center gap-4" style="flex-wrap: wrap;">
     {% set pct = readiness.score %}
@@ -56,13 +353,13 @@
       </div>
     </div>
 
-    <div class="flex flex-col gap-2" style="flex: 1; min-width: 280px;">
+    <div class="flex flex-col gap-2" style="flex: 1; min-width: 320px;">
       {% set comps = [
-        ('Sample size',     readiness.components.sample,  'Closed paper trades vs 250-trade target'),
-        ('Win rate',        readiness.components.win,     'Realized win rate vs 55% target'),
-        ('Process quality', readiness.components.process, 'Average reflection score on last 50 trades'),
-        ('Playbook depth',  readiness.components.rules,   'Learned rules vs 30-rule target'),
-        ('Configuration',   readiness.components.config,  'Claude API connectivity'),
+        ('Sample size',       readiness.components.sample,        'Closed paper trades vs 250-trade target'),
+        ('Profitability',     readiness.components.profitability, 'Win rate vs 55% AND profit factor vs 1.5x'),
+        ('Edge magnitude',    readiness.components.edge,          'Expectancy ($ per trade) vs starting bankroll'),
+        ('Risk discipline',   readiness.components.discipline,    'Max drawdown, payoff ratio, P&L consistency'),
+        ('Process & coverage', readiness.components.process,      'Reflections, playbook, symbol diversity, recency, Claude config'),
       ] %}
       {% for label, val, hint in comps %}
         <div>
@@ -79,6 +376,7 @@
 
     <div class="flex flex-col gap-2" style="min-width: 220px;">
       <div class="flex justify-between"><span class="text-muted">Closed trades</span><span class="mono">{{ readiness.closed_trades }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Open trades</span><span class="mono">{{ readiness.open_trades }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Wins / Losses</span><span class="mono">{{ readiness.wins }} / {{ readiness.losses }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Win rate</span><span class="mono">{{ '%.1f' | format(readiness.win_rate * 100) }}%</span></div>
       <div class="flex justify-between"><span class="text-muted">Active rules</span><span class="mono">{{ readiness.rules }}</span></div>
@@ -86,10 +384,100 @@
       <div class="flex justify-between"><span class="text-muted">Avg process score</span><span class="mono">{{ '%.2f' | format(readiness.avg_reflection_score) }}</span></div>
     </div>
   </div>
+
+  <!-- Simulation metrics panel -->
+  {% set m = readiness.metrics %}
+  {% macro pf_fmt(v) -%}
+    {%- if v == "Infinity" or v == none -%}∞{%- elif v is number and v == v and v != v + 1 -%}{{ '%.2f' | format(v) }}{%- else -%}{{ v }}{%- endif -%}
+  {%- endmacro %}
+  <div class="mt-4" style="border-top: 1px solid var(--border); padding-top: 0.9rem;">
+    <div class="flex items-center justify-between mb-2">
+      <h4 style="margin: 0; font-size: 0.85rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);">
+        Simulation metrics powering this score
+      </h4>
+      <span class="text-dim" style="font-size: 0.72rem;">
+        Last activity {{ m.recency_days }}d ago · {{ m.distinct_symbols }} distinct symbols
+      </span>
+    </div>
+    <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      {% set rcol = 'var(--good)' if m.realized_pnl > 0.005 else ('var(--bad)' if m.realized_pnl < -0.005 else 'var(--text)') %}
+      <div class="kpi" style="border-left: 3px solid {{ rcol }};">
+        <div class="kpi-label">Realized P&amp;L</div>
+        <div class="kpi-value mono" style="color: {{ rcol }};">
+          {{ '+' if m.realized_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.realized_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.2f' | format(m.return_pct) }}% on ${{ '{:,.0f}'.format(m.starting_bankroll) }}</div>
+      </div>
+      {% set ucol = 'var(--good)' if m.unrealized_pnl > 0.005 else ('var(--bad)' if m.unrealized_pnl < -0.005 else 'var(--text)') %}
+      <div class="kpi" style="border-left: 3px solid {{ ucol }};">
+        <div class="kpi-label">Unrealized P&amp;L</div>
+        <div class="kpi-value mono" style="color: {{ ucol }};">
+          {{ '+' if m.unrealized_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.unrealized_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ readiness.open_trades }} open</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Profit Factor</div>
+        <div class="kpi-value mono">{{ pf_fmt(m.profit_factor) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">${{ '{:,.0f}'.format(m.gross_win) }} / ${{ '{:,.0f}'.format(m.gross_loss) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Expectancy / trade</div>
+        <div class="kpi-value mono">{{ '+' if m.expectancy >= 0 else '−' }}${{ '{:,.2f}'.format(m.expectancy|abs) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.3f' | format(m.expectancy_pct) }}% of bankroll</div>
+      </div>
+    </div>
+    <div class="grid mt-2" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      <div class="kpi">
+        <div class="kpi-label">Avg Win</div>
+        <div class="kpi-value mono" style="color: var(--good);">+${{ '{:,.2f}'.format(m.avg_win) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Avg Loss</div>
+        <div class="kpi-value mono" style="color: var(--bad);">−${{ '{:,.2f}'.format(m.avg_loss) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Payoff Ratio</div>
+        <div class="kpi-value mono">{{ pf_fmt(m.payoff_ratio) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">avg win / avg loss</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Max Drawdown</div>
+        <div class="kpi-value mono" style="color: var(--bad);">−${{ '{:,.2f}'.format(m.max_drawdown_abs) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.1f' | format(m.max_drawdown_pct) }}% of peak</div>
+      </div>
+    </div>
+    <div class="grid mt-2" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      <div class="kpi">
+        <div class="kpi-label">Consistency</div>
+        <div class="kpi-value mono">{{ '%.2f' | format(m.consistency) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">Sharpe-like, &gt; 0.2 is healthy</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Avg Hold</div>
+        <div class="kpi-value mono">
+          {% if m.avg_hold_minutes > 0 %}{{ '%.0f' | format(m.avg_hold_minutes) }}m{% else %}—{% endif %}
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Symbol Coverage</div>
+        <div class="kpi-value mono">{{ m.distinct_symbols }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">distinct symbols traded</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Total Equity P&amp;L</div>
+        {% set tcol = 'var(--good)' if m.total_pnl > 0.005 else ('var(--bad)' if m.total_pnl < -0.005 else 'var(--text)') %}
+        <div class="kpi-value mono" style="color: {{ tcol }};">
+          {{ '+' if m.total_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.total_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">realized + unrealized</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <!-- ============================================================ -->
-<!-- PLAYBOOK EDITOR                                                -->
+<!-- PLAYBOOK EDITOR                                                 -->
 <!-- ============================================================ -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
@@ -173,7 +561,7 @@
 </div>
 
 <!-- ============================================================ -->
-<!-- DECISION LOG                                                   -->
+<!-- DECISION LOG                                                    -->
 <!-- ============================================================ -->
 <div class="card mb-4">
   <div class="card-header">
@@ -226,7 +614,7 @@
 </div>
 
 <!-- ============================================================ -->
-<!-- SYNTHETIC TRAINING SESSION                                     -->
+<!-- SYNTHETIC TRAINING SESSION                                      -->
 <!-- ============================================================ -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
@@ -271,5 +659,8 @@
 </div>
 
 <div id="training-result"></div>
+
+<script src="/static/positions_lab.js?v=2"></script>
+<script src="/static/live_session.js?v=1"></script>
 
 {% endblock %}

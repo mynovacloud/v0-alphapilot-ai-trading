@@ -32,6 +32,7 @@ from database.models import (
     ClaudeDecision,
     PaperTrade,
     TradeReflection,
+    Wallet,
 )
 from services.claude_client import chat as claude_chat
 from services.claude_client import is_configured as claude_is_configured
@@ -333,62 +334,241 @@ def reset_playbook() -> dict[str, Any]:
 
 def readiness_score() -> dict[str, Any]:
     """
-    A 0..100 score indicating how ready the Claude bot is to handle real money.
-    Considers: total closed trades, win rate, average reflection score, playbook
-    size, claude configuration. Used by the Training Center.
+    Comprehensive 0..100 readiness score for graduating from paper to live.
+
+    Weighs FIVE signal families derived from the entire simulation history:
+      1. Sample size           - have we observed enough trades?
+      2. Profitability         - win rate AND profit factor (gross win / gross loss)
+      3. Edge magnitude        - expectancy (avg P&L per trade) vs starting bankroll
+      4. Risk discipline       - max drawdown and average loss vs average win
+      5. Process & coverage    - reflection scores, playbook depth, symbol diversity,
+                                 Claude config, trading recency
+
+    Returns a dict with the score, sub-scores, and the raw simulation metrics
+    so the Training UI can render the complete picture.
     """
+    import math
+    from datetime import datetime, timedelta
+
     with session_scope() as s:
-        closed = s.query(PaperTrade).filter(PaperTrade.status == "closed").count()
-        wins = (
-            s.query(PaperTrade)
-            .filter(PaperTrade.status == "closed", PaperTrade.realized_pnl > 0)
-            .count()
-        )
-        losses = (
-            s.query(PaperTrade)
-            .filter(PaperTrade.status == "closed", PaperTrade.realized_pnl < 0)
-            .count()
-        )
+        all_trades = s.query(PaperTrade).all()
         rules = s.query(AILearningMemory).count()
-        reflections = s.query(TradeReflection).count()
-        avg_score_row = s.query(TradeReflection).order_by(TradeReflection.id.desc()).limit(50).all()
+        reflections_total = s.query(TradeReflection).count()
+        avg_score_row = (
+            s.query(TradeReflection)
+            .order_by(TradeReflection.id.desc())
+            .limit(50)
+            .all()
+        )
         avg_score = (
             sum(float(r.score or 0) for r in avg_score_row) / len(avg_score_row)
-            if avg_score_row else 0.0
+            if avg_score_row
+            else 0.0
         )
+        wallets = s.query(Wallet).all()
+        starting_bankroll = sum(float(w.paper_balance or 0.0) for w in wallets) or 0.0
 
-    win_rate = (wins / closed) if closed else 0.0
+    # Partition trades.
+    closed = [t for t in all_trades if t.status == "closed"]
+    open_trades = [t for t in all_trades if t.status == "open"]
+    wins = [t for t in closed if (t.realized_pnl or 0) > 0]
+    losses = [t for t in closed if (t.realized_pnl or 0) < 0]
+    flats = [t for t in closed if (t.realized_pnl or 0) == 0]
 
-    # Sub-scores (each 0..1)
-    sample_score = min(closed / 250.0, 1.0)             # 250 trades = "well-sampled"
-    win_score = max(0.0, min(win_rate / 0.55, 1.0))     # 55% = good crypto win rate
+    closed_count = len(closed)
+    win_count = len(wins)
+    loss_count = len(losses)
+
+    realized_pnl = sum(float(t.realized_pnl or 0) for t in closed)
+    unrealized_pnl = sum(float(t.unrealized_pnl or 0) for t in open_trades)
+    total_pnl = realized_pnl + unrealized_pnl
+
+    gross_win = sum(float(t.realized_pnl or 0) for t in wins)
+    gross_loss = abs(sum(float(t.realized_pnl or 0) for t in losses))
+    avg_win = (gross_win / win_count) if win_count else 0.0
+    avg_loss = (gross_loss / loss_count) if loss_count else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else (
+        float("inf") if gross_win > 0 else 0.0
+    )
+    win_rate = (win_count / closed_count) if closed_count else 0.0
+    expectancy = (realized_pnl / closed_count) if closed_count else 0.0  # $ per trade
+    payoff_ratio = (avg_win / avg_loss) if avg_loss > 0 else (
+        float("inf") if avg_win > 0 else 0.0
+    )
+
+    # Equity curve & max drawdown across closed trades, ordered by close time.
+    closed_sorted = sorted(
+        closed,
+        key=lambda t: t.closed_at or t.opened_at or datetime.min,
+    )
+    equity = starting_bankroll
+    peak = starting_bankroll if starting_bankroll else 0.0
+    max_dd_abs = 0.0
+    max_dd_pct = 0.0
+    pnl_series: list[float] = []
+    for t in closed_sorted:
+        equity += float(t.realized_pnl or 0)
+        pnl_series.append(float(t.realized_pnl or 0))
+        if equity > peak:
+            peak = equity
+        drawdown = peak - equity
+        if drawdown > max_dd_abs:
+            max_dd_abs = drawdown
+            max_dd_pct = (drawdown / peak) if peak > 0 else 0.0
+
+    # Sharpe-like consistency: mean / std of per-trade P&L.
+    consistency = 0.0
+    if len(pnl_series) >= 5:
+        mean = sum(pnl_series) / len(pnl_series)
+        var = sum((x - mean) ** 2 for x in pnl_series) / len(pnl_series)
+        std = math.sqrt(var)
+        consistency = (mean / std) if std > 0 else 0.0  # unitless, ~Sharpe ratio per trade
+
+    avg_hold_min = 0.0
+    holds = [
+        ((t.closed_at - t.opened_at).total_seconds() / 60.0)
+        for t in closed
+        if t.closed_at and t.opened_at
+    ]
+    if holds:
+        avg_hold_min = sum(holds) / len(holds)
+
+    distinct_symbols = len({t.symbol for t in all_trades if t.symbol})
+
+    # "Recency": did the bot trade within the last 7 days?
+    last_close = max((t.closed_at for t in closed if t.closed_at), default=None)
+    last_open = max((t.opened_at for t in all_trades if t.opened_at), default=None)
+    last_activity = max([d for d in (last_close, last_open) if d], default=None)
+    recency_days = (
+        (datetime.utcnow() - last_activity).days if last_activity else 9999
+    )
+
+    return_pct = (realized_pnl / starting_bankroll * 100.0) if starting_bankroll else 0.0
+
+    # ------- Sub-scores (each clamped to 0..1) -------
+    sample_score = min(closed_count / 250.0, 1.0)  # 250 closed trades = "well-sampled"
+
+    # Profitability: blend of win rate (target 55%) and profit factor (target 1.5).
+    win_rate_score = max(0.0, min(win_rate / 0.55, 1.0))
+    pf_score = (
+        1.0 if profit_factor == float("inf") and gross_win > 0
+        else max(0.0, min((profit_factor - 1.0) / 0.5, 1.0)) if profit_factor > 0
+        else 0.0
+    )
+    profitability_score = 0.5 * win_rate_score + 0.5 * pf_score
+
+    # Edge: expectancy as fraction of starting bankroll per trade.
+    # 0.1% per trade = decent, 0.5% = excellent.
+    expectancy_pct = (expectancy / starting_bankroll) if starting_bankroll else 0.0
+    edge_score = max(0.0, min(expectancy_pct / 0.005, 1.0))
+
+    # Discipline: penalize big drawdowns and skewed payoff.
+    # 25%+ drawdown -> 0; flat -> 1.
+    dd_score = max(0.0, 1.0 - (max_dd_pct / 0.25))
+    payoff_score = (
+        1.0 if payoff_ratio == float("inf") and avg_win > 0
+        else max(0.0, min(payoff_ratio / 1.5, 1.0)) if payoff_ratio > 0
+        else 0.0
+    )
+    consistency_score = max(0.0, min((consistency + 0.2) / 0.5, 1.0))
+    discipline_score = 0.5 * dd_score + 0.3 * payoff_score + 0.2 * consistency_score
+
+    # Process & coverage.
     process_score = max(0.0, min((avg_score + 1.0) / 2.0, 1.0))
     rules_score = min(rules / 30.0, 1.0)
+    coverage_score = min(distinct_symbols / 8.0, 1.0)  # 8+ distinct symbols
+    recency_score = (
+        1.0 if recency_days <= 1
+        else 0.7 if recency_days <= 3
+        else 0.4 if recency_days <= 7
+        else 0.1 if recency_days <= 14
+        else 0.0
+    )
     config_score = 1.0 if claude_is_configured() else 0.0
-
-    composite = (
-        0.30 * sample_score
-        + 0.25 * win_score
-        + 0.20 * process_score
-        + 0.15 * rules_score
+    process_total = (
+        0.35 * process_score
+        + 0.25 * rules_score
+        + 0.20 * coverage_score
+        + 0.10 * recency_score
         + 0.10 * config_score
     )
 
+    composite = (
+        0.25 * sample_score
+        + 0.25 * profitability_score
+        + 0.20 * edge_score
+        + 0.15 * discipline_score
+        + 0.15 * process_total
+    )
+
+    # Hard gates: even if composite is high, a tiny sample or unconfigured
+    # Claude must keep the bot off live trading.
+    if closed_count < 30:
+        composite = min(composite, 0.45)
+    if not claude_is_configured():
+        composite = min(composite, 0.50)
+
+    def _f(x: float) -> float:
+        return float("inf") if x == float("inf") else round(x, 3)
+
     return {
         "score": round(composite * 100.0, 1),
-        "closed_trades": closed,
-        "wins": wins,
-        "losses": losses,
+        # Headline counts (kept for backward compatibility with existing UI).
+        "closed_trades": closed_count,
+        "open_trades": len(open_trades),
+        "wins": win_count,
+        "losses": loss_count,
+        "flats": len(flats),
         "win_rate": round(win_rate, 4),
         "rules": rules,
-        "reflections": reflections,
+        "reflections": reflections_total,
         "avg_reflection_score": round(avg_score, 3),
         "claude_configured": claude_is_configured(),
+        # Full simulation metrics (the new "AI training is calculating everything" payload).
+        "metrics": {
+            "starting_bankroll": round(starting_bankroll, 2),
+            "realized_pnl": round(realized_pnl, 2),
+            "unrealized_pnl": round(unrealized_pnl, 2),
+            "total_pnl": round(total_pnl, 2),
+            "return_pct": round(return_pct, 3),
+            "gross_win": round(gross_win, 2),
+            "gross_loss": round(gross_loss, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
+            "profit_factor": _f(profit_factor),
+            "payoff_ratio": _f(payoff_ratio),
+            "expectancy": round(expectancy, 4),
+            "expectancy_pct": round(expectancy_pct * 100.0, 4),
+            "max_drawdown_abs": round(max_dd_abs, 2),
+            "max_drawdown_pct": round(max_dd_pct * 100.0, 3),
+            "consistency": round(consistency, 3),
+            "avg_hold_minutes": round(avg_hold_min, 1),
+            "distinct_symbols": distinct_symbols,
+            "recency_days": recency_days,
+        },
+        # 5-axis composite. Each is 0..1.
         "components": {
             "sample": round(sample_score, 3),
-            "win": round(win_score, 3),
-            "process": round(process_score, 3),
+            "profitability": round(profitability_score, 3),
+            "edge": round(edge_score, 3),
+            "discipline": round(discipline_score, 3),
+            "process": round(process_total, 3),
+            # Legacy keys preserved so older templates still render.
+            "win": round(win_rate_score, 3),
             "rules": round(rules_score, 3),
+            "config": round(config_score, 3),
+        },
+        # Detail breakdown for tooltips / "why this score?" UI.
+        "subcomponents": {
+            "win_rate": round(win_rate_score, 3),
+            "profit_factor": round(pf_score, 3),
+            "drawdown": round(dd_score, 3),
+            "payoff": round(payoff_score, 3),
+            "consistency": round(consistency_score, 3),
+            "reflection": round(process_score, 3),
+            "playbook": round(rules_score, 3),
+            "coverage": round(coverage_score, 3),
+            "recency": round(recency_score, 3),
             "config": round(config_score, 3),
         },
     }

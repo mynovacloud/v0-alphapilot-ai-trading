@@ -3,13 +3,51 @@
 {% block topbar %}Dashboard{% endblock %}
 {% block content %}
 
-<div class="banner banner-info">
-  Paper trading mode is active. Trades are simulated against <strong>live</strong> market prices from CoinGecko — no real funds are at risk.
+{# -------------------------------------------------------------- #}
+{# Mode toggle: All / Paper / Live. Drives the entire dashboard.   #}
+{# -------------------------------------------------------------- #}
+{% set mode = current_mode or 'all' %}
+{% set live_total = (summary.by_mode.live.realized_pnl or 0) + (summary.by_mode.live.unrealized_pnl or 0) %}
+{% set paper_total = (summary.by_mode.paper.realized_pnl or 0) + (summary.by_mode.paper.unrealized_pnl or 0) %}
+
+<div class="flex items-center justify-between mb-3" style="flex-wrap:wrap;gap:0.6rem;">
+  <div class="flex items-center gap-2" role="tablist" aria-label="Trading mode filter">
+    <a href="/?mode=all"   class="btn btn-sm {{ 'btn-primary' if mode=='all'   else '' }}">All</a>
+    <a href="/?mode=paper" class="btn btn-sm {{ 'btn-primary' if mode=='paper' else '' }}">Paper</a>
+    <a href="/?mode=live"  class="btn btn-sm {{ 'btn-primary' if mode=='live'  else '' }}">Live</a>
+    <span class="text-dim" style="font-size:0.78rem;margin-left:0.4rem;">
+      Showing {{ summary.active_wallets }} wallet{{ '' if summary.active_wallets == 1 else 's' }}
+      {% if mode != 'all' %}in <strong>{{ mode }}</strong> mode{% endif %}
+    </span>
+  </div>
+  {% if session_active %}
+    <a href="/training" class="badge badge-good badge-dot" style="text-decoration:none;">
+      <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--good);margin-right:0.4rem;animation:pulse 1.6s infinite;"></span>
+      Training session live — view feed
+    </a>
+  {% endif %}
 </div>
 
+{% if mode == 'live' %}
+  <div class="banner banner-warn">
+    <strong>Live trading view.</strong> These figures reflect <strong>real money</strong> on connected exchange wallets. Closing a position here moves actual funds.
+  </div>
+{% elif mode == 'paper' %}
+  <div class="banner banner-info">
+    <strong>Paper trading view.</strong> Simulated trades against live market prices. No real funds at risk.
+  </div>
+{% else %}
+  <div class="banner banner-info">
+    Showing every wallet. Use the toggle above to scope KPIs and tables to <strong>paper</strong> or <strong>live</strong> trading only.
+  </div>
+{% endif %}
+
+{# -------------------------------------------------------------- #}
+{# Headline KPI grid (mode-scoped)                                  #}
+{# -------------------------------------------------------------- #}
 <div class="kpi-grid">
   <div class="kpi">
-    <div class="kpi-label">Total Portfolio Value</div>
+    <div class="kpi-label">{% if mode=='live' %}Live Equity{% elif mode=='paper' %}Paper Equity{% else %}Total Portfolio Value{% endif %}</div>
     <div class="kpi-value tnum">{{ summary.total_portfolio_value | money }}</div>
     <div class="kpi-sub">Across {{ summary.active_wallets }} wallet{{ '' if summary.active_wallets == 1 else 's' }}</div>
   </div>
@@ -40,12 +78,80 @@
   </div>
 </div>
 
+{# -------------------------------------------------------------- #}
+{# Paper vs Live comparison — always shown so users see both books #}
+{# side-by-side regardless of which mode they have selected.       #}
+{# -------------------------------------------------------------- #}
+<div class="grid grid-2 mb-4">
+  {% set p = summary.by_mode.paper %}
+  {% set l = summary.by_mode.live %}
+  <div class="card" style="border-left:3px solid var(--accent,#4aa3ff);">
+    <div class="card-header">
+      <div class="card-title">Paper Book</div>
+      <span class="badge">{{ p.wallets }} wallet{{ '' if p.wallets == 1 else 's' }}</span>
+    </div>
+    <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:0.5rem;">
+      <div>
+        <div class="kpi-label">Bankroll</div>
+        <div class="tnum" style="font-size:1.2rem;font-weight:700;">{{ p.balance | money }}</div>
+      </div>
+      <div>
+        <div class="kpi-label">Realized</div>
+        <div class="tnum {{ 'text-good' if p.realized_pnl > 0 else ('text-bad' if p.realized_pnl < 0 else '') }}" style="font-size:1.2rem;font-weight:700;">{{ p.realized_pnl | signed }}</div>
+      </div>
+      <div>
+        <div class="kpi-label">Unrealized</div>
+        <div class="tnum {{ 'text-good' if p.unrealized_pnl > 0 else ('text-bad' if p.unrealized_pnl < 0 else '') }}" style="font-size:1.2rem;font-weight:700;">{{ p.unrealized_pnl | signed }}</div>
+      </div>
+      <div>
+        <div class="kpi-label">Trades</div>
+        <div class="tnum" style="font-size:1.2rem;font-weight:700;">{{ p.closed }}<span class="text-dim" style="font-weight:400;font-size:0.85rem;"> / {{ p.open }} open</span></div>
+        <div class="text-dim" style="font-size:0.72rem;">{{ p.wins }}W / {{ p.losses }}L</div>
+      </div>
+    </div>
+  </div>
+  <div class="card" style="border-left:3px solid var(--good);">
+    <div class="card-header">
+      <div class="card-title">Live Book</div>
+      <span class="badge badge-good">{{ l.wallets }} wallet{{ '' if l.wallets == 1 else 's' }}</span>
+    </div>
+    {% if l.wallets == 0 %}
+      <div class="empty" style="padding:0.6rem 0;">
+        No live wallets yet. Flip a wallet's mode to <strong>live</strong> on its detail page once paper performance is proven.
+      </div>
+    {% else %}
+      <div class="grid" style="grid-template-columns:repeat(4,1fr);gap:0.5rem;">
+        <div>
+          <div class="kpi-label">Real Bankroll</div>
+          <div class="tnum" style="font-size:1.2rem;font-weight:700;">{{ l.balance | money }}</div>
+        </div>
+        <div>
+          <div class="kpi-label">Realized</div>
+          <div class="tnum {{ 'text-good' if l.realized_pnl > 0 else ('text-bad' if l.realized_pnl < 0 else '') }}" style="font-size:1.2rem;font-weight:700;">{{ l.realized_pnl | signed }}</div>
+        </div>
+        <div>
+          <div class="kpi-label">Unrealized</div>
+          <div class="tnum {{ 'text-good' if l.unrealized_pnl > 0 else ('text-bad' if l.unrealized_pnl < 0 else '') }}" style="font-size:1.2rem;font-weight:700;">{{ l.unrealized_pnl | signed }}</div>
+        </div>
+        <div>
+          <div class="kpi-label">Trades</div>
+          <div class="tnum" style="font-size:1.2rem;font-weight:700;">{{ l.closed }}<span class="text-dim" style="font-weight:400;font-size:0.85rem;"> / {{ l.open }} open</span></div>
+          <div class="text-dim" style="font-size:0.72rem;">{{ l.wins }}W / {{ l.losses }}L</div>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+
 <div class="grid grid-2-1 mb-4">
   <div class="card">
     <div class="card-header">
       <div>
         <div class="card-title">Equity Curve</div>
-        <div class="card-sub">Cumulative realized P&amp;L over time</div>
+        <div class="card-sub">
+          Cumulative realized P&amp;L
+          {% if mode == 'paper' %}— paper book{% elif mode == 'live' %}— live book{% else %}— all wallets{% endif %}
+        </div>
       </div>
       <div class="flex gap-2">
         <span class="badge">Daily {{ summary.daily_pnl | signed }}</span>
@@ -96,13 +202,29 @@
     <div class="card-header"><div class="card-title">Wallets</div><a class="btn btn-sm" href="/wallets">View all</a></div>
     <div class="table-wrap">
       <table class="table">
-        <thead><tr><th>Name</th><th>Platform</th><th class="num">Paper Balance</th><th>Status</th></tr></thead>
+        <thead><tr><th>Name</th><th>Mode</th><th>Platform</th><th class="num">Bankroll</th><th>Status</th></tr></thead>
         <tbody>
-          {% for w in wallets[:6] %}
+          {% for w in wallets[:8] %}
+            {% set wmode = (w.trading_mode or 'paper') | lower %}
             <tr>
               <td><a href="/wallets/{{ w.id }}">{{ w.name }}</a></td>
+              <td>
+                {% if wmode == 'live' %}
+                  <span class="badge badge-good">LIVE</span>
+                {% elif wmode == 'live_shadow' %}
+                  <span class="badge badge-warn">SHADOW</span>
+                {% else %}
+                  <span class="badge">PAPER</span>
+                {% endif %}
+              </td>
               <td class="text-muted">{{ w.platform }}</td>
-              <td class="num tnum">{{ w.paper_balance | money }}</td>
+              <td class="num tnum">
+                {% if wmode in ['live','live_shadow'] %}
+                  {{ w.real_balance_placeholder | money }}
+                {% else %}
+                  {{ w.paper_balance | money }}
+                {% endif %}
+              </td>
               <td>
                 {% if 'connected' in w.connection_status %}
                   <span class="badge badge-good badge-dot">{{ w.connection_status }}</span>
@@ -112,7 +234,7 @@
               </td>
             </tr>
           {% else %}
-            <tr><td colspan="4" class="empty">No wallets yet — <a href="/wallets/new">add one</a>.</td></tr>
+            <tr><td colspan="5" class="empty">No wallets yet — <a href="/wallets/new">add one</a>.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -120,22 +242,35 @@
   </div>
 
   <div class="card">
-    <div class="card-header"><div class="card-title">Recent Trades</div><a class="btn btn-sm" href="/wallets">View all</a></div>
+    <div class="card-header">
+      <div class="card-title">Recent Trades</div>
+      <a class="btn btn-sm" href="/activity?mode={{ mode }}">View all</a>
+    </div>
     <div class="table-wrap">
       <table class="table">
-        <thead><tr><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">P&amp;L</th><th>Status</th></tr></thead>
+        <thead><tr><th>Symbol</th><th>Mode</th><th>Side</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">P&amp;L</th><th>Status</th></tr></thead>
         <tbody>
           {% for t in recent_trades %}
+            {% set tmode = (t.trading_mode or 'paper') | lower %}
             <tr>
               <td class="mono">{{ t.symbol }}</td>
+              <td>
+                {% if tmode == 'live' %}<span class="badge badge-good">LIVE</span>
+                {% elif tmode == 'live_shadow' %}<span class="badge badge-warn">SHADOW</span>
+                {% else %}<span class="badge">PAPER</span>{% endif %}
+              </td>
               <td>{% if t.side == 'BUY' %}<span class="badge badge-good">BUY</span>{% else %}<span class="badge badge-bad">SELL</span>{% endif %}</td>
-              <td class="num tnum">{{ '%.2f' | format(t.qty) }}</td>
+              <td class="num tnum">{{ '%.4f' | format(t.qty) }}</td>
               <td class="num tnum">{{ t.entry_price | money }}</td>
-              <td class="num tnum {{ 'text-good' if t.realized_pnl > 0 else ('text-bad' if t.realized_pnl < 0 else 'text-muted') }}">{{ t.realized_pnl | signed if t.status == 'closed' else '—' }}</td>
+              <td class="num tnum {{ 'text-good' if t.realized_pnl > 0 else ('text-bad' if t.realized_pnl < 0 else 'text-muted') }}">
+                {% if t.status == 'closed' %}{{ t.realized_pnl | signed }}
+                {% elif t.unrealized_pnl %}{{ t.unrealized_pnl | signed }}
+                {% else %}—{% endif %}
+              </td>
               <td><span class="badge {{ 'badge-info' if t.status == 'open' else '' }}">{{ t.status }}</span></td>
             </tr>
           {% else %}
-            <tr><td colspan="6" class="empty">No trades yet.</td></tr>
+            <tr><td colspan="7" class="empty">No trades yet in this view.</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -144,11 +279,19 @@
 </div>
 
 <div class="card">
-  <div class="card-header"><div class="card-title">Recent Activity</div><a class="btn btn-sm" href="/activity">View all</a></div>
+  <div class="card-header">
+    <div class="card-title">Recent Activity</div>
+    <a class="btn btn-sm" href="/activity?mode={{ mode }}">View all</a>
+  </div>
   <div class="flex flex-col gap-2">
     {% for log in recent_logs %}
       <div class="flex items-center gap-3" style="padding: 0.4rem 0; border-bottom: 1px solid var(--border);">
         <span class="badge {{ 'badge-warn' if log.level == 'warn' else ('badge-bad' if log.level == 'error' else 'badge-info') }}">{{ log.category }}</span>
+        {% if log.trading_mode == 'live' or log.trading_mode == 'live_shadow' %}
+          <span class="badge badge-good" style="font-size:0.65rem;">LIVE</span>
+        {% elif log.trading_mode == 'paper' %}
+          <span class="badge" style="font-size:0.65rem;">PAPER</span>
+        {% endif %}
         <div style="flex:1; font-size: 0.85rem;">{{ log.message }}</div>
         <div class="text-dim" style="font-size: 0.75rem;">{{ log.created_at | dt }}</div>
       </div>
@@ -157,5 +300,12 @@
     {% endfor %}
   </div>
 </div>
+
+<style>
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.55; transform: scale(0.85); }
+}
+</style>
 
 {% endblock %}
