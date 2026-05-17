@@ -482,6 +482,7 @@ loadPnlStats('today');
     <div class="flex gap-2 items-center flex-wrap">
       <button type="button" class="btn btn-sm btn-outline" onclick="refreshPositions()">Refresh</button>
       <button type="button" class="btn btn-sm btn-good" onclick="takeProfits()" title="Close all profitable positions">Take Profits</button>
+      <button type="button" class="btn btn-sm btn-outline" onclick="forceCheckPositions()" title="Debug: See what the bot would do">Debug Check</button>
       <button type="button" class="btn btn-sm btn-warn" onclick="closeAllPositions()">Close All</button>
       <button type="button" class="btn btn-sm btn-bad" onclick="emergencyExit()">Emergency Exit</button>
       <button type="button" class="btn btn-sm btn-outline" onclick="openTradingStyleModal()" title="Configure scalper/swing settings">Trading Style</button>
@@ -719,10 +720,39 @@ async function takeProfits() {
       alert(`Profits taken!\n- Closed: ${data.closed} winners\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Held: ${data.skipped} positions`);
       refreshPositions();
     } else {
-      alert('Error: ' + (data.error || 'Unknown error'));
+      alert('Error: ' + (data.error || 'Unknown error') + '\n\n' + (data.traceback || ''));
+    }
     }
   } catch (err) {
     alert('Failed to take profits: ' + err.message);
+  }
+}
+
+async function forceCheckPositions() {
+  try {
+    const res = await fetch('/v1/positions/force-check', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      let msg = `Position Check Results:\n\n`;
+      msg += `Total positions: ${data.total_positions}\n`;
+      msg += `Would auto-exit: ${data.would_exit}\n\n`;
+      
+      if (data.positions && data.positions.length > 0) {
+        for (const p of data.positions) {
+          msg += `${p.symbol}: P&L $${p.pnl_usd} (${p.pnl_pct}%)\n`;
+          msg += `  Style: ${p.wallet_trading_style}, Target: $${p.wallet_micro_target}\n`;
+          msg += `  Should exit: ${p.should_exit ? 'YES - ' + p.exit_reason : 'NO'}\n\n`;
+        }
+      } else {
+        msg += 'No open positions found.';
+      }
+      
+      alert(msg);
+    } else {
+      alert('Error: ' + (data.error || 'Unknown') + '\n\n' + (data.traceback || ''));
+    }
+  } catch (err) {
+    alert('Force check failed: ' + err.message);
   }
 }
 

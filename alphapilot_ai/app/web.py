@@ -2279,18 +2279,122 @@ def api_update_trading_style(
 @router.get("/v1/wallet/trading-style")
 def api_get_trading_style() -> JSONResponse:
     """Get current wallet trading style settings."""
+    import logging
     with session_scope() as s:
         wallet = s.query(Wallet).first()
         if not wallet:
             return JSONResponse({"ok": False, "error": "No wallet found"}, status_code=404)
         
+        # Log actual database values for debugging
+        logging.info(f"[TRADING_STYLE] DB values: trading_style={wallet.trading_style}, micro_target={wallet.micro_profit_target_usd}, min_pct={wallet.min_profit_pct}, auto_reinvest={wallet.auto_reinvest}")
+        
         return JSONResponse({
             "ok": True,
-            "trading_style": getattr(wallet, 'trading_style', 'hybrid') or 'hybrid',
-            "micro_profit_target_usd": getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25,
-            "min_profit_pct": getattr(wallet, 'min_profit_pct', 0.003) or 0.003,
-            "auto_reinvest": getattr(wallet, 'auto_reinvest', True),
+            "trading_style": wallet.trading_style or 'hybrid',
+            "micro_profit_target_usd": float(wallet.micro_profit_target_usd or 0.25),
+            "min_profit_pct": float(wallet.min_profit_pct or 0.003),
+            "auto_reinvest": bool(wallet.auto_reinvest) if wallet.auto_reinvest is not None else True,
             "max_daily_trades": wallet.max_daily_trades or 10,
+        })
+
+
+@router.post("/v1/positions/force-check")
+def api_force_check_positions() -> JSONResponse:
+    """
+    Force the position monitor to check all positions NOW and return what it finds.
+    This is a debug endpoint to test if scalper settings are working.
+    """
+    import logging
+    from connectors.live_prices import get_price
+    from trading.position_monitor import PositionMonitor
+    
+    results = []
+    exit_signals = []
+    
+    try:
+        monitor = PositionMonitor()
+        
+        with session_scope() as s:
+            # Get all open trades
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+            
+            for trade in open_trades:
+                # Get wallet settings
+                wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+                
+                trading_style = wallet.trading_style if wallet else 'hybrid'
+                micro_target = float(wallet.micro_profit_target_usd or 0.25) if wallet else 0.25
+                min_pct = float(wallet.min_profit_pct or 0.003) if wallet else 0.003
+                
+                # Get current price
+                p = get_price(trade.symbol)
+                if not p.get("ok"):
+                    results.append({
+                        "symbol": trade.symbol,
+                        "error": "Could not fetch price"
+                    })
+                    continue
+                
+                current_price = float(p["price"])
+                entry = float(trade.entry_price)
+                qty = float(trade.qty)
+                side = (trade.side or "BUY").upper()
+                
+                # Calculate P&L
+                if side == "BUY":
+                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+                else:
+                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
+                
+                pnl_usd = pnl_pct * entry * qty
+                
+                # Check if should exit
+                should_exit = False
+                exit_reason = None
+                
+                if pnl_usd > 0:
+                    if trading_style == "scalper" and pnl_usd >= micro_target:
+                        should_exit = True
+                        exit_reason = f"SCALPER: pnl_usd ${pnl_usd:.4f} >= target ${micro_target}"
+                    elif trading_style == "hybrid" and (pnl_usd >= micro_target or pnl_pct >= min_pct):
+                        should_exit = True
+                        exit_reason = f"HYBRID: pnl_usd ${pnl_usd:.4f} or pnl_pct {pnl_pct:.4%}"
+                
+                result = {
+                    "trade_id": trade.id,
+                    "symbol": trade.symbol,
+                    "side": side,
+                    "entry": entry,
+                    "current": current_price,
+                    "qty": qty,
+                    "pnl_usd": round(pnl_usd, 4),
+                    "pnl_pct": round(pnl_pct * 100, 4),
+                    "wallet_trading_style": trading_style,
+                    "wallet_micro_target": micro_target,
+                    "wallet_min_pct": min_pct,
+                    "should_exit": should_exit,
+                    "exit_reason": exit_reason,
+                }
+                results.append(result)
+                
+                if should_exit:
+                    exit_signals.append(result)
+                    logging.info(f"[FORCE_CHECK] Would exit {trade.symbol}: {exit_reason}")
+        
+        return JSONResponse({
+            "ok": True,
+            "total_positions": len(results),
+            "would_exit": len(exit_signals),
+            "positions": results,
+            "exit_signals": exit_signals,
+        })
+    except Exception as e:
+        import traceback
+        logging.exception("[FORCE_CHECK] Error")
+        return JSONResponse({
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
         })
 
 
