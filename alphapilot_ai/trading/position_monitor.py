@@ -110,6 +110,43 @@ class PositionMonitor:
             pnl_pct = (current_price - entry) / entry if entry > 0 else 0
         else:  # SELL / SHORT
             pnl_pct = (entry - current_price) / entry if entry > 0 else 0
+        
+        # Calculate P&L in USD
+        pnl_usd = pnl_pct * entry * qty
+
+        # =====================================================================
+        # SCALPER MODE: Check micro-profit target (highest priority for profits)
+        # =====================================================================
+        wallet = trade.wallet
+        trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
+        micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
+        min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+        
+        if pnl_usd > 0:  # Only check if we're in profit
+            # Scalper mode: take ANY profit that hits the USD target
+            if trading_style == "scalper" and pnl_usd >= micro_target_usd:
+                self._log_exit(session, trade, "micro_profit", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="micro_profit",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # Hybrid mode: use both USD and percentage targets
+            if trading_style == "hybrid":
+                if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
+                    self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
+                    return ExitSignal(
+                        trade_id=trade.id,
+                        symbol=trade.symbol,
+                        reason="target_profit",
+                        current_price=current_price,
+                        trigger_price=None,
+                        pnl_pct=pnl_pct,
+                    )
 
         # 1. Check max loss (hard cap)
         max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)

@@ -2133,6 +2133,136 @@ def api_close_all_positions() -> JSONResponse:
     })
 
 
+@router.post("/api/positions/take-profits")
+def api_take_all_profits() -> JSONResponse:
+    """
+    Close only PROFITABLE positions - lock in gains immediately.
+    Perfect for scalping: take your wins, let losers run to stop-loss.
+    """
+    from connectors.live_prices import get_price
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    engine = PaperTradingEngine()
+    closed = 0
+    skipped = 0
+    total_pnl = 0.0
+
+    with session_scope() as s:
+        open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+        trade_info = [(t.id, t.symbol, t.side, float(t.entry_price), float(t.qty)) for t in open_trades]
+
+    for trade_id, symbol, side, entry_price, qty in trade_info:
+        p = get_price(symbol)
+        if not p.get("ok"):
+            skipped += 1
+            continue
+        
+        current_price = float(p["price"])
+        
+        # Calculate P&L
+        if side.upper() == "BUY":
+            pnl = (current_price - entry_price) * qty
+        else:
+            pnl = (entry_price - current_price) * qty
+        
+        # Only close if profitable
+        if pnl <= 0:
+            skipped += 1
+            continue
+
+        result = engine.close_trade(trade_id, current_price, notes="take-profits via API")
+        if result.get("ok"):
+            closed += 1
+            total_pnl += float(result.get("pnl", 0))
+            with session_scope() as s:
+                trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                if trade:
+                    trade.exit_reason = "take_profit_manual"
+        else:
+            skipped += 1
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="positions",
+                level="info",
+                message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+            )
+        )
+
+    return JSONResponse({
+        "ok": True,
+        "closed": closed,
+        "skipped": skipped,
+        "total_pnl": round(total_pnl, 2),
+    })
+
+
+@router.post("/api/wallet/trading-style")
+def api_update_trading_style(
+    trading_style: str = Form(...),  # scalper, swing, hybrid
+    micro_profit_target_usd: float = Form(0.25),
+    min_profit_pct: float = Form(0.003),
+    auto_reinvest: bool = Form(True),
+    max_daily_trades: int = Form(100),
+) -> JSONResponse:
+    """
+    Update wallet trading style settings for scalping vs swing trading.
+    
+    - scalper: Take micro-profits ($0.25 default) as soon as they hit
+    - swing: Hold for larger gains (1-5%), use traditional SL/TP
+    - hybrid: AI decides based on market conditions
+    """
+    if trading_style not in ("scalper", "swing", "hybrid"):
+        return JSONResponse({"ok": False, "error": "Invalid trading_style"}, status_code=400)
+    
+    with session_scope() as s:
+        wallet = s.query(Wallet).first()
+        if not wallet:
+            return JSONResponse({"ok": False, "error": "No wallet found"}, status_code=404)
+        
+        wallet.trading_style = trading_style
+        wallet.micro_profit_target_usd = micro_profit_target_usd
+        wallet.min_profit_pct = min_profit_pct
+        wallet.auto_reinvest = auto_reinvest
+        wallet.max_daily_trades = max_daily_trades
+        
+        s.add(
+            ActivityLog(
+                category="settings",
+                level="info",
+                message=f"Trading style updated: {trading_style}, micro-target: ${micro_profit_target_usd}, max trades: {max_daily_trades}",
+            )
+        )
+    
+    return JSONResponse({
+        "ok": True,
+        "trading_style": trading_style,
+        "micro_profit_target_usd": micro_profit_target_usd,
+        "min_profit_pct": min_profit_pct,
+        "auto_reinvest": auto_reinvest,
+        "max_daily_trades": max_daily_trades,
+    })
+
+
+@router.get("/api/wallet/trading-style")
+def api_get_trading_style() -> JSONResponse:
+    """Get current wallet trading style settings."""
+    with session_scope() as s:
+        wallet = s.query(Wallet).first()
+        if not wallet:
+            return JSONResponse({"ok": False, "error": "No wallet found"}, status_code=404)
+        
+        return JSONResponse({
+            "ok": True,
+            "trading_style": getattr(wallet, 'trading_style', 'hybrid') or 'hybrid',
+            "micro_profit_target_usd": getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25,
+            "min_profit_pct": getattr(wallet, 'min_profit_pct', 0.003) or 0.003,
+            "auto_reinvest": getattr(wallet, 'auto_reinvest', True),
+            "max_daily_trades": wallet.max_daily_trades or 10,
+        })
+
+
 @router.post("/api/positions/{trade_id}/close-partial")
 def api_close_partial(
     trade_id: int,

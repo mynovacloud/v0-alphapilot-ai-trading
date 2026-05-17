@@ -42,6 +42,18 @@ class Wallet(Base):
     max_open_positions = Column(Integer, default=3)
     max_daily_loss_usd = Column(Float, default=200.0)
     max_daily_trades = Column(Integer, default=10)
+    # Trading style: "scalper" | "swing" | "hybrid"
+    # - scalper: take micro-profits quickly ($0.25-$1), high trade count
+    # - swing: hold for larger gains (1-5%), fewer trades
+    # - hybrid: AI decides based on market conditions
+    trading_style = Column(String(20), default="hybrid")
+    # Micro-profit target in USD (for scalper mode)
+    # When a position is up this much, auto-sell and reinvest
+    micro_profit_target_usd = Column(Float, default=0.25)
+    # Minimum profit percentage to trigger sell (alternative to USD target)
+    min_profit_pct = Column(Float, default=0.003)  # 0.3% default
+    # Auto-reinvest: immediately open new position after taking profit
+    auto_reinvest = Column(Boolean, default=True)
     # Perpetual futures controls. When `futures_enabled` is True, the bot is
     # allowed to open SHORT positions and apply leverage. `max_leverage` caps
     # the requested leverage; `default_leverage` is what the bot uses when a
