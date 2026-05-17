@@ -365,6 +365,51 @@ class CoinbaseConnector(BaseConnector):
         except Exception as e:
             return {"ok": False, "error": str(e)}
 
+    def list_orders(self, status: str = "OPEN", limit: int = 250) -> dict[str, Any]:
+        """
+        List orders for the authenticated account.
+
+        status:
+          - "OPEN"   -> only currently working orders
+          - "FILLED" -> recently filled
+          - "CANCELLED"
+          - ""       -> all (Coinbase returns most recent first)
+        """
+        if not self.api_key or not self.api_secret:
+            return {"ok": False, "error": "no credentials"}
+        path = "/api/v3/brokerage/orders/historical/batch"
+        query = f"?limit={limit}"
+        if status:
+            query += f"&order_status={status}"
+        try:
+            with httpx.Client(timeout=15.0) as c:
+                r = c.get(
+                    self.BASE_URL + path + query,
+                    headers=self._auth_headers("GET", path),
+                )
+            data = r.json()
+            if r.status_code != 200:
+                return {"ok": False, "error": data, "status": r.status_code}
+            return {
+                "ok": True,
+                "orders": [
+                    {
+                        "exchange_order_id": o.get("order_id"),
+                        "client_order_id": o.get("client_order_id"),
+                        "product_id": o.get("product_id"),
+                        "side": o.get("side"),
+                        "status": o.get("status"),
+                        "filled_size": float(o.get("filled_size", 0) or 0),
+                        "average_filled_price": float(o.get("average_filled_price", 0) or 0),
+                        "total_fees": float(o.get("total_fees", 0) or 0),
+                        "created_time": o.get("created_time"),
+                    }
+                    for o in data.get("orders", [])
+                ],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
     def get_order(self, exchange_order_id: str) -> dict[str, Any]:
         """Fetch the latest state of one order."""
         if not self.api_key or not self.api_secret:

@@ -275,6 +275,16 @@ class BotEngine:
             if outcome.get("ok"):
                 result.actions += 1
                 slots_left -= 1
+                try:
+                    from services.notifier import notify
+                    notify(
+                        f"Opened {side} {qty} {symbol} @ {price:.4f} "
+                        f"on {wallet['name']} (conf={confidence:.2f}, {strategy_type})",
+                        level="info",
+                        category="trade",
+                    )
+                except Exception:
+                    pass
             else:
                 result.skipped += 1
 

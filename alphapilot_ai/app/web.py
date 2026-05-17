@@ -46,6 +46,7 @@ from trading.backtester import run_backtest
 from trading.bot_engine import bot_engine
 from trading.market_scanner import scan_markets
 from trading.paper_trading_engine import PaperTradingEngine
+from trading.reconciler import reconciler
 from trading.risk_manager import RiskManager
 from trading.strategy_manager import (
     create_strategy,
@@ -844,7 +845,17 @@ def settings_page(request: Request) -> HTMLResponse:
     bot_cfg = BotConfig.load()
     bot_status = bot_scheduler.status()
     recent_ticks = bot_engine.recent_ticks(limit=10)
+    recent_recons = reconciler.recent(limit=10)
     kill_switch = RiskManager.kill_switch_status()
+    notifier_cfg = {
+        "provider": bot_config.get("notifier_provider") or "none",
+        "tg_token": bot_config.get("notifier_telegram_bot_token") or "",
+        "tg_chat": bot_config.get("notifier_telegram_chat_id") or "",
+        "discord_url": bot_config.get("notifier_discord_webhook_url") or "",
+        "min_level": bot_config.get("notifier_min_level") or "info",
+        "daily": (bot_config.get("notifier_daily_summary") or "true").lower() in {"1", "true", "yes", "on"},
+        "daily_hour": bot_config.get("notifier_daily_summary_hour_utc") or "23",
+    }
     with session_scope() as s:
         paused_wallets = [
             {"id": w.id, "name": w.name}
@@ -857,6 +868,8 @@ def settings_page(request: Request) -> HTMLResponse:
         bot_cfg=bot_cfg,
         bot_status=bot_status,
         recent_ticks=recent_ticks,
+        recent_recons=recent_recons,
+        notifier_cfg=notifier_cfg,
         kill_switch=kill_switch,
         paused_wallets=paused_wallets,
         settings=settings,
@@ -943,6 +956,67 @@ def settings_bot_save(
 def settings_bot_tick_now() -> RedirectResponse:
     """Run a single tick immediately (manual override, ignores bot_enabled)."""
     bot_engine.tick(manual=True)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/reconcile-now")
+def settings_bot_reconcile_now() -> RedirectResponse:
+    """Run a single reconciler pass on demand."""
+    reconciler.reconcile()
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/save")
+def settings_notifier_save(
+    notifier_provider: str = Form("none"),
+    notifier_telegram_bot_token: str = Form(""),
+    notifier_telegram_chat_id: str = Form(""),
+    notifier_discord_webhook_url: str = Form(""),
+    notifier_min_level: str = Form("info"),
+    notifier_daily_summary: str = Form("false"),
+    notifier_daily_summary_hour_utc: str = Form("23"),
+) -> RedirectResponse:
+    bot_config.set_many(
+        {
+            "notifier_provider": notifier_provider,
+            "notifier_telegram_bot_token": notifier_telegram_bot_token.strip(),
+            "notifier_telegram_chat_id": notifier_telegram_chat_id.strip(),
+            "notifier_discord_webhook_url": notifier_discord_webhook_url.strip(),
+            "notifier_min_level": notifier_min_level,
+            "notifier_daily_summary": "true" if notifier_daily_summary in {"true", "on", "1"} else "false",
+            "notifier_daily_summary_hour_utc": notifier_daily_summary_hour_utc.strip() or "23",
+        }
+    )
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="notifier",
+                level="info",
+                message=f"Notifier settings updated (provider={notifier_provider}).",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/test")
+def settings_notifier_test() -> RedirectResponse:
+    from services.notifier import send_test
+    res = send_test()
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="notifier",
+                level="info" if res.get("ok") else "warn",
+                message=f"Notifier test: {res}",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/send-summary-now")
+def settings_notifier_send_summary_now() -> RedirectResponse:
+    from services.daily_summary import maybe_send_daily_summary
+    maybe_send_daily_summary(force=True)
     return RedirectResponse(url="/settings", status_code=303)
 
 

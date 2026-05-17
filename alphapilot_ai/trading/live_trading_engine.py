@@ -36,7 +36,8 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-SUPPORTED_LIVE_PLATFORMS = {"Coinbase"}  # extend as more connectors implement live trading
+SUPPORTED_LIVE_PLATFORMS = {"Coinbase", "Coinbase Perp"}  # extend as more connectors implement live trading
+PERP_LIVE_PLATFORMS = {"Coinbase Perp"}
 
 
 class LiveTradingEngine:
@@ -69,6 +70,36 @@ class LiveTradingEngine:
             confidence=confidence,
             strategy_id=strategy_id,
             notes=notes,
+        )
+
+    def place_perp_market(
+        self,
+        wallet_id: int,
+        symbol: str,
+        side: str,
+        base_qty: float,
+        leverage: float = 1.0,
+        reduce_only: bool = False,
+        confidence: float = 0.6,
+        strategy_id: int | None = None,
+        notes: str = "",
+    ) -> dict[str, Any]:
+        """
+        Place a perpetual-futures market order. Routes through the same risk
+        gate as spot orders, but additionally enforces wallet.futures_enabled
+        and wallet.max_leverage inside RiskManager.evaluate_trade(is_perp=True).
+        """
+        return self._dispatch(
+            wallet_id=wallet_id,
+            symbol=symbol,
+            side=side,
+            order_type="perp_market",
+            base_qty=base_qty,
+            confidence=confidence,
+            strategy_id=strategy_id,
+            notes=notes,
+            leverage=leverage,
+            reduce_only=reduce_only,
         )
 
     def place_limit(
@@ -193,6 +224,8 @@ class LiveTradingEngine:
         confidence: float = 0.6,
         strategy_id: int | None = None,
         notes: str = "",
+        leverage: float = 1.0,
+        reduce_only: bool = False,
     ) -> dict[str, Any]:
         if not settings.live_trading_enabled:
             return {"ok": False, "error": "Live trading globally disabled (set LIVE_TRADING_ENABLED=true)."}
@@ -238,6 +271,7 @@ class LiveTradingEngine:
         if notional > 0 and not self._wallet_caps_ok(wallet_id, notional):
             return {"ok": False, "error": "Wallet cap exceeded (max_position_usd or max_daily_loss)."}
 
+        is_perp = order_type == "perp_market"
         decision = self.risk.evaluate_trade(
             wallet_id=wallet_id,
             qty=risk_qty,
@@ -245,6 +279,8 @@ class LiveTradingEngine:
             confidence=confidence,
             strategy_id=strategy_id,
             is_paper=False,
+            is_perp=is_perp,
+            leverage=leverage,
         )
         if not decision and notional > 0:
             return {"ok": False, "error": f"Risk: {decision.reason}"}

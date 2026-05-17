@@ -24,6 +24,14 @@ DEFAULTS: dict[str, str] = {
     "bot_max_open_per_wallet": "5",
     "bot_max_ticks_log": "200",            # how many tick rows to keep visible
     "bot_dry_run": "true",                 # if true, decisions are logged only (paper layer ignored)
+    # Notifier settings
+    "notifier_provider": "none",           # "telegram" | "discord" | "none"
+    "notifier_telegram_bot_token": "",
+    "notifier_telegram_chat_id": "",
+    "notifier_discord_webhook_url": "",
+    "notifier_min_level": "info",          # "info" | "warn" | "error"
+    "notifier_daily_summary": "true",      # send a daily P&L summary
+    "notifier_daily_summary_hour_utc": "23",  # 0..23
 }
 
 

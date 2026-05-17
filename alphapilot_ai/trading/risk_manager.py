@@ -77,6 +77,8 @@ class RiskManager:
         strategy_id: int | None = None,
         *,
         is_paper: bool = True,
+        leverage: float = 1.0,
+        is_perp: bool = False,
     ) -> RiskDecision:
         """Run every gate in order. First failure short-circuits."""
         # 1. Global kill switch
@@ -120,6 +122,29 @@ class RiskManager:
                     False,
                     f"Notional ${notional:,.2f} > wallet cap ${wallet.max_position_usd:,.2f}",
                     "wallet_position_cap",
+                )
+
+            # 5b. Futures / leverage gates
+            if is_perp:
+                if not getattr(wallet, "futures_enabled", False):
+                    return RiskDecision(
+                        False,
+                        "Wallet has futures_enabled=False; cannot place perp order.",
+                        "futures_disabled",
+                    )
+                wallet_max_lev = float(getattr(wallet, "max_leverage", 1.0) or 1.0)
+                if leverage > wallet_max_lev:
+                    return RiskDecision(
+                        False,
+                        f"Leverage {leverage}x > wallet max {wallet_max_lev}x.",
+                        "leverage_cap",
+                    )
+            elif leverage and leverage > 1.0:
+                # Spot trade asking for leverage — refuse rather than silently ignore.
+                return RiskDecision(
+                    False,
+                    "Spot order cannot use leverage > 1.",
+                    "spot_leverage_rejected",
                 )
 
             open_count_paper, todays_count_paper = self._wallet_paper_today(s, wallet_id)
@@ -249,6 +274,16 @@ class RiskManager:
                     ),
                 )
             )
+
+        # Notify externally — never let a notifier failure break the kill switch.
+        try:
+            from services.notifier import notify
+            if on:
+                notify(f"KILL SWITCH ENGAGED — {reason or 'manual'}", level="error", category="risk")
+            else:
+                notify(f"Kill switch released ({reason or 'manual'}).", level="warn", category="risk")
+        except Exception:
+            pass
 
     @classmethod
     def kill_switch_status(cls) -> bool:

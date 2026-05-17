@@ -42,6 +42,18 @@ class Wallet(Base):
     max_open_positions = Column(Integer, default=3)
     max_daily_loss_usd = Column(Float, default=200.0)
     max_daily_trades = Column(Integer, default=10)
+    # Perpetual futures controls. When `futures_enabled` is True, the bot is
+    # allowed to open SHORT positions and apply leverage. `max_leverage` caps
+    # the requested leverage; `default_leverage` is what the bot uses when a
+    # signal does not specify one. `margin_mode` is "isolated" or "cross" and
+    # is sent through to the exchange where supported. `liquidation_buffer_pct`
+    # adds a safety margin to the bot's liquidation-price estimate so we close
+    # positions before the exchange does.
+    futures_enabled = Column(Boolean, default=False)
+    max_leverage = Column(Float, default=1.0)
+    default_leverage = Column(Float, default=1.0)
+    margin_mode = Column(String(20), default="isolated")
+    liquidation_buffer_pct = Column(Float, default=0.10)
     connection_status = Column(String(40), default="disconnected")
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
@@ -93,6 +105,12 @@ class PaperTrade(Base):
     realized_pnl = Column(Float, default=0.0)
     unrealized_pnl = Column(Float, default=0.0)
     confidence = Column(Float, default=0.5)
+    # Perpetual-futures fields. For spot trades these stay at defaults.
+    is_perp = Column(Boolean, default=False)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)        # USD locked as margin for this trade
+    liquidation_price = Column(Float, nullable=True) # estimated, NOT exchange-of-record
+    funding_paid = Column(Float, default=0.0)
     status = Column(String(20), default="open")  # open / closed / cancelled
     opened_at = Column(DateTime, default=utcnow)
     closed_at = Column(DateTime, nullable=True)
