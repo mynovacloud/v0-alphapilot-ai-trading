@@ -335,6 +335,18 @@ class LiveTradingEngine:
                 client_order_id=client_order_id,
                 stop_direction="STOP_DIRECTION_STOP_DOWN" if side.upper() == "SELL" else "STOP_DIRECTION_STOP_UP",
             )
+        elif order_type == "perp_market":
+            if platform not in PERP_LIVE_PLATFORMS or not hasattr(connector, "place_perp_order"):
+                result = {"ok": False, "error": f"Platform {platform} does not support perpetual futures."}
+            else:
+                result = connector.place_perp_order(
+                    symbol=symbol,
+                    side=side,
+                    base_qty=base_qty or 0.0,
+                    leverage=leverage,
+                    reduce_only=reduce_only,
+                    client_order_id=client_order_id,
+                )
         else:
             result = {"ok": False, "error": f"Unsupported order_type: {order_type}"}
 

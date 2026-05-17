@@ -302,6 +302,51 @@ def add_wallet_submit(
     return RedirectResponse(url="/wallets", status_code=303)
 
 
+@router.post("/wallets/{wallet_id}/futures")
+def wallet_update_futures(
+    wallet_id: int,
+    futures_enabled: str = Form("off"),
+    max_leverage: float = Form(1.0),
+    default_leverage: float = Form(1.0),
+    margin_mode: str = Form("isolated"),
+    liquidation_buffer_pct: float = Form(0.10),
+) -> RedirectResponse:
+    """
+    Update perpetual-futures controls on a wallet. Bounded so users cannot
+    accidentally configure dangerous values:
+      - max_leverage clamped to [1, 20]
+      - default_leverage clamped to [1, max_leverage]
+      - liquidation_buffer_pct clamped to [0.02, 0.5]
+    """
+    enabled = futures_enabled in {"on", "true", "1"}
+    max_lev = max(1.0, min(float(max_leverage or 1.0), 20.0))
+    def_lev = max(1.0, min(float(default_leverage or 1.0), max_lev))
+    buf = max(0.02, min(float(liquidation_buffer_pct or 0.10), 0.5))
+    mm = "cross" if (margin_mode or "isolated").lower() == "cross" else "isolated"
+
+    with session_scope() as s:
+        w = s.get(Wallet, wallet_id)
+        if not w:
+            return RedirectResponse(url="/wallets", status_code=303)
+        w.futures_enabled = enabled
+        w.max_leverage = max_lev
+        w.default_leverage = def_lev
+        w.margin_mode = mm
+        w.liquidation_buffer_pct = buf
+        s.add(
+            ActivityLog(
+                category="wallet",
+                level="info",
+                wallet_id=wallet_id,
+                message=(
+                    f"Futures controls updated on '{w.name}': enabled={enabled}, "
+                    f"max_lev={max_lev}x, default_lev={def_lev}x, mode={mm}, buf={buf:.2%}"
+                ),
+            )
+        )
+    return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
+
+
 @router.get("/wallets/{wallet_id}", response_class=HTMLResponse)
 def wallet_detail(request: Request, wallet_id: int) -> HTMLResponse:
     with session_scope() as s:
