@@ -228,6 +228,12 @@
       <span class="badge badge-bad">Keep paper trading</span>
     {% endif %}
   </div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem; max-width: 720px;">
+    Composite score from the entire simulation history: sample size, profitability (win rate &amp; profit factor),
+    edge magnitude (expectancy), risk discipline (drawdown, payoff, consistency), and process quality
+    (reflections, playbook depth, symbol coverage, recency, Claude config). The bot only graduates to live
+    money when this number stays above 75 with a healthy underlying sample.
+  </p>
 
   <div class="flex items-center gap-4" style="flex-wrap: wrap;">
     {% set pct = readiness.score %}
@@ -245,13 +251,13 @@
       </div>
     </div>
 
-    <div class="flex flex-col gap-2" style="flex: 1; min-width: 280px;">
+    <div class="flex flex-col gap-2" style="flex: 1; min-width: 320px;">
       {% set comps = [
-        ('Sample size',     readiness.components.sample,  'Closed paper trades vs 250-trade target'),
-        ('Win rate',        readiness.components.win,     'Realized win rate vs 55% target'),
-        ('Process quality', readiness.components.process, 'Average reflection score on last 50 trades'),
-        ('Playbook depth',  readiness.components.rules,   'Learned rules vs 30-rule target'),
-        ('Configuration',   readiness.components.config,  'Claude API connectivity'),
+        ('Sample size',       readiness.components.sample,        'Closed paper trades vs 250-trade target'),
+        ('Profitability',     readiness.components.profitability, 'Win rate vs 55% AND profit factor vs 1.5x'),
+        ('Edge magnitude',    readiness.components.edge,          'Expectancy ($ per trade) vs starting bankroll'),
+        ('Risk discipline',   readiness.components.discipline,    'Max drawdown, payoff ratio, P&L consistency'),
+        ('Process & coverage', readiness.components.process,      'Reflections, playbook, symbol diversity, recency, Claude config'),
       ] %}
       {% for label, val, hint in comps %}
         <div>
@@ -268,11 +274,102 @@
 
     <div class="flex flex-col gap-2" style="min-width: 220px;">
       <div class="flex justify-between"><span class="text-muted">Closed trades</span><span class="mono">{{ readiness.closed_trades }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Open trades</span><span class="mono">{{ readiness.open_trades }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Wins / Losses</span><span class="mono">{{ readiness.wins }} / {{ readiness.losses }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Win rate</span><span class="mono">{{ '%.1f' | format(readiness.win_rate * 100) }}%</span></div>
       <div class="flex justify-between"><span class="text-muted">Active rules</span><span class="mono">{{ readiness.rules }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Reflections</span><span class="mono">{{ readiness.reflections }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Avg process score</span><span class="mono">{{ '%.2f' | format(readiness.avg_reflection_score) }}</span></div>
+    </div>
+  </div>
+
+  <!-- Simulation metrics panel -->
+  {% set m = readiness.metrics %}
+  {% macro pf_fmt(v) -%}
+    {%- if v == "Infinity" or v == none -%}∞{%- elif v is number and v == v and v != v + 1 -%}{{ '%.2f' | format(v) }}{%- else -%}{{ v }}{%- endif -%}
+  {%- endmacro %}
+  <div class="mt-4" style="border-top: 1px solid var(--border); padding-top: 0.9rem;">
+    <div class="flex items-center justify-between mb-2">
+      <h4 style="margin: 0; font-size: 0.85rem; letter-spacing: 0.04em; text-transform: uppercase; color: var(--text-muted);">
+        Simulation metrics powering this score
+      </h4>
+      <span class="text-dim" style="font-size: 0.72rem;">
+        Last activity {{ m.recency_days }}d ago · {{ m.distinct_symbols }} distinct symbols
+      </span>
+    </div>
+    <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      {% set rcol = 'var(--good)' if m.realized_pnl > 0.005 else ('var(--bad)' if m.realized_pnl < -0.005 else 'var(--text)') %}
+      <div class="kpi" style="border-left: 3px solid {{ rcol }};">
+        <div class="kpi-label">Realized P&amp;L</div>
+        <div class="kpi-value mono" style="color: {{ rcol }};">
+          {{ '+' if m.realized_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.realized_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.2f' | format(m.return_pct) }}% on ${{ '{:,.0f}'.format(m.starting_bankroll) }}</div>
+      </div>
+      {% set ucol = 'var(--good)' if m.unrealized_pnl > 0.005 else ('var(--bad)' if m.unrealized_pnl < -0.005 else 'var(--text)') %}
+      <div class="kpi" style="border-left: 3px solid {{ ucol }};">
+        <div class="kpi-label">Unrealized P&amp;L</div>
+        <div class="kpi-value mono" style="color: {{ ucol }};">
+          {{ '+' if m.unrealized_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.unrealized_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ readiness.open_trades }} open</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Profit Factor</div>
+        <div class="kpi-value mono">{{ pf_fmt(m.profit_factor) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">${{ '{:,.0f}'.format(m.gross_win) }} / ${{ '{:,.0f}'.format(m.gross_loss) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Expectancy / trade</div>
+        <div class="kpi-value mono">{{ '+' if m.expectancy >= 0 else '−' }}${{ '{:,.2f}'.format(m.expectancy|abs) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.3f' | format(m.expectancy_pct) }}% of bankroll</div>
+      </div>
+    </div>
+    <div class="grid mt-2" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      <div class="kpi">
+        <div class="kpi-label">Avg Win</div>
+        <div class="kpi-value mono" style="color: var(--good);">+${{ '{:,.2f}'.format(m.avg_win) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Avg Loss</div>
+        <div class="kpi-value mono" style="color: var(--bad);">−${{ '{:,.2f}'.format(m.avg_loss) }}</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Payoff Ratio</div>
+        <div class="kpi-value mono">{{ pf_fmt(m.payoff_ratio) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">avg win / avg loss</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Max Drawdown</div>
+        <div class="kpi-value mono" style="color: var(--bad);">−${{ '{:,.2f}'.format(m.max_drawdown_abs) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">{{ '%.1f' | format(m.max_drawdown_pct) }}% of peak</div>
+      </div>
+    </div>
+    <div class="grid mt-2" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+      <div class="kpi">
+        <div class="kpi-label">Consistency</div>
+        <div class="kpi-value mono">{{ '%.2f' | format(m.consistency) }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">Sharpe-like, &gt; 0.2 is healthy</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Avg Hold</div>
+        <div class="kpi-value mono">
+          {% if m.avg_hold_minutes > 0 %}{{ '%.0f' | format(m.avg_hold_minutes) }}m{% else %}—{% endif %}
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Symbol Coverage</div>
+        <div class="kpi-value mono">{{ m.distinct_symbols }}</div>
+        <div class="text-dim" style="font-size: 0.72rem;">distinct symbols traded</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Total Equity P&amp;L</div>
+        {% set tcol = 'var(--good)' if m.total_pnl > 0.005 else ('var(--bad)' if m.total_pnl < -0.005 else 'var(--text)') %}
+        <div class="kpi-value mono" style="color: {{ tcol }};">
+          {{ '+' if m.total_pnl >= 0 else '−' }}${{ '{:,.2f}'.format(m.total_pnl|abs) }}
+        </div>
+        <div class="text-dim" style="font-size: 0.72rem;">realized + unrealized</div>
+      </div>
     </div>
   </div>
 </div>
