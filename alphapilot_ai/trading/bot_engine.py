@@ -111,6 +111,13 @@ class BotEngine:
             errors=0,
         )
 
+        # HEARTBEAT: Always log that a tick started so we know the scheduler is alive
+        self._log(
+            "bot",
+            f"TICK STARTED (manual={manual}, enabled={cfg.bot_enabled}, dry_run={cfg.dry_run})",
+            level="info",
+        )
+
         if not cfg.bot_enabled and not manual:
             result.notes.append("bot_disabled")
             self._log("bot", "Tick skipped: bot is disabled.", level="info")
@@ -261,18 +268,29 @@ class BotEngine:
         best: dict[str, Any] | None = None
         evaluated = 0
         below_conf = 0
+        claude_calls = 0  # Track how many times we call Claude
 
-        # Sweep the universe. Stop once we've used all available slots.
-        # DIVERSIFICATION: Prioritize symbols we DON'T already hold.
+        # Sweep the universe. DON'T break when slots are full - we still want to
+        # call Claude for existing positions (re-evaluate, DCA opportunities, etc.)
         for product in universe:
-            if slots_left <= 0:
-                break
-
             symbol = product["product_id"]
             
-            # Skip symbols we already hold for NEW entries (DCA handled separately)
-            if symbol in held_symbols:
+            # For NEW entries, skip if we already hold AND have no slots
+            # But if we DO have slots, we should diversify into NEW symbols
+            is_held = symbol in held_symbols
+            
+            # Skip this symbol for NEW entries if:
+            # 1. We already hold it (diversification), OR
+            # 2. We have no slots left AND we don't hold it (can't act anyway)
+            if is_held:
+                # We might want to DCA - let portfolio intelligence handle that
                 continue
+            if slots_left <= 0:
+                # No slots for new positions, but keep evaluating for logging/monitoring
+                # Continue evaluating a few more for "best signal" tracking
+                if evaluated >= 10:  # Evaluate at least 10 symbols even if slots full
+                    break
+            
             price_payload = get_price(symbol)
             if not price_payload.get("ok"):
                 result.skipped += 1
@@ -292,20 +310,11 @@ class BotEngine:
             evaluated += 1
             result.decisions += 1
 
-            # Skip the LLM round-trip when we have nothing useful to ask about.
-            # A truly empty technical signal (HOLD with zero confidence and no
-            # computed indicators) gives Claude nothing to reason from — it
-            # will respond "no indicators provided, HOLD" 100% of the time.
-            # That wastes paid API calls AND fills the decision log with
-            # noise that masks any real BUY/SELL signals.
-            #
-            # We always skip these — the previous version gated on
-            # `cfg.min_confidence > 0.05`, but a training session at floor 0.0
-            # would NOT skip and would dump dozens of useless HOLDs into the
-            # decision log every tick.
+            # ALWAYS call Claude for BUY/SELL signals, even if confidence is low.
+            # Let Claude be the arbiter. Only skip truly empty HOLD signals.
             if (
                 signal.side == "HOLD"
-                and float(signal.confidence or 0) <= 0.0
+                and float(signal.confidence or 0) <= 0.05
                 and not signal.indicators.get("ema_fast")
             ):
                 # Still record the diagnostic so the user sees we evaluated it.
@@ -319,6 +328,7 @@ class BotEngine:
                 continue
 
             # Hand the technical signal to Claude for the FINAL decision.
+            claude_calls += 1
             decision = claude_decide(
                 wallet=wallet,
                 symbol=symbol,
@@ -447,8 +457,8 @@ class BotEngine:
             "bot",
             (
                 f"{wallet['name']}: evaluated {evaluated}/{len(universe)} symbols, "
-                f"floor={cfg.min_confidence:.2f}, below={below_conf}, "
-                f"slots={cap - open_count}/{cap}, {best_line}."
+                f"claude_calls={claude_calls}, floor={cfg.min_confidence:.2f}, below={below_conf}, "
+                f"slots={cap - open_count}/{cap}, held={len(held_symbols)}, {best_line}."
             ),
             wallet_id=wallet["id"],
             level="info",

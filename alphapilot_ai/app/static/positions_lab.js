@@ -33,7 +33,68 @@
     granularity: 900,
     data: null,
     layout: null, // {x, y, w, h, candleW, priceMin, priceMax, t0, t1, points}
+    // Pan/zoom state
+    zoomLevel: 1.0,
+    panOffset: 0, // time offset in seconds (positive = looking at older data)
+    isDragging: false,
+    dragStartX: 0,
+    dragStartPan: 0,
+    // Filter state
+    showEntries: true,
+    showExits: true,
+    showDecisions: true,
+    showHolds: false,
   };
+
+  // Filter checkboxes
+  const filterEntries = sel("#filter-entries");
+  const filterExits = sel("#filter-exits");
+  const filterDecisions = sel("#filter-decisions");
+  const filterHolds = sel("#filter-holds");
+  
+  // Zoom/pan buttons
+  const zoomInBtn = sel("#chart-zoom-in");
+  const zoomOutBtn = sel("#chart-zoom-out");
+  const zoomResetBtn = sel("#chart-zoom-reset");
+  const zoomLevelEl = sel("#chart-zoom-level");
+  const panLeftBtn = sel("#chart-pan-left");
+  const panRightBtn = sel("#chart-pan-right");
+  const goLatestBtn = sel("#chart-go-latest");
+
+  // Initialize filter listeners
+  if (filterEntries) filterEntries.addEventListener("change", () => { state.showEntries = filterEntries.checked; renderChart(); });
+  if (filterExits) filterExits.addEventListener("change", () => { state.showExits = filterExits.checked; renderChart(); });
+  if (filterDecisions) filterDecisions.addEventListener("change", () => { state.showDecisions = filterDecisions.checked; renderChart(); });
+  if (filterHolds) filterHolds.addEventListener("change", () => { state.showHolds = filterHolds.checked; renderChart(); });
+
+  // Zoom controls
+  if (zoomInBtn) zoomInBtn.addEventListener("click", () => { zoom(1.25); });
+  if (zoomOutBtn) zoomOutBtn.addEventListener("click", () => { zoom(0.8); });
+  if (zoomResetBtn) zoomResetBtn.addEventListener("click", () => { state.zoomLevel = 1.0; state.panOffset = 0; updateZoomLabel(); renderChart(); });
+  
+  // Pan controls
+  if (panLeftBtn) panLeftBtn.addEventListener("click", () => { pan(-0.25); });
+  if (panRightBtn) panRightBtn.addEventListener("click", () => { pan(0.25); });
+  if (goLatestBtn) goLatestBtn.addEventListener("click", () => { state.panOffset = 0; renderChart(); });
+
+  function zoom(factor) {
+    state.zoomLevel = Math.max(0.25, Math.min(10, state.zoomLevel * factor));
+    updateZoomLabel();
+    renderChart();
+  }
+
+  function pan(fraction) {
+    if (!state.data || !state.data.candles.length) return;
+    const candles = state.data.candles;
+    const timeSpan = (candles[candles.length - 1].time - candles[0].time) / state.zoomLevel;
+    state.panOffset += timeSpan * fraction;
+    state.panOffset = Math.max(0, state.panOffset); // Can't pan into the future
+    renderChart();
+  }
+
+  function updateZoomLabel() {
+    if (zoomLevelEl) zoomLevelEl.textContent = Math.round(state.zoomLevel * 100) + "%";
+  }
 
   const COLORS = {
     grid: "rgba(255,255,255,0.06)",
@@ -277,9 +338,42 @@
     priceMin -= pad;
     priceMax += pad;
 
-    // ---- time range ------------------------------------------
-    const t0 = candles[0].time;
-    const t1 = candles[candles.length - 1].time + state.granularity; // include trailing slot
+    // ---- time range with zoom/pan ------------------------------------------
+    const fullT0 = candles[0].time;
+    const fullT1 = candles[candles.length - 1].time + state.granularity;
+    const fullSpan = fullT1 - fullT0;
+    
+    // Apply zoom: narrower time window
+    const visibleSpan = fullSpan / state.zoomLevel;
+    
+    // Apply pan: shift the visible window (panOffset is how far back we're looking)
+    // t1 is the right edge (most recent), t0 is the left edge
+    const t1 = fullT1 - state.panOffset;
+    const t0 = t1 - visibleSpan;
+    
+    // Filter candles to visible range
+    const visibleCandles = candles.filter(c => c.time + state.granularity >= t0 && c.time <= t1);
+    
+    // Recalculate price range for visible candles only
+    priceMin = Infinity; priceMax = -Infinity;
+    for (const c of visibleCandles) {
+      if (c.low < priceMin) priceMin = c.low;
+      if (c.high > priceMax) priceMax = c.high;
+    }
+    if (priceMin === Infinity) { priceMin = 0; priceMax = 1; }
+    for (const t of trades) {
+      if (t.opened_at_ts >= t0 && t.opened_at_ts <= t1) {
+        if (t.entry_price && t.entry_price < priceMin) priceMin = t.entry_price;
+        if (t.entry_price && t.entry_price > priceMax) priceMax = t.entry_price;
+      }
+      if (t.closed_at_ts >= t0 && t.closed_at_ts <= t1) {
+        if (t.exit_price && t.exit_price < priceMin) priceMin = t.exit_price;
+        if (t.exit_price && t.exit_price > priceMax) priceMax = t.exit_price;
+      }
+    }
+    const pricePad = (priceMax - priceMin) * 0.08 || priceMax * 0.02 || 1;
+    priceMin -= pricePad;
+    priceMax += pricePad;
 
     // ---- layout ---------------------------------------------
     const padL = 10, padR = 64, padT = 14, padB = 28;
@@ -317,9 +411,9 @@
       ctx.fillText(fmtTime(ts), x, h - 8);
     }
 
-    // ---- candles ---------------------------------------------
-    const candleW = Math.max(2, (plotW / Math.max(candles.length, 1)) * 0.7);
-    for (const c of candles) {
+    // ---- candles (use visibleCandles) ---------------------------------------------
+    const candleW = Math.max(2, (plotW / Math.max(visibleCandles.length, 1)) * 0.7 * Math.min(state.zoomLevel, 2));
+    for (const c of visibleCandles) {
       const x = xFor(c.time + state.granularity / 2);
       const yO = yFor(c.open), yC = yFor(c.close);
       const yH = yFor(c.high), yL = yFor(c.low);
@@ -335,101 +429,168 @@
       ctx.fillRect(x - candleW / 2, top, candleW, bodyH);
     }
 
-    // ---- decision dots --------------------------------------
+    // ---- decision dots (with filter) --------------------------------------
     const overlayPoints = []; // {x, y, type, payload}
-    for (const d of decisions) {
-      if (!d.ts || d.ts < t0 || d.ts > t1) continue;
-      if (!d.price) continue;
-      const x = xFor(d.ts);
-      const y = yFor(d.price);
-      let color = COLORS.decisionHold;
-      if (d.action === "BUY") color = COLORS.decisionBuy;
-      else if (d.action === "SELL") color = COLORS.decisionSell;
-      else if (d.action === "CLOSE") color = COLORS.decisionClose;
-      // HOLDs are rendered very faint so they don't overwhelm
-      const isHold = d.action === "HOLD";
-      ctx.globalAlpha = isHold ? 0.32 : 0.85;
-      ctx.fillStyle = color;
-      ctx.beginPath();
-      ctx.arc(x, y, isHold ? 2.5 : 3.5, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.globalAlpha = 1;
-      overlayPoints.push({ x, y, r: isHold ? 4 : 6, type: "decision", payload: d });
-    }
-
-    // ---- entries (arrows) -----------------------------------
-    for (const t of trades) {
-      if (!t.opened_at_ts || !t.entry_price) continue;
-      if (t.opened_at_ts < t0 || t.opened_at_ts > t1) continue;
-      const x = xFor(t.opened_at_ts);
-      const y = yFor(t.entry_price);
-      const isLong = t.side === "BUY";
-      const color = isLong ? COLORS.long : COLORS.short;
-      // Arrow body
-      ctx.fillStyle = color;
-      ctx.strokeStyle = "rgba(0,0,0,0.6)";
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      if (isLong) {
-        // up-arrow below the entry price
-        ctx.moveTo(x, y - 2);
-        ctx.lineTo(x - 6, y + 10);
-        ctx.lineTo(x + 6, y + 10);
-      } else {
-        // down-arrow above the entry price
-        ctx.moveTo(x, y + 2);
-        ctx.lineTo(x - 6, y - 10);
-        ctx.lineTo(x + 6, y - 10);
+    if (state.showDecisions || state.showHolds) {
+      for (const d of decisions) {
+        if (!d.ts || d.ts < t0 || d.ts > t1) continue;
+        if (!d.price) continue;
+        const isHold = d.action === "HOLD";
+        // Apply filters
+        if (isHold && !state.showHolds) continue;
+        if (!isHold && !state.showDecisions) continue;
+        
+        const x = xFor(d.ts);
+        const y = yFor(d.price);
+        let color = COLORS.decisionHold;
+        if (d.action === "BUY") color = COLORS.decisionBuy;
+        else if (d.action === "SELL") color = COLORS.decisionSell;
+        else if (d.action === "CLOSE") color = COLORS.decisionClose;
+        // HOLDs are rendered very faint so they don't overwhelm
+        ctx.globalAlpha = isHold ? 0.32 : 0.85;
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        ctx.arc(x, y, isHold ? 2.5 : 3.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+        overlayPoints.push({ x, y, r: isHold ? 4 : 6, type: "decision", payload: d });
       }
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      // Entry-price dashed line spanning the trade duration
-      const xEnd = t.closed_at_ts && t.closed_at_ts <= t1 ? xFor(t.closed_at_ts) : xFor(t1);
-      ctx.setLineDash([3, 3]);
-      ctx.strokeStyle = color + "aa";
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      ctx.lineTo(xEnd, y);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      overlayPoints.push({ x, y, r: 10, type: "entry", payload: t });
     }
 
-    // ---- exits (triangles colored by P&L) -------------------
-    for (const t of trades) {
-      if (!t.closed_at_ts || !t.exit_price) continue;
-      if (t.closed_at_ts < t0 || t.closed_at_ts > t1) continue;
-      const x = xFor(t.closed_at_ts);
-      const y = yFor(t.exit_price);
-      const pnl = t.realized_pnl || 0;
-      const color = pnl > 0 ? COLORS.win : pnl < 0 ? COLORS.loss : COLORS.flat;
-      ctx.fillStyle = color;
-      ctx.strokeStyle = "rgba(0,0,0,0.6)";
-      ctx.beginPath();
-      ctx.moveTo(x - 6, y - 6);
-      ctx.lineTo(x + 6, y - 6);
-      ctx.lineTo(x + 6, y + 6);
-      ctx.lineTo(x - 6, y + 6);
-      ctx.closePath();
-      ctx.fill();
-      ctx.stroke();
-      // little × through the box
-      ctx.strokeStyle = "rgba(0,0,0,0.7)";
-      ctx.beginPath();
-      ctx.moveTo(x - 4, y - 4); ctx.lineTo(x + 4, y + 4);
-      ctx.moveTo(x + 4, y - 4); ctx.lineTo(x - 4, y + 4);
-      ctx.stroke();
-      overlayPoints.push({ x, y, r: 10, type: "exit", payload: t });
+    // ---- entries (arrows) with filter -----------------------------------
+    if (state.showEntries) {
+      for (const t of trades) {
+        if (!t.opened_at_ts || !t.entry_price) continue;
+        if (t.opened_at_ts < t0 || t.opened_at_ts > t1) continue;
+        const x = xFor(t.opened_at_ts);
+        const y = yFor(t.entry_price);
+        const isLong = t.side === "BUY";
+        const color = isLong ? COLORS.long : COLORS.short;
+        // Arrow body
+        ctx.fillStyle = color;
+        ctx.strokeStyle = "rgba(0,0,0,0.6)";
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        if (isLong) {
+          // up-arrow below the entry price
+          ctx.moveTo(x, y - 2);
+          ctx.lineTo(x - 6, y + 10);
+          ctx.lineTo(x + 6, y + 10);
+        } else {
+          // down-arrow above the entry price
+          ctx.moveTo(x, y + 2);
+          ctx.lineTo(x - 6, y - 10);
+          ctx.lineTo(x + 6, y - 10);
+        }
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        // Entry-price dashed line spanning the trade duration
+        const xEnd = t.closed_at_ts && t.closed_at_ts <= t1 ? xFor(t.closed_at_ts) : xFor(t1);
+        ctx.setLineDash([3, 3]);
+        ctx.strokeStyle = color + "aa";
+        ctx.beginPath();
+        ctx.moveTo(x, y);
+        ctx.lineTo(xEnd, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        overlayPoints.push({ x, y, r: 10, type: "entry", payload: t });
+      }
+    }
+
+    // ---- exits (triangles colored by P&L) with filter -------------------
+    if (state.showExits) {
+      for (const t of trades) {
+        if (!t.closed_at_ts || !t.exit_price) continue;
+        if (t.closed_at_ts < t0 || t.closed_at_ts > t1) continue;
+        const x = xFor(t.closed_at_ts);
+        const y = yFor(t.exit_price);
+        const pnl = t.realized_pnl || 0;
+        const color = pnl > 0 ? COLORS.win : pnl < 0 ? COLORS.loss : COLORS.flat;
+        ctx.fillStyle = color;
+        ctx.strokeStyle = "rgba(0,0,0,0.6)";
+        ctx.beginPath();
+        ctx.moveTo(x - 6, y - 6);
+        ctx.lineTo(x + 6, y - 6);
+        ctx.lineTo(x + 6, y + 6);
+        ctx.lineTo(x - 6, y + 6);
+        ctx.closePath();
+        ctx.fill();
+        ctx.stroke();
+        // little × through the box
+        ctx.strokeStyle = "rgba(0,0,0,0.7)";
+        ctx.beginPath();
+        ctx.moveTo(x - 4, y - 4); ctx.lineTo(x + 4, y + 4);
+        ctx.moveTo(x + 4, y - 4); ctx.lineTo(x - 4, y + 4);
+        ctx.stroke();
+        overlayPoints.push({ x, y, r: 10, type: "exit", payload: t });
+      }
     }
 
     state.layout = { points: overlayPoints, w, h };
   }
 
   // -----------------------------------------------------------
+  // Drag to pan
+  // -----------------------------------------------------------
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return; // left click only
+    state.isDragging = true;
+    state.dragStartX = e.clientX;
+    state.dragStartPan = state.panOffset;
+    canvas.style.cursor = "grabbing";
+  });
+
+  canvas.addEventListener("mousemove", (e) => {
+    if (!state.isDragging) return;
+    if (!state.data || !state.data.candles.length) return;
+    
+    const dx = e.clientX - state.dragStartX;
+    const candles = state.data.candles;
+    const fullSpan = candles[candles.length - 1].time - candles[0].time;
+    const visibleSpan = fullSpan / state.zoomLevel;
+    const rect = canvas.getBoundingClientRect();
+    
+    // Convert pixel drag to time offset
+    const timeDelta = (dx / rect.width) * visibleSpan;
+    state.panOffset = Math.max(0, state.dragStartPan + timeDelta);
+    renderChart();
+  });
+
+  canvas.addEventListener("mouseup", () => {
+    state.isDragging = false;
+    canvas.style.cursor = "grab";
+  });
+
+  canvas.addEventListener("mouseleave", () => {
+    if (state.isDragging) {
+      state.isDragging = false;
+      canvas.style.cursor = "grab";
+    }
+  });
+
+  // Scroll to zoom
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    state.zoomLevel = Math.max(0.25, Math.min(10, state.zoomLevel * factor));
+    updateZoomLabel();
+    renderChart();
+  }, { passive: false });
+
+  // Double-click to reset
+  canvas.addEventListener("dblclick", () => {
+    state.zoomLevel = 1.0;
+    state.panOffset = 0;
+    updateZoomLabel();
+    renderChart();
+  });
+
+  // -----------------------------------------------------------
   // Hover tooltip
   // -----------------------------------------------------------
   canvas.addEventListener("mousemove", (e) => {
+    if (state.isDragging) return; // Don't show tooltip while dragging
     if (!state.layout) return;
     const rect = canvas.getBoundingClientRect();
     const mx = e.clientX - rect.left;

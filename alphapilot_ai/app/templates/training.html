@@ -888,7 +888,18 @@ document.addEventListener('keydown', e => {
     <div class="card-title">Positions Lab</div>
     <div class="flex gap-2 items-center">
       <span class="badge badge-info">live candles + bot trades + decisions</span>
-      <select id="lab-granularity" class="select" style="width: 120px;">
+    </div>
+  </div>
+  <p class="text-muted mb-3" style="font-size: 0.85rem;">
+    Pick any symbol the bot has touched. The chart shows real Coinbase candles with green up-arrows where the bot opened longs, red down-arrows for shorts, and X marks at the exits colored by P&amp;L. The faint dots are every Claude decision (including HOLDs) so you can see what the bot considered but skipped.
+  </p>
+
+  <!-- Chart Controls Bar -->
+  <div class="flex gap-3 items-center flex-wrap mb-3" style="padding: 0.6rem 0.8rem; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+    <div class="flex gap-2 items-center">
+      <label class="text-muted" style="font-size: 0.75rem; font-weight: 600;">TIMEFRAME</label>
+      <select id="lab-granularity" class="select" style="width: 80px; font-size: 0.8rem;">
+        <option value="60">1m</option>
         <option value="300">5m</option>
         <option value="900" selected>15m</option>
         <option value="3600">1h</option>
@@ -896,10 +907,48 @@ document.addEventListener('keydown', e => {
         <option value="86400">1d</option>
       </select>
     </div>
+    
+    <div style="width: 1px; height: 20px; background: var(--border);"></div>
+    
+    <div class="flex gap-2 items-center">
+      <label class="text-muted" style="font-size: 0.75rem; font-weight: 600;">SHOW</label>
+      <label class="flex items-center gap-1" style="font-size: 0.78rem; cursor: pointer;">
+        <input type="checkbox" id="filter-entries" checked style="accent-color: var(--good);">
+        <span style="color: var(--good);">Entries</span>
+      </label>
+      <label class="flex items-center gap-1" style="font-size: 0.78rem; cursor: pointer;">
+        <input type="checkbox" id="filter-exits" checked style="accent-color: var(--accent);">
+        <span style="color: var(--accent);">Exits</span>
+      </label>
+      <label class="flex items-center gap-1" style="font-size: 0.78rem; cursor: pointer;">
+        <input type="checkbox" id="filter-decisions" checked style="accent-color: var(--text-muted);">
+        <span>Decisions</span>
+      </label>
+      <label class="flex items-center gap-1" style="font-size: 0.78rem; cursor: pointer;">
+        <input type="checkbox" id="filter-holds" style="accent-color: var(--text-muted);">
+        <span class="text-muted">HOLDs</span>
+      </label>
+    </div>
+    
+    <div style="width: 1px; height: 20px; background: var(--border);"></div>
+    
+    <div class="flex gap-1 items-center">
+      <label class="text-muted" style="font-size: 0.75rem; font-weight: 600;">ZOOM</label>
+      <button type="button" id="chart-zoom-out" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem;">−</button>
+      <span id="chart-zoom-level" class="mono text-dim" style="font-size: 0.75rem; min-width: 40px; text-align: center;">100%</span>
+      <button type="button" id="chart-zoom-in" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem;">+</button>
+      <button type="button" id="chart-zoom-reset" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem; font-size: 0.7rem;">Reset</button>
+    </div>
+    
+    <div style="width: 1px; height: 20px; background: var(--border);"></div>
+    
+    <div class="flex gap-1 items-center">
+      <label class="text-muted" style="font-size: 0.75rem; font-weight: 600;">NAV</label>
+      <button type="button" id="chart-pan-left" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem;">←</button>
+      <button type="button" id="chart-pan-right" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem;">→</button>
+      <button type="button" id="chart-go-latest" class="btn btn-sm btn-outline" style="padding: 0.2rem 0.5rem; font-size: 0.7rem;">Latest</button>
+    </div>
   </div>
-  <p class="text-muted mb-3" style="font-size: 0.85rem;">
-    Pick any symbol the bot has touched. The chart shows real Coinbase candles with green up-arrows where the bot opened longs, red down-arrows for shorts, and X marks at the exits colored by P&amp;L. The faint dots are every Claude decision (including HOLDs) so you can see what the bot considered but skipped.
-  </p>
 
   <div class="grid" style="grid-template-columns: 240px 1fr; gap: 1rem; align-items: start;">
     <!-- Symbol list -->
@@ -961,9 +1010,12 @@ document.addEventListener('keydown', e => {
           <div class="kpi"><div class="kpi-label">Avg Hold</div><div class="kpi-value mono" id="lab-kpi-hold">—</div></div>
         </div>
 
-        <!-- Chart canvas -->
+        <!-- Chart canvas with drag instruction -->
         <div style="position: relative; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.5rem;">
-          <canvas id="lab-chart" style="width: 100%; height: 460px; display: block;"></canvas>
+          <div id="chart-drag-hint" style="position: absolute; top: 8px; left: 8px; font-size: 0.7rem; color: var(--text-muted); opacity: 0.7; pointer-events: none;">
+            Drag to pan · Scroll to zoom · Double-click to reset
+          </div>
+          <canvas id="lab-chart" style="width: 100%; height: 460px; display: block; cursor: grab;"></canvas>
           <div id="lab-tooltip" style="position: absolute; pointer-events: none; display: none; background: rgba(15,17,21,0.96); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: var(--text); max-width: 320px; z-index: 5;"></div>
           <div style="position: absolute; bottom: 0.6rem; right: 0.8rem; display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--text-muted);">
             <span><span style="display:inline-block;width:10px;height:10px;background:var(--good);border-radius:2px;margin-right:4px;"></span>Long entry</span>
