@@ -197,11 +197,11 @@ class PositionMonitor:
                 )
 
         # 5. Check time limit (only if position is flat or losing)
-        # DEFAULT: If no time limit set, use 24 hours for paper trades
-        time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 24.0
+        # DEFAULT: If no time limit set, use 4 hours for paper trades (faster iteration)
+        time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
         if trade.opened_at:
             deadline = trade.opened_at + timedelta(hours=time_limit)
-            if utcnow() >= deadline and pnl_pct <= 0.01:  # Allow small gains to run
+            if utcnow() >= deadline and pnl_pct <= 0.005:  # Close if flat or losing after time limit
                 self._log_exit(session, trade, "time", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
@@ -212,16 +212,42 @@ class PositionMonitor:
                     pnl_pct=pnl_pct,
                 )
         
-        # 6. Close winning positions that have been profitable for a while
-        # If up 1%+ for more than 2 hours, take profit (don't let winners reverse)
-        if trade.opened_at and pnl_pct >= 0.01:
-            age_hours = (utcnow() - trade.opened_at).total_seconds() / 3600
-            if age_hours >= 2.0 and pnl_pct >= 0.015:  # 1.5%+ after 2 hours = take profit
-                self._log_exit(session, trade, "profit_time", current_price, pnl_pct)
+        # 6. Take small profits after some time has passed
+        # This ensures we lock in gains instead of letting them evaporate
+        if trade.opened_at and pnl_pct > 0:
+            age_minutes = (utcnow() - trade.opened_at).total_seconds() / 60
+            
+            # After 30 mins: take 0.5%+ profit
+            if age_minutes >= 30 and pnl_pct >= 0.005:
+                self._log_exit(session, trade, "profit_30m", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
                     symbol=trade.symbol,
-                    reason="profit_time",
+                    reason="profit_30m",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # After 1 hour: take 0.3%+ profit  
+            if age_minutes >= 60 and pnl_pct >= 0.003:
+                self._log_exit(session, trade, "profit_1h", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="profit_1h",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # After 2 hours: take ANY profit (even $0.01)
+            if age_minutes >= 120 and pnl_pct > 0.001:
+                self._log_exit(session, trade, "profit_2h", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="profit_2h",
                     current_price=current_price,
                     trigger_price=None,
                     pnl_pct=pnl_pct,
