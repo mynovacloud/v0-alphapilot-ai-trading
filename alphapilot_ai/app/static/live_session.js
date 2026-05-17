@@ -12,8 +12,8 @@
 (function () {
   "use strict";
 
-  const POLL_MS = 2000;
-  const MAX_FEED_ITEMS = 80;
+  const POLL_MS = 1500;
+  const MAX_FEED_ITEMS = 120;
 
   // --- DOM ---
   const root = document.getElementById("live-session");
@@ -23,6 +23,17 @@
   const stopBtn = document.getElementById("live-stop-btn");
   const tickBtn = document.getElementById("live-tick-btn");
   const tickSel = document.getElementById("live-tick-seconds");
+  const tickValEl = document.getElementById("live-tick-val");
+  const confSel = document.getElementById("live-min-confidence");
+  const confValEl = document.getElementById("live-conf-val");
+  const sizeSel = document.getElementById("live-position-size");
+  const sizeValEl = document.getElementById("live-size-val");
+  const maxOpenSel = document.getElementById("live-max-open");
+  const maxOpenValEl = document.getElementById("live-maxopen-val");
+  const universeLimitEl = document.getElementById("live-universe-limit");
+  const aggressiveEl = document.getElementById("live-aggressive");
+  const settingsSummaryEl = document.getElementById("live-settings-summary");
+  const settingsDetails = document.getElementById("live-settings");
   const pulse = document.getElementById("live-pulse");
   const statusBadge = document.getElementById("live-status-badge");
 
@@ -271,12 +282,58 @@
     state.timer = null;
   }
 
+  // --- Settings panel wiring ---
+  function fmtMoneyShort(v) {
+    return "$" + Math.round(v).toLocaleString();
+  }
+  function refreshSettingsSummary() {
+    if (!settingsSummaryEl) return;
+    settingsSummaryEl.textContent =
+      "tick " + tickSel.value + "s · floor " + parseFloat(confSel.value).toFixed(2) +
+      " · " + fmtMoneyShort(parseFloat(sizeSel.value)) + "/trade · " +
+      maxOpenSel.value + " open" +
+      (aggressiveEl && aggressiveEl.checked ? " · aggressive" : "");
+  }
+  function bindSlider(input, valueEl, fmt) {
+    if (!input || !valueEl) return;
+    const upd = () => { valueEl.textContent = fmt(input.value); refreshSettingsSummary(); };
+    input.addEventListener("input", upd);
+    upd();
+  }
+  bindSlider(tickSel, tickValEl, (v) => v + "s");
+  bindSlider(confSel, confValEl, (v) => parseFloat(v).toFixed(2));
+  bindSlider(sizeSel, sizeValEl, (v) => fmtMoneyShort(parseFloat(v)));
+  bindSlider(maxOpenSel, maxOpenValEl, (v) => v);
+  if (aggressiveEl) {
+    aggressiveEl.addEventListener("change", () => {
+      if (aggressiveEl.checked) {
+        // Snap sliders to aggressive defaults but keep them user-editable.
+        confSel.value = "0.30";
+        confValEl.textContent = "0.30";
+        if (parseInt(maxOpenSel.value, 10) < 8) {
+          maxOpenSel.value = "8";
+          maxOpenValEl.textContent = "8";
+        }
+        if (parseInt(tickSel.value, 10) > 5) {
+          tickSel.value = "5";
+          tickValEl.textContent = "5s";
+        }
+      }
+      refreshSettingsSummary();
+    });
+  }
+
   // --- Buttons ---
   startBtn.addEventListener("click", async () => {
     startBtn.disabled = true;
     try {
       const fd = new FormData();
       fd.append("tick_seconds", tickSel.value);
+      fd.append("min_confidence", confSel.value);
+      fd.append("position_size_usd", sizeSel.value);
+      fd.append("max_open_per_wallet", maxOpenSel.value);
+      fd.append("universe_limit", universeLimitEl ? universeLimitEl.value : "40");
+      fd.append("aggressive", aggressiveEl && aggressiveEl.checked ? "true" : "false");
       const res = await fetch("/training/session/start", { method: "POST", body: fd });
       const data = await res.json();
       if (!data.ok) {
@@ -291,6 +348,18 @@
           message: "Claude is not configured — bot will trade on technical signals only.",
         });
       }
+      renderLog({
+        ts: Math.floor(Date.now() / 1000),
+        level: "success",
+        category: "session",
+        message:
+          "Session started — tick " + data.tick_seconds + "s · floor " +
+          (data.min_confidence != null ? data.min_confidence.toFixed(2) : "?") +
+          " · $" + Math.round(data.position_size_usd || 0) + "/trade · " +
+          (data.max_open_per_wallet || "?") + " open · universe " + (data.universe_limit || "?"),
+      });
+      // Collapse the settings card once running so the live feed has more room.
+      if (settingsDetails) settingsDetails.open = false;
       setStatus(true, { tick_seconds: data.tick_seconds });
       startPolling();
     } finally {
@@ -324,9 +393,28 @@
   });
 
   // --- Boot ---
+  // Pull current bot knobs so the sliders reflect the real backend state
+  // (e.g. after a reload during an active session).
+  async function hydrateSettings() {
+    try {
+      const res = await fetch("/training/session/config", { headers: { Accept: "application/json" } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (!data.ok) return;
+      if (tickSel)    { tickSel.value = String(data.tick_seconds); tickValEl.textContent = data.tick_seconds + "s"; }
+      if (confSel)    { confSel.value = String(data.min_confidence); confValEl.textContent = Number(data.min_confidence).toFixed(2); }
+      if (sizeSel)    { sizeSel.value = String(data.position_size_usd); sizeValEl.textContent = fmtMoneyShort(data.position_size_usd); }
+      if (maxOpenSel) { maxOpenSel.value = String(data.max_open_per_wallet); maxOpenValEl.textContent = String(data.max_open_per_wallet); }
+      if (universeLimitEl) universeLimitEl.value = String(data.universe_limit);
+      refreshSettingsSummary();
+    } catch (e) {
+      console.error("[v0] settings hydrate failed", e);
+    }
+  }
+
   // Always do an initial poll so the page rehydrates portfolio numbers and
   // detects an already-running session (e.g. if the user reloaded mid-run).
-  pollOnce().then(() => {
+  hydrateSettings().then(pollOnce).then(() => {
     if (state.sessionActive) startPolling();
   });
 })();

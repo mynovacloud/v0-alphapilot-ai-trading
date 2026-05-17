@@ -978,7 +978,14 @@ def _truthy(v: str | None) -> bool:
 
 
 @router.post("/training/session/start")
-def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
+def training_session_start(
+    tick_seconds: int = Form(15),
+    min_confidence: float = Form(0.55),
+    position_size_usd: float = Form(100.0),
+    max_open_per_wallet: int = Form(5),
+    universe_limit: int = Form(40),
+    aggressive: str = Form("false"),
+) -> JSONResponse:
     from config.bot_config import get as cfg_get
     from config.bot_config import set_many as cfg_set
     from services.claude_client import is_configured as claude_is_configured
@@ -987,29 +994,62 @@ def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
     if _truthy(cfg_get("training_session_active")):
         return JSONResponse({"ok": True, "already_running": True})
 
-    tick = max(5, min(120, int(tick_seconds or 15)))
+    # Aggressive preset: drop confidence floor and shrink position size so the
+    # bot fires often enough during a short training session for the user to
+    # actually see executions stream in.
+    if _truthy(aggressive):
+        min_confidence = min(min_confidence, 0.35)
+        max_open_per_wallet = max(max_open_per_wallet, 8)
+
+    tick = max(2, min(120, int(tick_seconds or 15)))
+    min_conf = max(0.0, min(0.95, float(min_confidence or 0.55)))
+    pos_usd = max(5.0, min(100_000.0, float(position_size_usd or 100.0)))
+    max_open = max(1, min(50, int(max_open_per_wallet or 5)))
+    uni_limit = max(5, min(150, int(universe_limit or 40)))
 
     # Snapshot the values we're about to overwrite so Stop can restore.
-    prev_enabled = cfg_get("bot_enabled")
-    prev_dry = cfg_get("bot_dry_run")
-    prev_tick = cfg_get("bot_tick_seconds")
+    prev = {
+        "bot_enabled":         cfg_get("bot_enabled") or "",
+        "bot_dry_run":         cfg_get("bot_dry_run") or "",
+        "bot_tick_seconds":    cfg_get("bot_tick_seconds") or "",
+        "bot_min_confidence":  cfg_get("bot_min_confidence") or "",
+        "bot_position_size_usd": cfg_get("bot_position_size_usd") or "",
+        "bot_max_open_per_wallet": cfg_get("bot_max_open_per_wallet") or "",
+        "bot_universe_limit":  cfg_get("bot_universe_limit") or "",
+    }
 
     cfg_set(
         {
             "training_session_active": "true",
             "training_session_started_at": utcnow().isoformat(),
             "training_session_tick_seconds": str(tick),
-            "training_session_prev_bot_enabled": prev_enabled or "",
-            "training_session_prev_dry_run": prev_dry or "",
-            "training_session_prev_tick_seconds": prev_tick or "",
-            # Force the autonomous loop ON in paper-live mode.
+            "training_session_prev_bot_enabled": prev["bot_enabled"],
+            "training_session_prev_dry_run": prev["bot_dry_run"],
+            "training_session_prev_tick_seconds": prev["bot_tick_seconds"],
+            "training_session_prev_min_confidence": prev["bot_min_confidence"],
+            "training_session_prev_position_size_usd": prev["bot_position_size_usd"],
+            "training_session_prev_max_open_per_wallet": prev["bot_max_open_per_wallet"],
+            "training_session_prev_universe_limit": prev["bot_universe_limit"],
+            # Force the autonomous loop ON in paper-live mode with the chosen knobs.
             "bot_enabled": "true",
             "bot_dry_run": "false",
             "bot_tick_seconds": str(tick),
+            "bot_min_confidence": str(min_conf),
+            "bot_position_size_usd": str(pos_usd),
+            "bot_max_open_per_wallet": str(max_open),
+            "bot_universe_limit": str(uni_limit),
         }
     )
 
-    bot_scheduler.reload()  # picks up the new tick interval
+    bot_scheduler.reload()  # pick up the new tick interval
+
+    # Fire one tick immediately so the user sees activity within seconds
+    # instead of waiting for the next scheduler beat.
+    try:
+        from trading.bot_engine import bot_engine
+        bot_engine.tick(manual=True)
+    except Exception as e:
+        logger.warning("Initial training tick failed: %s", e)
 
     with session_scope() as s:
         s.add(
@@ -1017,8 +1057,10 @@ def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
                 category="bot",
                 level="info",
                 message=(
-                    f"Live training session started "
-                    f"(tick={tick}s, paper-live={'YES' if claude_is_configured() else 'YES (no Claude — fallback signals)'})"
+                    f"Live training session started — tick={tick}s, "
+                    f"min_conf={min_conf:.2f}, size=${pos_usd:.0f}, "
+                    f"max_open={max_open}, universe={uni_limit}, "
+                    f"claude={'on' if claude_is_configured() else 'off (technical fallback)'}"
                 ),
             )
         )
@@ -1026,6 +1068,31 @@ def training_session_start(tick_seconds: int = Form(15)) -> JSONResponse:
         {
             "ok": True,
             "tick_seconds": tick,
+            "min_confidence": min_conf,
+            "position_size_usd": pos_usd,
+            "max_open_per_wallet": max_open,
+            "universe_limit": uni_limit,
+            "claude_configured": claude_is_configured(),
+        }
+    )
+
+
+@router.get("/training/session/config")
+def training_session_config() -> JSONResponse:
+    """Read the bot knobs the Training Center cares about so the page can
+    rehydrate its form state on load."""
+    from config.bot_config import get as cfg_get
+    from services.claude_client import is_configured as claude_is_configured
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "active": _truthy(cfg_get("training_session_active")),
+            "tick_seconds": int(float(cfg_get("bot_tick_seconds") or 15)),
+            "min_confidence": float(cfg_get("bot_min_confidence") or 0.55),
+            "position_size_usd": float(cfg_get("bot_position_size_usd") or 100),
+            "max_open_per_wallet": int(float(cfg_get("bot_max_open_per_wallet") or 5)),
+            "universe_limit": int(float(cfg_get("bot_universe_limit") or 40)),
             "claude_configured": claude_is_configured(),
         }
     )
@@ -1043,6 +1110,10 @@ def training_session_stop() -> JSONResponse:
     prev_enabled = cfg_get("training_session_prev_bot_enabled") or "false"
     prev_dry = cfg_get("training_session_prev_dry_run") or "true"
     prev_tick = cfg_get("training_session_prev_tick_seconds") or "60"
+    prev_min_conf = cfg_get("training_session_prev_min_confidence") or "0.65"
+    prev_pos = cfg_get("training_session_prev_position_size_usd") or "100"
+    prev_max_open = cfg_get("training_session_prev_max_open_per_wallet") or "5"
+    prev_uni = cfg_get("training_session_prev_universe_limit") or "40"
 
     cfg_set(
         {
@@ -1051,10 +1122,18 @@ def training_session_stop() -> JSONResponse:
             "training_session_prev_bot_enabled": "",
             "training_session_prev_dry_run": "",
             "training_session_prev_tick_seconds": "",
+            "training_session_prev_min_confidence": "",
+            "training_session_prev_position_size_usd": "",
+            "training_session_prev_max_open_per_wallet": "",
+            "training_session_prev_universe_limit": "",
             # Restore the user's prior config.
             "bot_enabled": prev_enabled,
             "bot_dry_run": prev_dry,
             "bot_tick_seconds": prev_tick,
+            "bot_min_confidence": prev_min_conf,
+            "bot_position_size_usd": prev_pos,
+            "bot_max_open_per_wallet": prev_max_open,
+            "bot_universe_limit": prev_uni,
         }
     )
     bot_scheduler.reload()

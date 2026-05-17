@@ -206,7 +206,19 @@ class BotEngine:
         slots_left = max(0, cap - open_count)
         if slots_left <= 0:
             result.skipped += 1
+            self._log(
+                "bot",
+                f"{wallet['name']}: skipped (no open slots — {open_count}/{cap} used).",
+                wallet_id=wallet["id"],
+                level="info",
+            )
             return
+
+        # Track best per-tick candidate so we always log a useful summary
+        # even when nothing crosses the confidence threshold.
+        best: dict[str, Any] | None = None
+        evaluated = 0
+        below_conf = 0
 
         # Sweep the universe. Stop once we've used all available slots.
         for product in universe:
@@ -228,12 +240,10 @@ class BotEngine:
             # (Momentum / Mean Reversion / Volatility Breakout / Probability Edge)
             # and returns a Signal with confidence, reasoning, and indicators.
             signal = evaluate_symbol(symbol, strategy_type)
+            evaluated += 1
             result.decisions += 1
 
             # Hand the technical signal to Claude for the FINAL decision.
-            # claude_decide always returns a TradeDecision (never raises) and
-            # falls back to the technical signal if the LLM is misconfigured
-            # or unavailable, so the bot keeps trading no matter what.
             decision = claude_decide(
                 wallet=wallet,
                 symbol=symbol,
@@ -245,7 +255,20 @@ class BotEngine:
             side = decision.action
             confidence = float(decision.confidence or 0.0)
 
-            if side not in {"BUY", "SELL"} or confidence < cfg.min_confidence:
+            # Always remember the strongest candidate we saw so the tick log
+            # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
+            if best is None or confidence > best.get("confidence", 0.0):
+                best = {
+                    "symbol": symbol,
+                    "side": side,
+                    "confidence": confidence,
+                    "reason": (decision.rationale or signal.reasoning or "")[:120],
+                }
+
+            if side not in {"BUY", "SELL"}:
+                continue
+            if confidence < cfg.min_confidence:
+                below_conf += 1
                 continue
 
             # Sizing: Claude's size_multiplier scales the bot's default size,
@@ -260,7 +283,6 @@ class BotEngine:
                 continue
 
             if cfg.dry_run:
-                # Log the decision but don't actually open a paper trade.
                 self._log(
                     "bot",
                     (
@@ -293,6 +315,15 @@ class BotEngine:
             if outcome.get("ok"):
                 result.actions += 1
                 slots_left -= 1
+                self._log(
+                    "trade",
+                    (
+                        f"OPEN {side} {qty} {symbol} @ {price:.4f} "
+                        f"on {wallet['name']} (conf={confidence:.2f}, src={decision.source})"
+                    ),
+                    wallet_id=wallet["id"],
+                    level="success",
+                )
                 try:
                     from services.notifier import notify
                     notify(
@@ -305,6 +336,33 @@ class BotEngine:
                     pass
             else:
                 result.skipped += 1
+                self._log(
+                    "trade",
+                    (
+                        f"REJECTED {side} {qty} {symbol} @ {price:.4f} on {wallet['name']}: "
+                        f"{outcome.get('error') or outcome.get('reason') or 'unknown'}"
+                    ),
+                    wallet_id=wallet["id"],
+                    level="warn",
+                )
+
+        # Per-wallet tick summary so the live console always has a heartbeat.
+        if best:
+            best_line = (
+                f"best={best['symbol']} {best['side']} conf={best['confidence']:.2f}"
+            )
+        else:
+            best_line = "no signals"
+        self._log(
+            "bot",
+            (
+                f"{wallet['name']}: evaluated {evaluated}/{len(universe)} symbols, "
+                f"floor={cfg.min_confidence:.2f}, below={below_conf}, "
+                f"slots={cap - open_count}/{cap}, {best_line}."
+            ),
+            wallet_id=wallet["id"],
+            level="info",
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers
