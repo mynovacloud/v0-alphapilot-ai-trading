@@ -159,7 +159,8 @@
     </div>
     <div class="flex items-center gap-2 mt-3" style="flex-wrap:wrap;">
       <label class="text-muted" style="font-size:0.74rem;">Universe size</label>
-      <input id="live-universe-limit" type="number" min="5" max="150" value="40" class="input" style="width:80px;">
+      <input id="live-universe-limit" type="number" min="10" max="150" value="40" class="input" style="width:80px;">
+      <span class="text-dim" style="font-size:0.68rem;">Min 10. Smaller = faster ticks, fewer chances to fire.</span>
       <label class="flex items-center gap-1 text-muted" style="font-size:0.74rem;margin-left:0.6rem;cursor:pointer;">
         <input id="live-aggressive" type="checkbox">
         <span>Aggressive training mode</span>
@@ -168,6 +169,17 @@
       <span class="text-dim" style="font-size:0.7rem;margin-left:auto;">
         These knobs apply to the bot config when you press Start, and revert when you Stop.
       </span>
+    </div>
+    <!-- Kill switch banner — auto-released on Start, but if a daily loss budget
+         re-engages it mid-session the user needs to know that's what's happening. -->
+    <div id="live-kill-banner" style="display:none;margin-top:0.8rem;padding:0.6rem 0.8rem;border-radius:var(--radius-sm);background:rgba(220,55,55,0.12);border:1px solid rgba(220,55,55,0.45);">
+      <div class="flex items-center justify-between gap-2" style="flex-wrap:wrap;">
+        <div>
+          <strong style="color:#ff6b6b;">Kill switch is engaged.</strong>
+          <span class="text-muted" style="font-size:0.78rem;margin-left:0.4rem;">No ticks will run until it is released.</span>
+        </div>
+        <button id="live-kill-release" class="btn btn-sm" type="button">Release kill switch</button>
+      </div>
     </div>
   </details>
 
