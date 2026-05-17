@@ -45,6 +45,10 @@ DEFAULTS: dict[str, str] = {
     "training_session_prev_bot_enabled": "",
     "training_session_prev_dry_run": "",
     "training_session_prev_tick_seconds": "",
+    "training_session_prev_min_confidence": "",
+    "training_session_prev_position_size_usd": "",
+    "training_session_prev_max_open_per_wallet": "",
+    "training_session_prev_universe_limit": "",
 }
 
 
@@ -65,7 +69,7 @@ class BotConfig:
         raw = _load_raw()
         return cls(
             bot_enabled=_b(raw.get("bot_enabled")),
-            tick_seconds=max(5, int(float(raw.get("bot_tick_seconds") or 60))),
+            tick_seconds=max(2, int(float(raw.get("bot_tick_seconds") or 60))),
             universe=raw.get("bot_universe") or "coinbase_usd",
             universe_limit=max(1, int(float(raw.get("bot_universe_limit") or 30))),
             min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.65))),

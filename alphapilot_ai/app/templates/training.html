@@ -108,14 +108,6 @@
       <span id="live-status-badge" class="badge" style="margin-left:0.6rem;">Idle</span>
     </div>
     <div class="flex items-center gap-2">
-      <label class="text-muted" style="font-size:0.78rem;">Tick</label>
-      <select id="live-tick-seconds" class="select" style="width:90px;">
-        <option value="5">5s</option>
-        <option value="10">10s</option>
-        <option value="15" selected>15s</option>
-        <option value="30">30s</option>
-        <option value="60">60s</option>
-      </select>
       <button id="live-start-btn" class="btn btn-primary" type="button">Start Live Session</button>
       <button id="live-stop-btn" class="btn btn-danger" type="button" style="display:none;">Stop Session</button>
       <button id="live-tick-btn" class="btn" type="button" title="Force one tick now">Tick&nbsp;Now</button>
@@ -123,10 +115,61 @@
   </div>
 
   <p class="text-muted mb-3" style="font-size:0.85rem;max-width:780px;">
-    Watch the bot trade in real time on paper money. Starting a session forces the autonomous engine to wake up
-    every few seconds, route Claude's decisions through the paper trading layer, and stream every BUY, SELL, HOLD,
-    and exit straight onto this page. Stop any time. We perfect this here before live capital.
+    Watch the bot trade in real time on paper money. Starting forces the autonomous engine to wake up
+    on your chosen interval, evaluate every symbol in the universe, and route every BUY / SELL through
+    the paper trading layer. Drop the tick rate to 2&nbsp;seconds for near&#8209;real&#8209;time, lower the
+    confidence floor for an aggressive training session, and watch executions stream in below. Stop any time.
   </p>
+
+  <!-- Session Settings panel -->
+  <details id="live-settings" open style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.75rem 0.9rem;margin-bottom:0.9rem;">
+    <summary class="mono" style="cursor:pointer;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">
+      Session settings
+      <span id="live-settings-summary" class="text-dim" style="margin-left:0.6rem;font-size:0.72rem;">tick 5s · floor 0.55 · $100/trade · 5 open</span>
+    </summary>
+    <div class="grid mt-3" style="grid-template-columns:repeat(4,1fr);gap:0.9rem;">
+      <div>
+        <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
+          Tick rate <span id="live-tick-val" class="mono" style="color:var(--text);font-weight:700;">5s</span>
+        </label>
+        <input id="live-tick-seconds" type="range" min="2" max="120" step="1" value="5" style="width:100%;">
+        <div class="text-dim" style="font-size:0.68rem;">2s = real-time stream · 60s = realistic pace</div>
+      </div>
+      <div>
+        <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
+          Confidence floor <span id="live-conf-val" class="mono" style="color:var(--text);font-weight:700;">0.55</span>
+        </label>
+        <input id="live-min-confidence" type="range" min="0" max="0.95" step="0.01" value="0.55" style="width:100%;">
+        <div class="text-dim" style="font-size:0.68rem;">Drop to ~0.30 to see lots of trades while training</div>
+      </div>
+      <div>
+        <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
+          Position size <span id="live-size-val" class="mono" style="color:var(--text);font-weight:700;">$100</span>
+        </label>
+        <input id="live-position-size" type="range" min="10" max="2000" step="10" value="100" style="width:100%;">
+        <div class="text-dim" style="font-size:0.68rem;">USD notional per opened paper trade</div>
+      </div>
+      <div>
+        <label class="text-muted" style="font-size:0.74rem;display:block;margin-bottom:0.2rem;">
+          Max open / wallet <span id="live-maxopen-val" class="mono" style="color:var(--text);font-weight:700;">5</span>
+        </label>
+        <input id="live-max-open" type="range" min="1" max="25" step="1" value="5" style="width:100%;">
+        <div class="text-dim" style="font-size:0.68rem;">How many concurrent positions per wallet</div>
+      </div>
+    </div>
+    <div class="flex items-center gap-2 mt-3" style="flex-wrap:wrap;">
+      <label class="text-muted" style="font-size:0.74rem;">Universe size</label>
+      <input id="live-universe-limit" type="number" min="5" max="150" value="40" class="input" style="width:80px;">
+      <label class="flex items-center gap-1 text-muted" style="font-size:0.74rem;margin-left:0.6rem;cursor:pointer;">
+        <input id="live-aggressive" type="checkbox">
+        <span>Aggressive training mode</span>
+        <span class="text-dim" style="font-size:0.68rem;">(force floor ≤ 0.35, max-open ≥ 8)</span>
+      </label>
+      <span class="text-dim" style="font-size:0.7rem;margin-left:auto;">
+        These knobs apply to the bot config when you press Start, and revert when you Stop.
+      </span>
+    </div>
+  </details>
 
   <!-- Live equity strip — these numbers tick every poll -->
   <div class="grid mb-3" style="grid-template-columns:1.4fr repeat(4,1fr);gap:0.6rem;">
