@@ -1,0 +1,3 @@
+2026-05-17 02:54:22,167 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
+2026-05-17 02:54:22,201 | INFO    | database.seed | Seeding mock data...
+2026-05-17 02:54:22,209 | INFO    | database.seed | Seed complete.
