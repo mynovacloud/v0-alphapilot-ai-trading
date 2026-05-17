@@ -754,6 +754,42 @@ def training_page(request: Request) -> HTMLResponse:
                 "wallet_name": wallet_names.get(wid, "?"),
             }
         traded_symbols = sorted(seen.values(), key=lambda r: (r["wallet_name"], r["symbol"]))
+
+        # Portfolio P&L roll-up across every paper trade (powers the bold
+        # money-strip at the top of the Training Center).
+        all_trades = s.query(PaperTrade).all()
+        starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
+        realized = 0.0
+        unrealized = 0.0
+        invested_open = 0.0
+        wins = 0
+        losses = 0
+        for t in all_trades:
+            if t.status == "closed":
+                pnl = t.realized_pnl or 0.0
+                realized += pnl
+                if pnl > 0:
+                    wins += 1
+                elif pnl < 0:
+                    losses += 1
+            else:
+                unrealized += (t.unrealized_pnl or 0.0)
+                invested_open += (t.entry_price or 0.0) * (t.qty or 0.0)
+        closed_count = wins + losses
+        portfolio = {
+            "starting": starting,
+            "realized": realized,
+            "unrealized": unrealized,
+            "current": starting + realized + unrealized,
+            "total_pl": realized + unrealized,
+            "total_pl_pct": ((realized + unrealized) / starting * 100.0) if starting else 0.0,
+            "invested_open": invested_open,
+            "open_trades": len(all_trades) - closed_count,
+            "closed_trades": closed_count,
+            "wins": wins,
+            "losses": losses,
+            "win_rate": (wins / closed_count) if closed_count else 0.0,
+        }
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
@@ -765,6 +801,7 @@ def training_page(request: Request) -> HTMLResponse:
             recent_reflections=recent_reflections(limit=15),
             claude_configured=claude_is_configured(),
             traded_symbols=traded_symbols,
+            portfolio=portfolio,
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),

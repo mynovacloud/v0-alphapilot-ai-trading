@@ -26,6 +26,77 @@
 {% endif %}
 
 <!-- ============================================================ -->
+<!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->
+<!-- ============================================================ -->
+{% set pl = portfolio.total_pl %}
+{% set pl_color = 'var(--good)' if pl > 0.005 else ('var(--bad)' if pl < -0.005 else 'var(--text-muted)') %}
+{% set pl_sign = '+' if pl >= 0 else '−' %}
+<div class="card mb-4" id="paper-money-strip"
+     style="background: linear-gradient(135deg, var(--bg-elev), var(--bg)); border: 1px solid var(--border);">
+  <div class="grid" style="grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr; gap: 1rem; align-items: stretch;">
+
+    <!-- HERO: current paper equity + P&L -->
+    <div style="padding: 0.6rem 0.4rem;">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Paper Portfolio</div>
+      <div class="mono" style="font-size: 2.6rem; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em;">
+        ${{ '{:,.2f}'.format(portfolio.current) }}
+      </div>
+      <div class="flex items-center gap-2" style="margin-top: 0.35rem;">
+        <span class="mono" style="font-size: 1.15rem; font-weight: 700; color: {{ pl_color }};">
+          {{ pl_sign }}${{ '{:,.2f}'.format(pl|abs) }}
+        </span>
+        <span class="mono" style="font-size: 0.95rem; font-weight: 600; color: {{ pl_color }};">
+          ({{ pl_sign }}{{ '%.2f' | format(portfolio.total_pl_pct|abs) }}%)
+        </span>
+        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} seeded</span>
+      </div>
+    </div>
+
+    <!-- Realized P&L -->
+    {% set rcol = 'var(--good)' if portfolio.realized > 0.005 else ('var(--bad)' if portfolio.realized < -0.005 else 'var(--text)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Realized P&amp;L</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ rcol }};">
+        {{ '+' if portfolio.realized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.realized|abs) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.closed_trades }} closed · {{ portfolio.wins }}W / {{ portfolio.losses }}L</div>
+    </div>
+
+    <!-- Unrealized P&L -->
+    {% set ucol = 'var(--good)' if portfolio.unrealized > 0.005 else ('var(--bad)' if portfolio.unrealized < -0.005 else 'var(--text)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Unrealized P&amp;L</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ ucol }};">
+        {{ '+' if portfolio.unrealized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.unrealized|abs) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open positions</div>
+    </div>
+
+    <!-- Capital deployed -->
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Capital Deployed</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800;">
+        ${{ '{:,.2f}'.format(portfolio.invested_open) }}
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">
+        {% if portfolio.current %}{{ '%.1f' | format(portfolio.invested_open / portfolio.current * 100) }}% of equity{% else %}—{% endif %}
+      </div>
+    </div>
+
+    <!-- Win rate -->
+    {% set wcol = 'var(--good)' if portfolio.win_rate >= 0.55 else ('var(--warn)' if portfolio.win_rate >= 0.4 else 'var(--bad)') %}
+    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+      <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Win Rate</div>
+      <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ wcol if portfolio.closed_trades else 'var(--text)' }};">
+        {{ '%.1f' | format(portfolio.win_rate * 100) }}%
+      </div>
+      <div class="text-dim" style="font-size: 0.78rem;">across all paper trades</div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ============================================================ -->
 <!-- POSITIONS LAB                                                   -->
 <!-- ============================================================ -->
 <div class="card mb-4" id="positions-lab">
@@ -71,13 +142,38 @@
       </div>
 
       <div id="lab-content" style="display: none;">
-        <!-- KPI strip -->
-        <div class="grid" style="grid-template-columns: repeat(6, 1fr); gap: 0.5rem;">
+        <!-- KPI strip: bold entry/exit dollar amounts up front -->
+        <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
+          <!-- Bought-In total -->
+          <div class="kpi" style="background: linear-gradient(135deg, rgba(38,194,129,0.10), var(--bg-elev)); border-left: 3px solid var(--good);">
+            <div class="kpi-label">Bought In (paper)</div>
+            <div class="kpi-value mono" id="lab-kpi-bought" style="font-size: 1.6rem; font-weight: 800; color: var(--good);">$0.00</div>
+            <div class="text-dim" id="lab-kpi-bought-sub" style="font-size: 0.72rem;">— entries</div>
+          </div>
+          <!-- Sold-At total -->
+          <div class="kpi" style="background: linear-gradient(135deg, rgba(74,163,255,0.10), var(--bg-elev)); border-left: 3px solid var(--accent, #4aa3ff);">
+            <div class="kpi-label">Sold At (paper)</div>
+            <div class="kpi-value mono" id="lab-kpi-sold" style="font-size: 1.6rem; font-weight: 800; color: var(--accent, #4aa3ff);">$0.00</div>
+            <div class="text-dim" id="lab-kpi-sold-sub" style="font-size: 0.72rem;">— exits</div>
+          </div>
+          <!-- Realized P&L for THIS symbol -->
+          <div class="kpi" style="border-left: 3px solid var(--border);">
+            <div class="kpi-label">Realized P&amp;L</div>
+            <div class="kpi-value mono" id="lab-kpi-pnl" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
+            <div class="text-dim" id="lab-kpi-pnl-sub" style="font-size: 0.72rem;">best — / worst —</div>
+          </div>
+          <!-- Currently open in this symbol -->
+          <div class="kpi" style="border-left: 3px solid var(--border);">
+            <div class="kpi-label">Currently Open</div>
+            <div class="kpi-value mono" id="lab-kpi-openval" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
+            <div class="text-dim" id="lab-kpi-openval-sub" style="font-size: 0.72rem;">0 positions · unreal —</div>
+          </div>
+        </div>
+
+        <div class="grid" style="grid-template-columns: repeat(4, 1fr); gap: 0.5rem;">
           <div class="kpi"><div class="kpi-label">Symbol</div><div class="kpi-value mono" id="lab-kpi-symbol">—</div></div>
-          <div class="kpi"><div class="kpi-label">Realized P&amp;L</div><div class="kpi-value mono" id="lab-kpi-pnl">$0.00</div></div>
           <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value mono" id="lab-kpi-winrate">0%</div></div>
           <div class="kpi"><div class="kpi-label">Trades</div><div class="kpi-value mono" id="lab-kpi-trades">0</div></div>
-          <div class="kpi"><div class="kpi-label">Open</div><div class="kpi-value mono" id="lab-kpi-open">0</div></div>
           <div class="kpi"><div class="kpi-label">Avg Hold</div><div class="kpi-value mono" id="lab-kpi-hold">—</div></div>
         </div>
 
@@ -97,11 +193,14 @@
         <div>
           <h4 style="font-size: 0.85rem; margin: 0 0 0.4rem 0;">Trade ledger for <span id="lab-ledger-symbol" class="mono">—</span></h4>
           <div style="overflow-x: auto;">
-            <table class="table" style="width: 100%; font-size: 0.78rem;">
+            <table class="table" style="width: 100%; font-size: 0.82rem;">
               <thead>
                 <tr>
-                  <th>#</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
-                  <th>P&amp;L</th><th>Conf</th><th>Status</th><th>Opened</th><th>Closed</th><th>Notes</th>
+                  <th>#</th><th>Side</th><th>Qty</th>
+                  <th style="text-align: right;">Bought&nbsp;$</th>
+                  <th style="text-align: right;">Sold&nbsp;$</th>
+                  <th style="text-align: right;">P&amp;L</th>
+                  <th>Conf</th><th>Status</th><th>Opened</th><th>Closed</th><th>Notes</th>
                 </tr>
               </thead>
               <tbody id="lab-ledger-body">

@@ -126,13 +126,60 @@
 
   function renderStats() {
     const s = state.data.stats;
+    const trades = state.data.trades || [];
+
+    // Aggregate notional dollar amounts at entry and exit, per symbol.
+    // "Bought $" sums (qty * entry_price) for every BUY (long) trade and
+    // every SHORT exit's covering price; we treat entry_price * qty as the
+    // capital "bought in" regardless of side for clarity to the user.
+    let boughtTotal = 0, soldTotal = 0;
+    let buyCount = 0, sellCount = 0;
+    let openNotional = 0, openUnreal = 0, openCount = 0;
+    for (const t of trades) {
+      const entryNotional = (t.entry_price || 0) * (t.qty || 0);
+      boughtTotal += entryNotional;
+      buyCount += 1;
+      if (t.exit_price) {
+        soldTotal += (t.exit_price || 0) * (t.qty || 0);
+        sellCount += 1;
+      }
+      if (t.status === "open") {
+        openNotional += entryNotional;
+        openUnreal += t.unrealized_pnl || 0;
+        openCount += 1;
+      }
+    }
+
     sel("#lab-kpi-symbol").textContent = state.data.symbol;
     sel("#lab-kpi-pnl").textContent = fmtMoney(s.realized_pnl);
     sel("#lab-kpi-pnl").style.color =
       s.realized_pnl > 0 ? "var(--good)" : s.realized_pnl < 0 ? "var(--bad)" : "var(--text)";
+    const pnlSub = sel("#lab-kpi-pnl-sub");
+    if (pnlSub) pnlSub.textContent =
+      "best " + fmtMoney(s.best_pnl) + " / worst " + fmtMoney(s.worst_pnl);
+
+    sel("#lab-kpi-bought").textContent = fmtMoney(boughtTotal);
+    const boughtSub = sel("#lab-kpi-bought-sub");
+    if (boughtSub) boughtSub.textContent = buyCount + " entr" + (buyCount === 1 ? "y" : "ies");
+
+    sel("#lab-kpi-sold").textContent = fmtMoney(soldTotal);
+    const soldSub = sel("#lab-kpi-sold-sub");
+    if (soldSub) soldSub.textContent = sellCount + " exit" + (sellCount === 1 ? "" : "s");
+
+    const openVal = sel("#lab-kpi-openval");
+    if (openVal) {
+      openVal.textContent = fmtMoney(openNotional);
+      openVal.style.color =
+        openUnreal > 0 ? "var(--good)" : openUnreal < 0 ? "var(--bad)" : "var(--text)";
+    }
+    const openSub = sel("#lab-kpi-openval-sub");
+    if (openSub)
+      openSub.textContent =
+        openCount + " position" + (openCount === 1 ? "" : "s") +
+        " · unreal " + fmtMoney(openUnreal);
+
     sel("#lab-kpi-winrate").textContent = fmtPct(s.win_rate, 0);
     sel("#lab-kpi-trades").textContent = s.total_trades;
-    sel("#lab-kpi-open").textContent = s.open_trades;
     sel("#lab-kpi-hold").textContent =
       s.avg_hold_minutes > 0 ? Math.round(s.avg_hold_minutes) + "m" : "—";
   }
@@ -153,14 +200,25 @@
       const opened = t.opened_at_ts ? fmtTime(t.opened_at_ts) : "—";
       const closed = t.closed_at_ts ? fmtTime(t.closed_at_ts) : "—";
       const notes = (t.notes || "").replace(/</g, "&lt;");
+      const boughtNotional = (t.entry_price || 0) * (t.qty || 0);
+      const soldNotional = t.exit_price ? (t.exit_price * t.qty) : 0;
+      const boughtCell =
+        '<div class="mono" style="font-weight:700;font-size:0.95rem;color:var(--good);">' +
+        fmtMoney(boughtNotional) + '</div>' +
+        '<div class="text-dim mono" style="font-size:0.7rem;">@ ' + fmtPrice(t.entry_price) + '</div>';
+      const soldCell = t.exit_price
+        ? ('<div class="mono" style="font-weight:700;font-size:0.95rem;color:var(--accent,#4aa3ff);">' +
+           fmtMoney(soldNotional) + '</div>' +
+           '<div class="text-dim mono" style="font-size:0.7rem;">@ ' + fmtPrice(t.exit_price) + '</div>')
+        : '<span class="text-dim">— still open —</span>';
       return (
         '<tr>' +
         '<td class="mono text-dim">#' + t.id + '</td>' +
         '<td><span class="badge ' + sideClass + '">' + t.side + '</span></td>' +
         '<td class="mono">' + t.qty + '</td>' +
-        '<td class="mono">' + fmtPrice(t.entry_price) + '</td>' +
-        '<td class="mono">' + (t.exit_price ? fmtPrice(t.exit_price) : "—") + '</td>' +
-        '<td class="mono" style="color:' + pnlColor + '">' + fmtMoney(pnl) + '</td>' +
+        '<td style="text-align:right;">' + boughtCell + '</td>' +
+        '<td style="text-align:right;">' + soldCell + '</td>' +
+        '<td class="mono" style="text-align:right;font-weight:700;color:' + pnlColor + '">' + fmtMoney(pnl) + '</td>' +
         '<td class="mono">' + (t.confidence || 0).toFixed(2) + '</td>' +
         '<td><span class="badge ' + statusClass + '">' + t.status + '</span></td>' +
         '<td class="mono text-dim" style="font-size:0.72rem;">' + opened + '</td>' +
