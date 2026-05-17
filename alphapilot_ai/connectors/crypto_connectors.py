@@ -21,6 +21,7 @@ import base64
 import hashlib
 import hmac
 import json
+import secrets
 import time
 import urllib.parse
 import uuid
@@ -31,6 +32,28 @@ import httpx
 from config.settings import settings
 from connectors.base_connector import BaseConnector
 from connectors.live_prices import get_price as live_price
+
+
+def _is_pem_key(secret: str) -> bool:
+    """Detect modern Coinbase Cloud / CDP / Advanced Trade keys.
+
+    Those keys are ECDSA P-256 PEM blocks ('-----BEGIN EC PRIVATE KEY-----'
+    or '-----BEGIN PRIVATE KEY-----'). The legacy HMAC keys are short
+    base64-ish strings without any PEM framing.
+    """
+    if not secret:
+        return False
+    s = secret.strip().replace("\\n", "\n")
+    return "BEGIN" in s and "PRIVATE KEY" in s
+
+
+def _normalize_pem(secret: str) -> str:
+    """Coinbase often hands the PEM out as a JSON-escaped string with literal
+    `\\n` instead of real newlines. Convert both forms to a real PEM string."""
+    s = secret.strip()
+    if "\\n" in s and "\n" not in s:
+        s = s.replace("\\n", "\n")
+    return s
 
 
 # --------------------------------------------------------------------- #
@@ -87,15 +110,56 @@ class CoinbaseConnector(BaseConnector):
     def fetch_market_data(self, symbol: str) -> dict[str, Any]:
         return _market_data_via_coingecko(self.platform, symbol)
 
-    def _sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
+    def _is_cdp(self) -> bool:
+        """True when keys look like a Coinbase Cloud / CDP / Advanced Trade pair
+        (PEM private key + 'organizations/.../apiKeys/...' name)."""
+        return _is_pem_key(self.api_secret or "")
+
+    def _hmac_sign(self, timestamp: str, method: str, path: str, body: str = "") -> str:
         message = f"{timestamp}{method}{path}{body}"
         return hmac.new(self.api_secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
+    def _jwt_sign(self, method: str, path: str) -> str:
+        """Build a Coinbase CDP JWT (ES256, 2-minute expiry) for one request.
+
+        URI shape required by Coinbase: 'METHOD api.coinbase.com/path'
+        Required claims: sub=key_name, iss='cdp', nbf, exp, uri.
+        Header must include 'kid'=key_name and 'nonce'.
+        """
+        try:
+            import jwt  # type: ignore
+        except Exception as exc:  # pragma: no cover
+            raise RuntimeError(
+                "PyJWT + cryptography are required for Coinbase Advanced Trade keys. "
+                "Run: pip install -r requirements.txt"
+            ) from exc
+
+        key_name = (self.api_key or "").strip()
+        private_key = _normalize_pem(self.api_secret or "")
+        host = self.BASE_URL.replace("https://", "").replace("http://", "")
+        uri = f"{method.upper()} {host}{path}"
+        now = int(time.time())
+        claims = {
+            "sub": key_name,
+            "iss": "cdp",
+            "nbf": now,
+            "exp": now + 120,
+            "uri": uri,
+        }
+        headers = {"kid": key_name, "nonce": secrets.token_hex(16)}
+        return jwt.encode(claims, private_key, algorithm="ES256", headers=headers)
+
     def _auth_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
+        if self._is_cdp():
+            token = self._jwt_sign(method, path)
+            return {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
         timestamp = str(int(time.time()))
         return {
             "CB-ACCESS-KEY": self.api_key,
-            "CB-ACCESS-SIGN": self._sign(timestamp, method, path, body),
+            "CB-ACCESS-SIGN": self._hmac_sign(timestamp, method, path, body),
             "CB-ACCESS-TIMESTAMP": timestamp,
             "Content-Type": "application/json",
         }
@@ -103,6 +167,16 @@ class CoinbaseConnector(BaseConnector):
     def validate_credentials(self) -> dict[str, Any]:
         if not self.api_key or not self.api_secret:
             return {"valid": False, "error": "Coinbase requires both API key and API secret."}
+        # Detect a CDP/Advanced-Trade key but with a missing/garbled PEM secret.
+        if (self.api_key or "").startswith("organizations/") and not _is_pem_key(self.api_secret):
+            return {
+                "valid": False,
+                "error": (
+                    "This looks like a Coinbase Advanced Trade key (organizations/.../apiKeys/...), "
+                    "but the secret is not a PEM block. Paste the full private key including the "
+                    "'-----BEGIN EC PRIVATE KEY-----' and '-----END EC PRIVATE KEY-----' lines."
+                ),
+            }
         try:
             path = "/api/v3/brokerage/accounts"
             with httpx.Client(timeout=15.0) as c:
@@ -113,9 +187,16 @@ class CoinbaseConnector(BaseConnector):
                     "valid": True,
                     "platform": self.platform,
                     "accounts_visible": len(accounts),
+                    "auth_mode": "JWT/ES256" if self._is_cdp() else "HMAC (legacy)",
                     "live": True,
                 }
-            return {"valid": False, "status": r.status_code, "error": r.text[:300]}
+            # Surface the real Coinbase error message, not just the status code.
+            try:
+                err = r.json()
+                msg = err.get("error_details") or err.get("message") or err.get("error") or r.text[:300]
+            except Exception:
+                msg = r.text[:300]
+            return {"valid": False, "status": r.status_code, "error": str(msg)}
         except Exception as e:
             return {"valid": False, "error": f"Coinbase auth failed: {e}"}
 
