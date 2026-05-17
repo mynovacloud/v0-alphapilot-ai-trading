@@ -34,6 +34,11 @@ from database.models import (
     Wallet,
 )
 from trading.paper_trading_engine import PaperTradingEngine
+from trading.portfolio_intelligence import (
+    PortfolioIntelligence,
+    execute_portfolio_action,
+)
+from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol
 from utils.helpers import utcnow
@@ -61,6 +66,8 @@ class BotEngine:
     def __init__(self) -> None:
         self.ai = AIEngine()
         self.paper = PaperTradingEngine()
+        self.position_monitor = PositionMonitor()
+        self.portfolio_intel = PortfolioIntelligence()
         self._lock = threading.Lock()
         # In-memory ring buffer of recent tick results so the UI can show "what the bot did".
         self._recent_ticks: list[TickResult] = []
@@ -122,6 +129,28 @@ class BotEngine:
             result.notes.append("empty_universe")
             self._log("bot", "Tick skipped: universe is empty.", level="warn")
             return self._record(result)
+
+        # -----------------------------------------------------------------
+        # POSITION MONITORING: Check all open positions for auto-exits
+        # before evaluating new entries. This ensures SL/TP/trailing stops
+        # are processed at the same frequency as new entry signals.
+        # -----------------------------------------------------------------
+        auto_exits = self._monitor_positions(cfg, universe, result)
+        if auto_exits > 0:
+            result.notes.append(f"auto_exits={auto_exits}")
+
+        # -----------------------------------------------------------------
+        # PORTFOLIO INTELLIGENCE: Proactive portfolio management.
+        # This is where the "smart" behavior happens - instead of passively
+        # waiting for losing positions to recover, we:
+        #   1. DCA into losers at better prices
+        #   2. Scale into winners that keep working
+        #   3. Open offset trades to balance underwater positions
+        # This runs EVERY tick, regardless of slot availability.
+        # -----------------------------------------------------------------
+        intel_actions = self._run_portfolio_intelligence(cfg, universe, result)
+        if intel_actions > 0:
+            result.notes.append(f"portfolio_intel_actions={intel_actions}")
 
         # Walk every active wallet.
         with session_scope() as s:
@@ -343,6 +372,21 @@ class BotEngine:
             if outcome.get("ok"):
                 result.actions += 1
                 slots_left -= 1
+                # Initialize SL/TP based on Claude's recommendation
+                trade_id = outcome.get("trade_id")
+                if trade_id:
+                    with session_scope() as s:
+                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                        if trade:
+                            initialize_trade_sl_tp(
+                                trade,
+                                stop_loss_pct=decision.stop_loss_pct,
+                                take_profit_pct=decision.take_profit_pct,
+                                trailing_stop_pct=None,  # Can be enabled later
+                                max_loss_pct=0.10,
+                                time_limit_hours=None,
+                            )
+                            s.commit()
                 self._log(
                     "trade",
                     (
@@ -391,6 +435,168 @@ class BotEngine:
             wallet_id=wallet["id"],
             level="info",
         )
+
+    # ------------------------------------------------------------------ #
+    # Portfolio Intelligence
+    # ------------------------------------------------------------------ #
+
+    def _run_portfolio_intelligence(
+        self,
+        cfg: BotConfig,
+        universe: list[dict[str, Any]],
+        result: TickResult,
+    ) -> int:
+        """
+        Proactive portfolio management - DCA, scale-in, offset trades.
+        
+        This is what makes the bot ACTIVE instead of passive.
+        Instead of opening 3 positions and hoping they recover,
+        we continuously look for ways to improve portfolio P&L.
+        
+        Returns the number of actions executed.
+        """
+        # Build price map
+        price_map: dict[str, float] = {}
+        for product in universe:
+            symbol = product["product_id"]
+            price_payload = get_price(symbol)
+            if price_payload.get("ok"):
+                price_map[symbol] = float(price_payload["price"])
+        
+        if not price_map:
+            return 0
+        
+        # Get all wallets with positions
+        with session_scope() as s:
+            wallet_ids = (
+                s.query(PaperTrade.wallet_id)
+                .filter(PaperTrade.status == "open")
+                .distinct()
+                .all()
+            )
+            wallet_ids = [w[0] for w in wallet_ids]
+        
+        actions_executed = 0
+        
+        for wallet_id in wallet_ids:
+            # Generate portfolio improvement actions
+            actions = self.portfolio_intel.generate_actions(
+                wallet_id=wallet_id,
+                price_map=price_map,
+                universe=universe,
+                cfg=cfg,
+                max_actions=3,  # Max 3 actions per wallet per tick
+            )
+            
+            for action in actions:
+                self._log(
+                    "portfolio",
+                    f"Portfolio Intel: {action.action_type.upper()} {action.symbol} - {action.reason}",
+                    wallet_id=wallet_id,
+                    level="info",
+                )
+                
+                # Execute the action
+                outcome = execute_portfolio_action(
+                    action=action,
+                    wallet_id=wallet_id,
+                    paper_engine=self.paper,
+                    cfg=cfg,
+                )
+                
+                if outcome.get("ok"):
+                    actions_executed += 1
+                    self._log(
+                        "portfolio",
+                        f"Portfolio Intel SUCCESS: {action.action_type} {action.symbol} executed",
+                        wallet_id=wallet_id,
+                        level="success",
+                    )
+                    
+                    # Notify
+                    try:
+                        from services.notifier import notify
+                        notify(
+                            f"Portfolio Intel: {action.action_type.upper()} {action.symbol} - {action.reason[:100]}",
+                            level="info",
+                            category="portfolio_intel",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    self._log(
+                        "portfolio",
+                        f"Portfolio Intel FAILED: {action.action_type} {action.symbol} - {outcome.get('error')}",
+                        wallet_id=wallet_id,
+                        level="warn",
+                    )
+        
+        return actions_executed
+
+    # ------------------------------------------------------------------ #
+    # Position Monitoring
+    # ------------------------------------------------------------------ #
+
+    def _monitor_positions(
+        self,
+        cfg: BotConfig,
+        universe: list[dict[str, Any]],
+        result: TickResult,
+    ) -> int:
+        """
+        Check all open positions for auto-exit conditions (SL/TP/trailing/time).
+
+        Returns the number of positions that were auto-closed.
+        """
+        # Build price map from universe for quick lookup
+        price_map: dict[str, float] = {}
+        for product in universe:
+            symbol = product["product_id"]
+            price_payload = get_price(symbol)
+            if price_payload.get("ok"):
+                price_map[symbol] = float(price_payload["price"])
+
+        # Fetch all wallets with open positions
+        with session_scope() as s:
+            wallet_ids = (
+                s.query(PaperTrade.wallet_id)
+                .filter(PaperTrade.status == "open")
+                .distinct()
+                .all()
+            )
+            wallet_ids = [w[0] for w in wallet_ids]
+
+        closed_count = 0
+        for wallet_id in wallet_ids:
+            exits = self.position_monitor.check_all_positions(wallet_id, price_map)
+            for exit_signal in exits:
+                # Close the position through the paper engine
+                outcome = self.paper.close_trade(
+                    trade_id=exit_signal.trade_id,
+                    exit_price=exit_signal.current_price,
+                    notes=f"auto-exit/{exit_signal.reason}: triggered at ${exit_signal.current_price:.4f}",
+                )
+                if outcome.get("ok"):
+                    closed_count += 1
+                    # Update the exit_reason on the trade record
+                    with session_scope() as s:
+                        trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()
+                        if trade:
+                            trade.exit_reason = exit_signal.reason
+                    # Notify
+                    try:
+                        from services.notifier import notify
+                        notify(
+                            f"Auto-exit ({exit_signal.reason}): {exit_signal.symbol} "
+                            f"closed at ${exit_signal.current_price:.4f} "
+                            f"(P&L: {exit_signal.pnl_pct:+.2%})",
+                            level="info",
+                            category="auto_exit",
+                        )
+                    except Exception:
+                        pass
+
+        return closed_count
 
     # ------------------------------------------------------------------ #
     # Helpers
