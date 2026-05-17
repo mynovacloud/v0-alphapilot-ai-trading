@@ -9,6 +9,23 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(dt: datetime | None) -> datetime | None:
+    """Ensure a datetime is timezone-aware (UTC). Handles naive datetimes from DB."""
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def time_since_minutes(dt: datetime | None) -> float:
+    """Calculate minutes since a given datetime. Handles timezone-naive datetimes."""
+    if dt is None:
+        return 0.0
+    dt_utc = ensure_utc(dt)
+    return (utcnow() - dt_utc).total_seconds() / 60
+
+
 def fmt_money(value: float | int | None, currency: str = "$") -> str:
     if value is None:
         return f"{currency}0.00"

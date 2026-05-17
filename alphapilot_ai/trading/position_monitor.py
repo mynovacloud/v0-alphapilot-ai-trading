@@ -237,7 +237,9 @@ class PositionMonitor:
         # DEFAULT: If no time limit set, use 4 hours for paper trades (faster iteration)
         time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
         if trade.opened_at:
-            deadline = trade.opened_at + timedelta(hours=time_limit)
+            from utils.helpers import ensure_utc
+            opened_utc = ensure_utc(trade.opened_at)
+            deadline = opened_utc + timedelta(hours=time_limit)
             if utcnow() >= deadline and pnl_pct <= 0.005:  # Close if flat or losing after time limit
                 self._log_exit(session, trade, "time", current_price, pnl_pct)
                 return ExitSignal(
@@ -252,7 +254,8 @@ class PositionMonitor:
         # 6. Take small profits after some time has passed
         # This ensures we lock in gains instead of letting them evaporate
         if trade.opened_at and pnl_pct > 0:
-            age_minutes = (utcnow() - trade.opened_at).total_seconds() / 60
+            from utils.helpers import time_since_minutes
+            age_minutes = time_since_minutes(trade.opened_at)
             
             # After 30 mins: take 0.5%+ profit
             if age_minutes >= 30 and pnl_pct >= 0.005:

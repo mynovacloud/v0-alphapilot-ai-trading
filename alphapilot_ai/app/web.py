@@ -2016,8 +2016,8 @@ def api_positions() -> JSONResponse:
             opened = t.opened_at
             time_in_trade_min = 0
             if opened:
-                from utils.helpers import utcnow
-                time_in_trade_min = (utcnow() - opened).total_seconds() / 60
+                from utils.helpers import time_since_minutes
+                time_in_trade_min = time_since_minutes(opened)
 
             positions.append({
                 "id": t.id,
