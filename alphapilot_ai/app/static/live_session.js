@@ -508,7 +508,7 @@
       if (confSel)    { confSel.value = String(data.min_confidence); confValEl.textContent = Number(data.min_confidence).toFixed(2); }
       if (sizeSel)    { sizeSel.value = String(data.position_size_usd); sizeValEl.textContent = fmtMoneyShort(data.position_size_usd); }
       if (maxOpenSel) { maxOpenSel.value = String(data.max_open_per_wallet); maxOpenValEl.textContent = String(data.max_open_per_wallet); }
-      if (universeLimitEl) universeLimitEl.value = String(Math.max(10, parseInt(data.universe_limit, 10) || 40));
+      if (universeLimitEl) universeLimitEl.value = String(Math.max(10, parseInt(data.universe_limit, 10) || 100));
       setKillBanner(!!data.kill_switch_engaged);
       refreshSettingsSummary();
     } catch (e) {

@@ -17,18 +17,18 @@ DEFAULTS: dict[str, str] = {
     "bot_enabled": "false",                # master kill switch (string bool)
     "bot_tick_seconds": "60",              # how often the loop wakes up
     "bot_universe": "coinbase_usd",        # which universe to trade
-    "bot_universe_limit": "30",            # max symbols per tick
-    "bot_min_confidence": "0.65",          # minimum AI confidence to act
+    "bot_universe_limit": "100",           # max symbols per tick (increased for diversity)
+    "bot_min_confidence": "0.55",          # minimum AI confidence to act (lowered to trade more)
     "bot_default_strategy_type": "Momentum",
-    "bot_position_size_usd": "100",        # default per-trade notional in USD
-    "bot_max_open_per_wallet": "10",       # max concurrent positions (was 5, now 10 for diversity)
+    "bot_position_size_usd": "80",         # default per-trade notional in USD
+    "bot_max_open_per_wallet": "25",       # max concurrent positions (increased for scalping)
     "bot_max_ticks_log": "200",            # how many tick rows to keep visible
     "bot_dry_run": "true",                 # if true, decisions are logged only (paper layer ignored)
     # Aggressive trading settings
     "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
     "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+
     "bot_auto_scale_in_enabled": "true",   # automatically add to winning positions
-    "bot_diversification_target": "5",     # try to hold at least this many different assets
+    "bot_diversification_target": "15",    # try to hold at least this many different assets
     "bot_recovery_mode_enabled": "true",   # enable aggressive recovery when portfolio is down
     # Notifier settings
     "notifier_provider": "none",           # "telegram" | "discord" | "none"
@@ -83,17 +83,17 @@ class BotConfig:
             bot_enabled=_b(raw.get("bot_enabled")),
             tick_seconds=max(2, int(float(raw.get("bot_tick_seconds") or 60))),
             universe=raw.get("bot_universe") or "coinbase_usd",
-            universe_limit=max(1, int(float(raw.get("bot_universe_limit") or 30))),
-            min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.65))),
+            universe_limit=max(1, int(float(raw.get("bot_universe_limit") or 100))),
+            min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.55))),
             default_strategy_type=raw.get("bot_default_strategy_type") or "Momentum",
-            position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 100)),
-            max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 10))),
+            position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 80)),
+            max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 25))),
             dry_run=_b(raw.get("bot_dry_run"), default=True),
             # Aggressive trading
             auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
             auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),
             auto_scale_in_enabled=_b(raw.get("bot_auto_scale_in_enabled"), default=True),
-            diversification_target=max(1, int(float(raw.get("bot_diversification_target") or 5))),
+            diversification_target=max(1, int(float(raw.get("bot_diversification_target") or 15))),
             recovery_mode_enabled=_b(raw.get("bot_recovery_mode_enabled"), default=True),
         )
 

@@ -101,9 +101,28 @@ def coinbase_usd_universe(limit: int = 50) -> list[dict[str, Any]]:
     # Best-effort: bring well-known liquid majors to the front so the bot evaluates
     # them first within its tick budget.
     PRIORITY = [
-        "BTC-USD", "ETH-USD", "SOL-USD", "AVAX-USD", "LINK-USD", "MATIC-USD",
-        "DOGE-USD", "XRP-USD", "ADA-USD", "DOT-USD", "ATOM-USD", "LTC-USD",
-        "UNI-USD", "ARB-USD", "OP-USD", "APT-USD", "SUI-USD", "BCH-USD", "NEAR-USD",
+        # Top tier - highest liquidity
+        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD",
+        # Layer 1s
+        "AVAX-USD", "DOT-USD", "ATOM-USD", "NEAR-USD", "APT-USD", "SUI-USD",
+        "TON-USD", "TRX-USD", "HBAR-USD", "ALGO-USD", "FTM-USD", "ICP-USD",
+        # Layer 2s & Scaling
+        "MATIC-USD", "ARB-USD", "OP-USD", "IMX-USD", "STRK-USD", "MANTA-USD",
+        # DeFi
+        "LINK-USD", "UNI-USD", "AAVE-USD", "MKR-USD", "CRV-USD", "LDO-USD",
+        "SNX-USD", "COMP-USD", "SUSHI-USD", "1INCH-USD", "BAL-USD", "YFI-USD",
+        # Memecoins (high volatility = scalping opportunities)
+        "SHIB-USD", "PEPE-USD", "BONK-USD", "WIF-USD", "FLOKI-USD", "MEME-USD",
+        # Infrastructure
+        "FIL-USD", "AR-USD", "RENDER-USD", "RNDR-USD", "GRT-USD", "OCEAN-USD",
+        # Gaming & Metaverse
+        "AXS-USD", "SAND-USD", "MANA-USD", "ENJ-USD", "GALA-USD", "IMX-USD",
+        # Exchange tokens
+        "BCH-USD", "LTC-USD", "ETC-USD", "XLM-USD", "VET-USD", "EGLD-USD",
+        # AI tokens
+        "FET-USD", "AGIX-USD", "RNDR-USD", "TAO-USD",
+        # Misc high-volume
+        "INJ-USD", "SEI-USD", "TIA-USD", "PYTH-USD", "JTO-USD", "JUP-USD",
     ]
     priority_index = {sym: i for i, sym in enumerate(PRIORITY)}
     out.sort(key=lambda r: (priority_index.get(r["product_id"], 999), r["product_id"]))
