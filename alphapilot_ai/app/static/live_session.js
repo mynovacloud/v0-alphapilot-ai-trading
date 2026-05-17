@@ -393,6 +393,34 @@
   });
 
   // --- Boot ---
+  // Show / hide the kill-switch banner based on backend state.
+  const killBanner = document.getElementById("live-kill-banner");
+  const killReleaseBtn = document.getElementById("live-kill-release");
+  function setKillBanner(engaged) {
+    if (!killBanner) return;
+    killBanner.style.display = engaged ? "" : "none";
+  }
+  if (killReleaseBtn) {
+    killReleaseBtn.addEventListener("click", async () => {
+      killReleaseBtn.disabled = true;
+      try {
+        const res = await fetch("/training/session/release-kill-switch", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          setKillBanner(false);
+          renderLog({
+            ts: Math.floor(Date.now() / 1000),
+            level: "success",
+            category: "session",
+            message: "Kill switch released — bot will tick again on the next interval.",
+          });
+        }
+      } finally {
+        killReleaseBtn.disabled = false;
+      }
+    });
+  }
+
   // Pull current bot knobs so the sliders reflect the real backend state
   // (e.g. after a reload during an active session).
   async function hydrateSettings() {
@@ -405,7 +433,8 @@
       if (confSel)    { confSel.value = String(data.min_confidence); confValEl.textContent = Number(data.min_confidence).toFixed(2); }
       if (sizeSel)    { sizeSel.value = String(data.position_size_usd); sizeValEl.textContent = fmtMoneyShort(data.position_size_usd); }
       if (maxOpenSel) { maxOpenSel.value = String(data.max_open_per_wallet); maxOpenValEl.textContent = String(data.max_open_per_wallet); }
-      if (universeLimitEl) universeLimitEl.value = String(data.universe_limit);
+      if (universeLimitEl) universeLimitEl.value = String(Math.max(10, parseInt(data.universe_limit, 10) || 40));
+      setKillBanner(!!data.kill_switch_engaged);
       refreshSettingsSummary();
     } catch (e) {
       console.error("[v0] settings hydrate failed", e);
@@ -414,7 +443,15 @@
 
   // Always do an initial poll so the page rehydrates portfolio numbers and
   // detects an already-running session (e.g. if the user reloaded mid-run).
+  // Also re-check kill switch state every 10s so a daily-loss event that
+  // re-engages it mid-session is surfaced immediately.
   hydrateSettings().then(pollOnce).then(() => {
     if (state.sessionActive) startPolling();
   });
+  setInterval(() => {
+    fetch("/training/session/config", { headers: { Accept: "application/json" } })
+      .then((r) => r.ok ? r.json() : null)
+      .then((d) => { if (d && d.ok) setKillBanner(!!d.kill_switch_engaged); })
+      .catch(() => {});
+  }, 10000);
 })();

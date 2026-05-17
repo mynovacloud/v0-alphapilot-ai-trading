@@ -138,13 +138,20 @@ def momentum_signal(
         "return_lb": ret,
     }
 
-    # Decide side
-    if ema_fast > ema_slow and ret > 0:
+    # Decide side. Loosened: previously required BOTH ema_cross AND positive
+    # return slope, which kept confidence at 0 on most ticks. Now we let either
+    # condition emit a directional signal at moderate confidence; Claude (or
+    # the user's confidence floor) is the final arbiter.
+    if ema_fast > ema_slow and ret >= 0:
         side = "BUY"
-    elif ema_fast < ema_slow and ret < 0:
+    elif ema_fast < ema_slow and ret <= 0:
+        side = "SELL"
+    elif ema_fast > ema_slow:        # cross says up, return says down -> weak BUY
+        side = "BUY"
+    elif ema_fast < ema_slow:        # cross says down, return says up -> weak SELL
         side = "SELL"
     else:
-        return Signal("HOLD", 0.0, "no momentum alignment", "Momentum", indicators)
+        return Signal("HOLD", 0.15, "EMAs perfectly equal", "Momentum", indicators)
 
     # Confidence: blend of normalized EMA gap and lookback return,
     # squashed into 0..1 with a soft cap.
@@ -224,17 +231,45 @@ def evaluate_symbol(
     product_id: str,
     strategy_type: str,
     *,
-    granularity: int = 300,    # 5-minute bars by default
+    granularity: int | None = None,
     lookback_bars: int = 200,
+    tick_seconds: int | None = None,
 ) -> Signal:
     """
     Pull candles for `product_id` and compute the signal for `strategy_type`.
 
+    `granularity` defaults to a value that matches the bot's tick cadence:
+      - tick <=  10s  ->  60s bars   (high-frequency training)
+      - tick <=  60s  -> 300s bars   (default)
+      - tick >  60s   -> 900s bars
+    Passing the candle granularity in lock-step with the tick is what makes
+    a real-time training session actually produce fresh signals every tick
+    instead of replaying the same 5-minute bar 150 times in a row.
+
     Falls back to HOLD on empty candles or unsupported strategy.
     """
+    if granularity is None:
+        if tick_seconds is None or tick_seconds <= 0:
+            granularity = 300
+        elif tick_seconds <= 10:
+            granularity = 60
+        elif tick_seconds <= 60:
+            granularity = 300
+        else:
+            granularity = 900
+
     candles = get_candles(product_id, granularity=granularity, limit=lookback_bars)
-    if not candles:
-        return Signal("HOLD", 0.0, "no candle data", strategy_type or "Momentum")
+    if not candles or len(candles) < 30:
+        # Always include the price + bar count so Claude can still reason
+        # about a thinly-traded symbol instead of seeing "no indicators".
+        last_price = float(candles[-1]["close"]) if candles else 0.0
+        return Signal(
+            "HOLD",
+            0.0,
+            f"only {len(candles)} bars at {granularity}s — insufficient history",
+            strategy_type or "Momentum",
+            {"bars": len(candles), "granularity_s": granularity, "last_price": last_price},
+        )
 
     st = (strategy_type or "Momentum").strip()
     if st == "Momentum":

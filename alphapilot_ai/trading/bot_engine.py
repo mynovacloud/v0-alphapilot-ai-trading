@@ -239,9 +239,32 @@ class BotEngine:
             # synthetic snapshot. evaluate_symbol picks the strategy implementation
             # (Momentum / Mean Reversion / Volatility Breakout / Probability Edge)
             # and returns a Signal with confidence, reasoning, and indicators.
-            signal = evaluate_symbol(symbol, strategy_type)
+            # Granularity follows the tick rate so a 2s real-time session uses
+            # 60s bars instead of stale 5-minute data.
+            signal = evaluate_symbol(symbol, strategy_type, tick_seconds=cfg.tick_seconds)
             evaluated += 1
             result.decisions += 1
+
+            # Skip the LLM round-trip when we have nothing useful to ask about:
+            # no candles + zero technical confidence means Claude will just
+            # respond "no indicators provided, HOLD" and waste a paid API call.
+            # The very low confidence floor in aggressive mode is checked first
+            # so the user can still force-call Claude on weak signals.
+            if (
+                signal.side == "HOLD"
+                and float(signal.confidence or 0) <= 0.0
+                and not signal.indicators.get("ema_fast")
+                and cfg.min_confidence > 0.05
+            ):
+                # Still record the diagnostic so the user sees we evaluated it.
+                if best is None:
+                    best = {
+                        "symbol": symbol,
+                        "side": "HOLD",
+                        "confidence": 0.0,
+                        "reason": signal.reasoning,
+                    }
+                continue
 
             # Hand the technical signal to Claude for the FINAL decision.
             decision = claude_decide(

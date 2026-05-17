@@ -1005,7 +1005,17 @@ def training_session_start(
     min_conf = max(0.0, min(0.95, float(min_confidence or 0.55)))
     pos_usd = max(5.0, min(100_000.0, float(position_size_usd or 100.0)))
     max_open = max(1, min(50, int(max_open_per_wallet or 5)))
-    uni_limit = max(5, min(150, int(universe_limit or 40)))
+    # Universe floor: 10. Anything smaller and the bot's just looking at 5 random
+    # micro-cap tokens with thin candle history, which is why no signals fire.
+    uni_limit = max(10, min(150, int(universe_limit or 40)))
+
+    # The bot's kill switch is the #1 reason "nothing happens" during a session.
+    # Auto-release it when the user explicitly starts a training session — they
+    # are saying "go trade", and a stale kill switch from a prior daily-loss
+    # event would silently nullify everything else they configured.
+    from trading.risk_manager import RiskManager
+    if RiskManager.kill_switch_status():
+        RiskManager.set_kill_switch(False, reason="training session start")
 
     # Snapshot the values we're about to overwrite so Stop can restore.
     prev = {
@@ -1077,12 +1087,24 @@ def training_session_start(
     )
 
 
+@router.post("/training/session/release-kill-switch")
+def training_release_kill_switch() -> JSONResponse:
+    """Allow the Training Center to release the kill switch in one click,
+    instead of forcing the user to dig into Settings while a session is running."""
+    from trading.risk_manager import RiskManager
+    was_on = RiskManager.kill_switch_status()
+    if was_on:
+        RiskManager.set_kill_switch(False, reason="released from Training Center")
+    return JSONResponse({"ok": True, "was_engaged": was_on})
+
+
 @router.get("/training/session/config")
 def training_session_config() -> JSONResponse:
     """Read the bot knobs the Training Center cares about so the page can
     rehydrate its form state on load."""
     from config.bot_config import get as cfg_get
     from services.claude_client import is_configured as claude_is_configured
+    from trading.risk_manager import RiskManager
 
     return JSONResponse(
         {
@@ -1094,6 +1116,9 @@ def training_session_config() -> JSONResponse:
             "max_open_per_wallet": int(float(cfg_get("bot_max_open_per_wallet") or 5)),
             "universe_limit": int(float(cfg_get("bot_universe_limit") or 40)),
             "claude_configured": claude_is_configured(),
+            # Surfaced so the Training Center can warn / auto-release before the
+            # user wonders why their tick log is just "kill switch engaged" forever.
+            "kill_switch_engaged": RiskManager.kill_switch_status(),
         }
     )
 
