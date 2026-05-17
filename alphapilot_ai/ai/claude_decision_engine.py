@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -448,53 +449,29 @@ def _build_user_prompt(
         pass
 
     # =========================================================================
-    # NEW: Advanced Market Intelligence
+    # NEW: Advanced Market Intelligence (with CACHING to avoid API spam)
     # =========================================================================
     
-    # 1. Multi-Timeframe Analysis
-    mtf_context = None
-    try:
-        from trading.multi_timeframe import get_mtf_signal_boost
-        mtf_data = get_mtf_signal_boost(symbol)
-        if mtf_data and mtf_data.get("bias") != "UNKNOWN":
-            mtf_context = {
-                "overall_bias": mtf_data["bias"],
-                "alignment_score": round(mtf_data.get("alignment", 0), 2),
-                "entry_timing": mtf_data.get("entry_timing", "UNKNOWN"),
-                "confidence_boost": mtf_data.get("boost", 0),
-                "higher_tf_support": mtf_data.get("higher_tf_support", False),
-                "divergence_warning": mtf_data.get("divergence_warning", False),
-                "summary": mtf_data.get("summary", ""),
-                "timeframe_details": mtf_data.get("details", {}),
-            }
-    except Exception:
-        pass
+    # Use module-level cache for data that doesn't change per-symbol
+    global _cached_fear_greed, _cached_fg_time
+    global _cached_derivatives, _cached_deriv_time
     
-    # 2. Derivatives Intelligence (Funding Rates, Long/Short Ratios)
-    derivatives_context = None
-    try:
-        from connectors.coinglass import get_funding_signal
-        deriv_data = get_funding_signal(symbol)
-        if deriv_data:
-            derivatives_context = {
-                "overall_signal": deriv_data.get("overall_signal", "NEUTRAL"),
-                "confidence_adjustment": deriv_data.get("confidence_adjustment", 0),
-                "funding_rate_pct": deriv_data.get("funding_rate"),
-                "funding_sentiment": deriv_data.get("funding_sentiment"),
-                "long_ratio": deriv_data.get("long_ratio"),
-                "short_ratio": deriv_data.get("short_ratio"),
-                "long_short_sentiment": deriv_data.get("ls_sentiment"),
-                "warnings": deriv_data.get("warnings", []),
-                "summary": deriv_data.get("summary", ""),
-            }
-    except Exception:
-        pass
+    cache_ttl = 300  # 5 minutes cache for global market data
+    now_ts = time.time()
     
-    # 3. Fear & Greed Index (Market Sentiment)
+    # 1. Fear & Greed Index (GLOBAL - same for all symbols, cache it)
     fear_greed_context = None
     try:
-        from connectors.fear_greed import get_fear_greed_signal
-        fg_data = get_fear_greed_signal()
+        if '_cached_fear_greed' not in globals() or '_cached_fg_time' not in globals():
+            _cached_fear_greed = None
+            _cached_fg_time = 0
+        
+        if now_ts - _cached_fg_time > cache_ttl or _cached_fear_greed is None:
+            from connectors.fear_greed import get_fear_greed_signal
+            _cached_fear_greed = get_fear_greed_signal()
+            _cached_fg_time = now_ts
+        
+        fg_data = _cached_fear_greed
         if fg_data and fg_data.get("available"):
             fear_greed_context = {
                 "value": fg_data.get("value"),
@@ -502,90 +479,59 @@ def _build_user_prompt(
                 "sentiment": fg_data.get("sentiment"),
                 "signal": fg_data.get("signal"),
                 "confidence_adjustment": fg_data.get("confidence_adjustment", 0),
-                "trend": fg_data.get("trend"),
-                "yesterday": fg_data.get("yesterday"),
-                "last_week": fg_data.get("last_week"),
-                "interpretation": fg_data.get("interpretation", ""),
                 "summary": fg_data.get("summary", ""),
             }
     except Exception:
         pass
     
-    # 4. Market Regime Detection
-    market_regime_context = None
+    # 2. Derivatives Intelligence (per-symbol but with caching)
+    derivatives_context = None
     try:
-        from connectors.candles import get_candles
-        from trading.market_regime import detect_regime, get_regime_trading_rules
-        import numpy as np
+        if '_cached_derivatives' not in globals() or '_cached_deriv_time' not in globals():
+            _cached_derivatives = {}
+            _cached_deriv_time = {}
         
-        candle_data = get_candles(symbol, granularity=900, limit=100)
-        if candle_data and candle_data.get("candles") and len(candle_data["candles"]) >= 50:
-            candles = candle_data["candles"]
-            high = np.array([c["high"] for c in candles], dtype=float)
-            low = np.array([c["low"] for c in candles], dtype=float)
-            close = np.array([c["close"] for c in candles], dtype=float)
-            volume = np.array([c["volume"] for c in candles], dtype=float)
-            
-            regime = detect_regime(high, low, close, volume)
-            if regime:
-                rules = get_regime_trading_rules(regime.regime)
-                market_regime_context = {
-                    "regime": regime.regime.value,
-                    "confidence": round(regime.confidence, 2),
-                    "trend_direction": regime.trend_direction,
-                    "trend_strength": round(regime.trend_strength, 1),
-                    "volatility_percentile": round(regime.volatility_percentile, 1),
-                    "volatility_expanding": regime.is_expanding,
-                    "range_bound": regime.range_bound,
-                    "range_high": round(regime.range_high, 2),
-                    "range_low": round(regime.range_low, 2),
-                    "recommended_strategy": regime.recommended_strategy,
-                    "position_size_multiplier": regime.position_size_multiplier,
-                    "trading_rules": rules,
-                    "metrics": regime.metrics,
-                }
+        cache_key = symbol
+        if cache_key not in _cached_deriv_time or now_ts - _cached_deriv_time.get(cache_key, 0) > cache_ttl:
+            from connectors.coinglass import get_funding_signal
+            _cached_derivatives[cache_key] = get_funding_signal(symbol)
+            _cached_deriv_time[cache_key] = now_ts
+        
+        deriv_data = _cached_derivatives.get(cache_key)
+        if deriv_data:
+            derivatives_context = {
+                "overall_signal": deriv_data.get("overall_signal", "NEUTRAL"),
+                "confidence_adjustment": deriv_data.get("confidence_adjustment", 0),
+                "funding_rate_pct": deriv_data.get("funding_rate"),
+                "summary": deriv_data.get("summary", ""),
+            }
     except Exception:
         pass
     
-    # 5. Advanced Technical Indicators
-    advanced_indicators = None
-    try:
-        from connectors.candles import get_candles
-        from trading.indicators import compute_all_indicators
-        import numpy as np
-        
-        candle_data = get_candles(symbol, granularity=900, limit=250)
-        if candle_data and candle_data.get("candles") and len(candle_data["candles"]) >= 50:
-            candles = candle_data["candles"]
-            high = np.array([c["high"] for c in candles], dtype=float)
-            low = np.array([c["low"] for c in candles], dtype=float)
-            close = np.array([c["close"] for c in candles], dtype=float)
-            volume = np.array([c["volume"] for c in candles], dtype=float)
-            
-            suite = compute_all_indicators(high, low, close, volume)
-            if suite:
-                advanced_indicators = {
-                    "rsi_14": round(suite.rsi_14, 1),
-                    "macd_histogram": round(suite.macd_histogram, 6),
-                    "macd_signal_cross": "BULLISH" if suite.macd_line > suite.macd_signal else "BEARISH",
-                    "stoch_k": round(suite.stoch_k, 1) if suite.stoch_k else None,
-                    "stoch_d": round(suite.stoch_d, 1) if suite.stoch_d else None,
-                    "bollinger_percent_b": round(suite.bb_percent_b, 2),
-                    "bollinger_bandwidth": round(suite.bb_bandwidth, 4),
-                    "adx_trend_strength": round(suite.adx, 1),
-                    "plus_di": round(suite.plus_di, 1) if suite.plus_di else None,
-                    "minus_di": round(suite.minus_di, 1) if suite.minus_di else None,
-                    "relative_volume": round(suite.relative_volume, 2),
-                    "vwap": round(suite.vwap, 2),
-                    "atr_percent": round(suite.atr_pct, 2),
-                    "trend_direction": suite.trend_direction,
-                    "trend_strength": suite.trend_strength,
-                    "momentum_signal": suite.momentum_signal,
-                    "volatility_state": suite.volatility_state,
-                    "volume_confirmation": suite.volume_confirmation,
+    # 3. Multi-Timeframe Analysis - SKIP for now (too slow per-symbol)
+    # Only fetch MTF for high-confidence signals to save API calls
+    mtf_context = None
+    if float(technical_signal.confidence or 0) >= 0.50:
+        try:
+            from trading.multi_timeframe import get_mtf_signal_boost
+            mtf_data = get_mtf_signal_boost(symbol)
+            if mtf_data and mtf_data.get("bias") != "UNKNOWN":
+                mtf_context = {
+                    "overall_bias": mtf_data["bias"],
+                    "alignment_score": round(mtf_data.get("alignment", 0), 2),
+                    "confidence_boost": mtf_data.get("boost", 0),
+                    "summary": mtf_data.get("summary", ""),
                 }
-    except Exception:
-        pass
+        except Exception:
+            pass
+    
+    # 4. Market Regime - SKIP expensive per-symbol computation
+    # Use a simplified approach: just pass the technical indicators
+    market_regime_context = None
+    
+    # 5. Advanced Technical Indicators - SKIP (already in technical_signal)
+    # The strategy engine already computes these, don't double-fetch
+    advanced_indicators = None
     
     # Calculate aggregate confidence adjustment from all sources
     confidence_adjustments = []
