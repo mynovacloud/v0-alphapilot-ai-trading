@@ -91,7 +91,9 @@ class PaperTradingEngine:
 
         return {"ok": True, "trade_id": trade_id, "fees": fees, "slippage": slippage}
 
-    def close_trade(self, trade_id: int, exit_price: float) -> dict[str, Any]:
+    def close_trade(self, trade_id: int, exit_price: float, notes: str = "") -> dict[str, Any]:
+        """Close a paper trade and record the P&L."""
+        logger.info(f"[CLOSE_TRADE] Attempting to close trade {trade_id} at {exit_price}")
         with session_scope() as s:
             trade = s.get(PaperTrade, trade_id)
             if not trade:

@@ -65,6 +65,7 @@ class PositionMonitor:
             List of ExitSignal objects for positions that should be closed
         """
         exits: list[ExitSignal] = []
+        import logging
 
         with session_scope() as s:
             open_trades = (
@@ -73,11 +74,27 @@ class PositionMonitor:
                 .filter(PaperTrade.status == "open")
                 .all()
             )
+            
+            logging.info(f"[POSITION_MONITOR] Wallet {wallet_id}: {len(open_trades)} open trades, {len(price_map)} prices in map")
 
             for trade in open_trades:
                 current_price = price_map.get(trade.symbol)
                 if current_price is None:
-                    continue
+                    # Try to fetch price directly if not in map
+                    import logging
+                    logging.warning(f"[POSITION_MONITOR] No price for {trade.symbol} in map, fetching...")
+                    try:
+                        from connectors.live_prices import get_price
+                        price_result = get_price(trade.symbol)
+                        if price_result.get("ok"):
+                            current_price = float(price_result["price"])
+                            logging.info(f"[POSITION_MONITOR] Fetched {trade.symbol} price: ${current_price}")
+                        else:
+                            logging.warning(f"[POSITION_MONITOR] Failed to fetch {trade.symbol}: {price_result}")
+                            continue
+                    except Exception as e:
+                        logging.error(f"[POSITION_MONITOR] Error fetching {trade.symbol}: {e}")
+                        continue
 
                 exit_signal = self._check_single_position(s, trade, current_price)
                 if exit_signal:
@@ -117,14 +134,28 @@ class PositionMonitor:
         # =====================================================================
         # SCALPER MODE: Check micro-profit target (highest priority for profits)
         # =====================================================================
-        wallet = trade.wallet
-        trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
-        micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-        min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+        # Get wallet settings - use explicit query to ensure fresh data
+        from database.models import Wallet
+        wallet = session.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+        
+        # Default values if columns don't exist yet
+        trading_style = 'hybrid'
+        micro_target_usd = 0.25
+        min_profit_pct = 0.003
+        
+        if wallet:
+            trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
+            micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
+            min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+        
+        # Log for debugging
+        import logging
+        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl_usd=${pnl_usd:.4f}, target=${micro_target_usd}, style={trading_style}")
         
         if pnl_usd > 0:  # Only check if we're in profit
             # Scalper mode: take ANY profit that hits the USD target
             if trading_style == "scalper" and pnl_usd >= micro_target_usd:
+                logging.info(f"[SCALPER] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f} >= target=${micro_target_usd}")
                 self._log_exit(session, trade, "micro_profit", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
@@ -138,6 +169,7 @@ class PositionMonitor:
             # Hybrid mode: use both USD and percentage targets
             if trading_style == "hybrid":
                 if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
+                    logging.info(f"[HYBRID] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f}, pnl_pct={pnl_pct:.4%}")
                     self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
                     return ExitSignal(
                         trade_id=trade.id,
@@ -147,6 +179,9 @@ class PositionMonitor:
                         trigger_price=None,
                         pnl_pct=pnl_pct,
                     )
+            
+            # Swing mode: only use percentage-based targets (traditional SL/TP)
+            # Falls through to the standard SL/TP checks below
 
         # 1. Check max loss (hard cap)
         max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)
@@ -237,7 +272,9 @@ class PositionMonitor:
         # DEFAULT: If no time limit set, use 4 hours for paper trades (faster iteration)
         time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
         if trade.opened_at:
-            deadline = trade.opened_at + timedelta(hours=time_limit)
+            from utils.helpers import ensure_utc
+            opened_utc = ensure_utc(trade.opened_at)
+            deadline = opened_utc + timedelta(hours=time_limit)
             if utcnow() >= deadline and pnl_pct <= 0.005:  # Close if flat or losing after time limit
                 self._log_exit(session, trade, "time", current_price, pnl_pct)
                 return ExitSignal(
@@ -252,7 +289,8 @@ class PositionMonitor:
         # 6. Take small profits after some time has passed
         # This ensures we lock in gains instead of letting them evaporate
         if trade.opened_at and pnl_pct > 0:
-            age_minutes = (utcnow() - trade.opened_at).total_seconds() / 60
+            from utils.helpers import time_since_minutes
+            age_minutes = time_since_minutes(trade.opened_at)
             
             # After 30 mins: take 0.5%+ profit
             if age_minutes >= 30 and pnl_pct >= 0.005:
