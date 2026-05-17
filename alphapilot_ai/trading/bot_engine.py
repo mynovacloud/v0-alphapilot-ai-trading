@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai.ai_engine import AIEngine
+from ai.claude_decision_engine import decide as claude_decide
 from config.bot_config import BotConfig
 from connectors.live_prices import get_price
 from connectors.universe import coinbase_usd_universe
@@ -229,17 +230,31 @@ class BotEngine:
             signal = evaluate_symbol(symbol, strategy_type)
             result.decisions += 1
 
-            confidence = float(signal.confidence or 0.0)
-            side = signal.side or "HOLD"
+            # Hand the technical signal to Claude for the FINAL decision.
+            # claude_decide always returns a TradeDecision (never raises) and
+            # falls back to the technical signal if the LLM is misconfigured
+            # or unavailable, so the bot keeps trading no matter what.
+            decision = claude_decide(
+                wallet=wallet,
+                symbol=symbol,
+                price=price,
+                technical_signal=signal,
+                strategy_type=strategy_type,
+            )
 
-            if side == "HOLD" or confidence < cfg.min_confidence:
+            side = decision.action
+            confidence = float(decision.confidence or 0.0)
+
+            if side not in {"BUY", "SELL"} or confidence < cfg.min_confidence:
                 continue
 
-            # Sizing: convert USD position size to base qty.
-            position_usd = min(
+            # Sizing: Claude's size_multiplier scales the bot's default size,
+            # then we clamp to the wallet's hard cap.
+            base_position_usd = min(
                 cfg.position_size_usd,
                 wallet["max_position_usd"] or cfg.position_size_usd,
             )
+            position_usd = max(0.0, base_position_usd * float(decision.size_multiplier or 1.0))
             qty = round(position_usd / price, 6)
             if qty <= 0:
                 continue
@@ -249,8 +264,9 @@ class BotEngine:
                 self._log(
                     "bot",
                     (
-                        f"[DRY RUN] {wallet['name']}: would {side} {qty} {symbol} @ {price:.4f} "
-                        f"(conf={confidence:.2f}, strat={strategy_type}) — {signal.reasoning}"
+                        f"[DRY RUN] {wallet['name']}: {decision.source} would {side} {qty} "
+                        f"{symbol} @ {price:.4f} (conf={confidence:.2f}, sl={decision.stop_loss_pct:.2%}, "
+                        f"tp={decision.take_profit_pct:.2%}) — {decision.rationale[:200]}"
                     ),
                     wallet_id=wallet["id"],
                     level="info",
@@ -269,7 +285,9 @@ class BotEngine:
                 confidence=confidence,
                 market_type="Crypto",
                 strategy_id=strategy_id,
-                notes=f"bot/{strategy_type}: {signal.reasoning}",
+                notes=(
+                    f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
+                ),
             )
 
             if outcome.get("ok"):
@@ -279,7 +297,7 @@ class BotEngine:
                     from services.notifier import notify
                     notify(
                         f"Opened {side} {qty} {symbol} @ {price:.4f} "
-                        f"on {wallet['name']} (conf={confidence:.2f}, {strategy_type})",
+                        f"on {wallet['name']} (conf={confidence:.2f}, src={decision.source})",
                         level="info",
                         category="trade",
                     )

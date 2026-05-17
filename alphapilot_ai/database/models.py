@@ -326,3 +326,68 @@ class BacktestResult(Base):
     risk_score = Column(Float, default=0.0)
     recommendation = Column(String(40), default="moderate")
     created_at = Column(DateTime, default=utcnow)
+
+
+class ClaudeDecision(Base):
+    """
+    A single decision the Claude bot produced for one (wallet, symbol) candidate.
+
+    We persist EVERY decision (BUY/SELL/HOLD/CLOSE), not just the ones we acted
+    on. This gives us:
+      - a full audit trail of what the bot considered and why,
+      - the dataset the Training Center uses to show decision quality drift,
+      - the join key the reflection loop uses to correlate fills with reasoning.
+    """
+    __tablename__ = "claude_decisions"
+
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False, index=True)
+    symbol = Column(String(80), nullable=False, index=True)
+    price = Column(Float, default=0.0)
+
+    # The "raw" technical signal we asked Claude to interpret.
+    technical_side = Column(String(8), default="HOLD")
+    technical_confidence = Column(Float, default=0.0)
+
+    # Claude's (or fallback's) decision.
+    action = Column(String(8), default="HOLD")          # BUY / SELL / HOLD / CLOSE
+    confidence = Column(Float, default=0.0)
+    size_multiplier = Column(Float, default=1.0)
+    stop_loss_pct = Column(Float, default=0.05)
+    take_profit_pct = Column(Float, default=0.10)
+    rationale = Column(Text, default="")
+    key_factors = Column(Text, default="[]")            # JSON-serialized list[str]
+    risk_flags = Column(Text, default="[]")             # JSON-serialized list[str]
+
+    source = Column(String(20), default="technical")    # claude / technical / fallback
+    model = Column(String(80), default="")
+    prompt_used = Column(Text, default="")
+    raw_response = Column(Text, default="")
+
+    created_at = Column(DateTime, default=utcnow, index=True)
+
+
+class TradeReflection(Base):
+    """
+    Post-trade reflection produced by Claude after a paper trade closes.
+
+    Stores the verdict, a -1..1 score (process quality, not outcome), a short
+    summary, and the JSON snapshot of the original decision + trade payload
+    used as input. Lessons extracted from each reflection are also written to
+    AILearningMemory so they show up in future system prompts.
+    """
+    __tablename__ = "trade_reflections"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, ForeignKey("paper_trades.id"), nullable=False, index=True)
+
+    verdict = Column(String(40), default="neutral")  # good_call / bad_call / lucky / unlucky / neutral
+    score = Column(Float, default=0.0)               # -1.0 .. 1.0
+    summary = Column(Text, default="")
+
+    lessons_json = Column(Text, default="[]")
+    decision_json = Column(Text, default="")
+    trade_json = Column(Text, default="")
+    raw_response = Column(Text, default="")
+
+    created_at = Column(DateTime, default=utcnow, index=True)

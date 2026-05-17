@@ -46,6 +46,11 @@ REAL_AUTH_PLATFORMS: set[str] = {"Coinbase", "Coinbase Perp", "Binance", "Kraken
 # Platforms that support perpetual futures (leverage, shorts).
 PERP_PLATFORMS: set[str] = {"Coinbase Perp"}
 
+# Platforms VISIBLE in the UI for new-wallet creation. We keep all the
+# connector classes registered (so existing wallets keep working) but limit
+# what the user can create to the surfaces we actively support end-to-end.
+VISIBLE_PLATFORMS: list[str] = ["Coinbase", "Polymarket"]
+
 
 def get_connector(platform: str, **kwargs) -> BaseConnector:
     cls = CONNECTOR_REGISTRY.get(platform, CustomConnector)

@@ -31,7 +31,12 @@ from config.bot_config import BotConfig
 from config.settings import settings
 from connectors.live_prices import get_price as live_price
 from connectors.live_prices import known_symbols
-from connectors.registry import CONNECTOR_REGISTRY, REAL_AUTH_PLATFORMS, get_connector
+from connectors.registry import (
+    CONNECTOR_REGISTRY,
+    REAL_AUTH_PLATFORMS,
+    VISIBLE_PLATFORMS,
+    get_connector,
+)
 from database.db import reset_db, session_scope
 from database.models import (
     ActivityLog,
@@ -227,7 +232,7 @@ def add_wallet_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request=request, name="add_wallet.html", context=_ctx(
             request,
             active="wallets",
-            platforms=list(CONNECTOR_REGISTRY.keys()),
+            platforms=list(VISIBLE_PLATFORMS),
             real_auth_platforms=sorted(REAL_AUTH_PLATFORMS),
             risk_profiles=["Conservative", "Moderate", "Aggressive", "Degenerate"],
         ),
@@ -718,15 +723,25 @@ def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form
 
 @router.get("/training", response_class=HTMLResponse)
 def training_page(request: Request) -> HTMLResponse:
+    from ai.claude_learning import (
+        get_playbook_with_metadata,
+        readiness_score,
+        recent_decisions,
+        recent_reflections,
+    )
+    from services.claude_client import is_configured as claude_is_configured
     wallets = get_wallets()
     strategies = list_strategies()
-    lessons = _memory.list_lessons(limit=20)
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
             wallets=wallets,
             strategies=strategies,
-            lessons=lessons,
+            playbook=get_playbook_with_metadata(limit=100),
+            readiness=readiness_score(),
+            recent_decisions=recent_decisions(limit=20),
+            recent_reflections=recent_reflections(limit=15),
+            claude_configured=claude_is_configured(),
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
@@ -751,7 +766,6 @@ def training_run(
         num_trades=num_trades,
         starting_balance=starting_balance,
     )
-    # Build equity curve from decisions
     eq: list[float] = [result.starting_balance]
     for d in result.decisions:
         eq.append(d.get("balance", eq[-1]))
@@ -764,7 +778,46 @@ def training_run(
 
 @router.post("/training/memory/reset")
 def training_memory_reset() -> RedirectResponse:
+    from ai.claude_learning import reset_playbook
+    reset_playbook()
     _memory.reset()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/consolidate")
+def training_memory_consolidate() -> RedirectResponse:
+    from ai.claude_learning import consolidate_lessons
+    consolidate_lessons()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/delete/{rule_id}")
+def training_memory_delete(rule_id: int) -> RedirectResponse:
+    from database.models import AILearningMemory
+    with session_scope() as s:
+        row = s.get(AILearningMemory, rule_id)
+        if row:
+            s.delete(row)
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/add")
+def training_memory_add(
+    category: str = Form("rule"),
+    content: str = Form(...),
+    weight: float = Form(1.5),
+) -> RedirectResponse:
+    """Manually pin a rule to the playbook so Claude obeys it on every decision."""
+    from database.models import AILearningMemory
+    content = (content or "").strip()
+    if not content:
+        return RedirectResponse(url="/training", status_code=303)
+    with session_scope() as s:
+        s.add(AILearningMemory(
+            category=(category or "rule").strip()[:60] or "rule",
+            content=content[:2000],
+            weight=max(0.05, min(float(weight or 1.5), 5.0)),
+        ))
     return RedirectResponse(url="/training", status_code=303)
 
 

@@ -24,14 +24,9 @@
     <div class="field">
       <label>Platform</label>
       <select class="select" name="platform" id="platform-select" required>
-        <optgroup label="Real API support (read-only)">
-          {% for p in platforms if p in real_auth_platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
-        </optgroup>
-        <optgroup label="Coming soon (paper-only)">
-          {% for p in platforms if p not in real_auth_platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
-        </optgroup>
+        {% for p in platforms %}<option value="{{ p }}">{{ p }}</option>{% endfor %}
       </select>
-      <small>Real API support: <strong>Coinbase, Binance, Kraken</strong>. Other platforms are paper-only for now.</small>
+      <small>AlphaPilot is currently focused on <strong>Coinbase</strong> (spot crypto, real API) and <strong>Polymarket</strong> (prediction markets). More venues will unlock as the Claude bot graduates from paper trading.</small>
     </div>
     <div class="field">
       <label>Initial Paper Balance (USD)</label>
@@ -76,9 +71,8 @@
 
 <script>
   const helpText = {
-    "Coinbase": "Create an API key at <a href='https://www.coinbase.com/settings/api' target='_blank' rel='noopener'>coinbase.com/settings/api</a>. Use 'Advanced Trade' API. Permissions: View only.",
-    "Binance": "Create an API key at <a href='https://www.binance.com/en/my/settings/api-management' target='_blank' rel='noopener'>binance.com</a>. Permissions: Enable Reading only.",
-    "Kraken": "Create an API key at <a href='https://www.kraken.com/u/security/api' target='_blank' rel='noopener'>kraken.com/u/security/api</a>. Permissions: Query Funds + Query Open/Closed Orders only.",
+    "Coinbase": "Create an API key at <a href='https://www.coinbase.com/settings/api' target='_blank' rel='noopener'>coinbase.com/settings/api</a>. Use 'Advanced Trade' API. Recommended permissions: View + Trade (Trade is required only when you graduate to live trading).",
+    "Polymarket": "Polymarket uses a wallet/proxy address rather than a traditional API key. Paste your proxy address in the Account ID field. Paper trading on Polymarket markets works without any keys.",
   };
   const sel = document.getElementById('platform-select');
   const help = document.getElementById('platform-help');

@@ -1,21 +1,240 @@
 {% extends "base.html" %}
-{% block title %}AI Training Lab — {{ app_name }}{% endblock %}
-{% block topbar %}AI Training Lab{% endblock %}
+{% block title %}AI Training Center — {{ app_name }}{% endblock %}
+{% block topbar %}AI Training Center{% endblock %}
 {% block content %}
 
 <div class="page-head">
   <div>
-    <h1>AI Training Lab</h1>
-    <p>Run simulated training sessions. The AI makes decisions on mock market snapshots, learns from mistakes, and saves lessons it can apply to future sessions.</p>
+    <h1>AI Training Center</h1>
+    <p>This is where the Claude bot learns to trade. Every paper trade produces a reflection, every reflection updates the playbook, and every playbook rule shapes the next decision. The bot graduates to live trading only when its readiness score is high enough.</p>
   </div>
-  <form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe all stored AI lessons?')">
-    <button class="btn btn-danger" type="submit">Reset AI Memory</button>
-  </form>
+  <div class="flex gap-2">
+    <form method="post" action="/training/memory/consolidate">
+      <button class="btn" type="submit" {{ '' if claude_configured else 'disabled' }} title="Ask Claude to merge duplicate rules and re-rank weights">Consolidate Playbook</button>
+    </form>
+    <form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe ALL learned rules and lessons? This cannot be undone.')">
+      <button class="btn btn-danger" type="submit">Reset Memory</button>
+    </form>
+  </div>
 </div>
 
+{% if not claude_configured %}
+  <div class="banner banner-warn mb-4">
+    <strong>Claude is not configured.</strong> The bot will fall back to raw technical signals until you add an API key on the
+    <a href="/settings">Settings</a> page. Reflections, playbook generation, and consolidation are paused.
+  </div>
+{% endif %}
+
+<!-- ============================================================ -->
+<!-- READINESS SCORE                                                -->
+<!-- ============================================================ -->
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Live-Trading Readiness</div>
+    {% if readiness.score >= 75 %}
+      <span class="badge badge-good">Ready candidate</span>
+    {% elif readiness.score >= 50 %}
+      <span class="badge badge-warn">Maturing</span>
+    {% else %}
+      <span class="badge badge-bad">Keep paper trading</span>
+    {% endif %}
+  </div>
+
+  <div class="flex items-center gap-4" style="flex-wrap: wrap;">
+    {% set pct = readiness.score %}
+    {% set color = 'var(--good)' if pct >= 75 else ('var(--warn)' if pct >= 50 else 'var(--bad)') %}
+    <div style="position: relative; width: 160px; height: 160px;">
+      <svg viewBox="0 0 36 36" style="width: 100%; height: 100%; transform: rotate(-90deg);">
+        <circle cx="18" cy="18" r="15.9155" fill="none" stroke="var(--border)" stroke-width="2.5"></circle>
+        <circle cx="18" cy="18" r="15.9155" fill="none" stroke="{{ color }}"
+                stroke-width="2.5" stroke-linecap="round"
+                stroke-dasharray="{{ pct }} {{ 100 - pct }}"></circle>
+      </svg>
+      <div style="position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;">
+        <div style="font-size: 2rem; font-weight: 700;">{{ '%.0f' | format(pct) }}</div>
+        <div class="text-muted" style="font-size: 0.75rem;">/ 100</div>
+      </div>
+    </div>
+
+    <div class="flex flex-col gap-2" style="flex: 1; min-width: 280px;">
+      {% set comps = [
+        ('Sample size',     readiness.components.sample,  'Closed paper trades vs 250-trade target'),
+        ('Win rate',        readiness.components.win,     'Realized win rate vs 55% target'),
+        ('Process quality', readiness.components.process, 'Average reflection score on last 50 trades'),
+        ('Playbook depth',  readiness.components.rules,   'Learned rules vs 30-rule target'),
+        ('Configuration',   readiness.components.config,  'Claude API connectivity'),
+      ] %}
+      {% for label, val, hint in comps %}
+        <div>
+          <div class="flex justify-between" style="font-size: 0.78rem;">
+            <span>{{ label }}<span class="text-dim" style="margin-left: 0.4rem;">{{ hint }}</span></span>
+            <span class="mono">{{ '%.0f' | format(val * 100) }}%</span>
+          </div>
+          <div style="height: 6px; background: var(--bg-elev); border-radius: 3px; overflow: hidden;">
+            <div style="height: 100%; width: {{ val * 100 }}%; background: {{ color }};"></div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+
+    <div class="flex flex-col gap-2" style="min-width: 220px;">
+      <div class="flex justify-between"><span class="text-muted">Closed trades</span><span class="mono">{{ readiness.closed_trades }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Wins / Losses</span><span class="mono">{{ readiness.wins }} / {{ readiness.losses }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Win rate</span><span class="mono">{{ '%.1f' | format(readiness.win_rate * 100) }}%</span></div>
+      <div class="flex justify-between"><span class="text-muted">Active rules</span><span class="mono">{{ readiness.rules }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Reflections</span><span class="mono">{{ readiness.reflections }}</span></div>
+      <div class="flex justify-between"><span class="text-muted">Avg process score</span><span class="mono">{{ '%.2f' | format(readiness.avg_reflection_score) }}</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- PLAYBOOK EDITOR                                                -->
+<!-- ============================================================ -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
-    <div class="card-header"><div class="card-title">Configure Session</div></div>
+    <div class="card-header">
+      <div class="card-title">Learned Playbook</div>
+      <span class="badge">{{ playbook|length }} rules</span>
+    </div>
+    <p class="text-muted mb-3" style="font-size: 0.82rem;">
+      These rules are injected into Claude's system prompt on every trading decision.
+      Higher weights mean Claude treats them as harder constraints. Rules are auto-generated
+      from post-trade reflections; you can also pin manual rules below.
+    </p>
+
+    <div class="flex flex-col gap-2" style="max-height: 460px; overflow-y: auto;">
+      {% for rule in playbook %}
+        <div style="padding: 0.65rem 0.75rem; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+          <div class="flex justify-between items-center mb-1">
+            <div class="flex gap-2 items-center">
+              <span class="badge {{ 'badge-good' if rule.category == 'rule' else ('badge-bad' if rule.category == 'mistake' else 'badge-info') }}">{{ rule.category }}</span>
+              <span class="text-dim mono" style="font-size: 0.72rem;">w {{ '%.2f' | format(rule.weight) }}</span>
+            </div>
+            <form method="post" action="/training/memory/delete/{{ rule.id }}" onsubmit="return confirm('Remove this rule?');">
+              <button class="btn btn-sm btn-danger" type="submit" title="Remove rule">×</button>
+            </form>
+          </div>
+          <div style="font-size: 0.85rem; line-height: 1.45;">{{ rule.content }}</div>
+        </div>
+      {% else %}
+        <div class="empty">No rules yet. Run paper trades — Claude will write its own rules from reflections.</div>
+      {% endfor %}
+    </div>
+
+    <hr style="margin: 1rem 0; border-color: var(--border);">
+
+    <h4 style="font-size: 0.85rem; margin-bottom: 0.5rem;">Pin a manual rule</h4>
+    <form method="post" action="/training/memory/add" class="flex flex-col gap-2">
+      <textarea class="input" name="content" rows="2" required
+                placeholder="e.g. Never enter a long when ATR > 5% of price; volatility regime is too hostile."></textarea>
+      <div class="flex gap-2">
+        <select class="select" name="category" style="flex: 0 0 140px;">
+          <option value="rule">rule</option>
+          <option value="lesson">lesson</option>
+          <option value="mistake">mistake</option>
+        </select>
+        <input class="input" name="weight" type="number" step="0.1" min="0.1" max="5.0" value="2.0"
+               style="flex: 0 0 100px;" title="Weight (0.1–5.0)">
+        <button class="btn btn-primary" type="submit" style="flex: 1;">Pin Rule</button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-title">Recent Reflections</div>
+      <span class="badge badge-info">post-trade</span>
+    </div>
+    <p class="text-muted mb-2" style="font-size: 0.8rem;">
+      After every paper trade closes, Claude writes a postmortem and converts it into rules.
+    </p>
+
+    <div class="flex flex-col gap-2" style="max-height: 540px; overflow-y: auto;">
+      {% for r in recent_reflections %}
+        {% set verdict_class = 'badge-good' if r.verdict in ['good_call'] else ('badge-bad' if r.verdict in ['bad_call'] else ('badge-warn' if r.verdict in ['lucky', 'unlucky'] else 'badge-info')) %}
+        <div style="padding: 0.6rem; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border);">
+          <div class="flex justify-between items-center mb-1">
+            <div class="flex gap-2 items-center">
+              <span class="badge {{ verdict_class }}">{{ r.verdict }}</span>
+              <span class="text-dim mono" style="font-size: 0.72rem;">trade #{{ r.trade_id }}</span>
+            </div>
+            <span class="mono" style="font-size: 0.72rem; color: {{ 'var(--good)' if r.score > 0 else ('var(--bad)' if r.score < 0 else 'var(--text-muted)') }};">
+              {{ '%+.2f' | format(r.score) }}
+            </span>
+          </div>
+          <div style="font-size: 0.82rem; line-height: 1.45;">{{ r.summary }}</div>
+        </div>
+      {% else %}
+        <div class="empty">No reflections yet. Once trades close, you'll see Claude's postmortems here.</div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- DECISION LOG                                                   -->
+<!-- ============================================================ -->
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Recent Decisions</div>
+    <span class="badge badge-info">audit trail</span>
+  </div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem;">
+    Every candidate Claude evaluated, including HOLDs. Compare Claude's action against the raw technical signal to spot drift.
+  </p>
+
+  <div style="overflow-x: auto;">
+    <table class="table" style="width: 100%; font-size: 0.82rem;">
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Symbol</th>
+          <th>Tech</th>
+          <th>Claude</th>
+          <th>Conf</th>
+          <th>Size</th>
+          <th>SL / TP</th>
+          <th>Source</th>
+          <th>Rationale</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in recent_decisions %}
+          <tr>
+            <td class="mono text-dim" style="font-size: 0.72rem;">{{ d.created_at[5:16] if d.created_at else '' }}</td>
+            <td class="mono">{{ d.symbol }}</td>
+            <td>
+              <span class="badge {{ 'badge-good' if d.technical_side == 'BUY' else ('badge-bad' if d.technical_side == 'SELL' else 'badge-info') }}">{{ d.technical_side }}</span>
+              <span class="text-dim mono" style="font-size: 0.7rem;">{{ '%.2f' | format(d.technical_confidence) }}</span>
+            </td>
+            <td>
+              <span class="badge {{ 'badge-good' if d.action == 'BUY' else ('badge-bad' if d.action == 'SELL' else ('badge-warn' if d.action == 'CLOSE' else 'badge-info')) }}">{{ d.action }}</span>
+            </td>
+            <td class="mono">{{ '%.2f' | format(d.confidence) }}</td>
+            <td class="mono">{{ '%.2f' | format(d.size_multiplier) }}x</td>
+            <td class="mono text-dim" style="font-size: 0.72rem;">{{ '%.1f' | format(d.stop_loss_pct * 100) }}% / {{ '%.1f' | format(d.take_profit_pct * 100) }}%</td>
+            <td><span class="badge {{ 'badge-good' if d.source == 'claude' else 'badge-warn' }}">{{ d.source }}</span></td>
+            <td title="{{ d.rationale }}" style="max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">{{ d.rationale }}</td>
+          </tr>
+        {% else %}
+          <tr><td colspan="9" class="empty">No decisions yet. Start the bot from the Dashboard or run a tick.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- SYNTHETIC TRAINING SESSION                                     -->
+<!-- ============================================================ -->
+<div class="grid grid-2-1 mb-4">
+  <div class="card">
+    <div class="card-header"><div class="card-title">Synthetic Training Session</div></div>
+    <p class="text-muted mb-3" style="font-size: 0.82rem;">
+      Run a fast offline simulation against synthetic snapshots to bootstrap the playbook before unleashing the bot on live data.
+      Great for stress-testing risk profiles and seeing how Claude handles edge cases.
+    </p>
     <form hx-post="/training/run" hx-target="#training-result" hx-swap="innerHTML" hx-indicator="#train-spinner" class="grid grid-2">
       <div class="field"><label>Wallet (optional)</label>
         <select class="select" name="wallet_id"><option value="">— None —</option>{% for w in wallets %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
@@ -39,20 +258,15 @@
   </div>
 
   <div class="card">
-    <div class="card-header"><div class="card-title">Stored Lessons</div><span class="badge">{{ lessons|length }}</span></div>
-    <div class="flex flex-col gap-2" style="max-height: 380px; overflow-y: auto;">
-      {% for l in lessons %}
-        <div style="padding: 0.5rem 0.6rem; background: var(--bg-elev); border-radius: var(--radius-sm); border: 1px solid var(--border); font-size: 0.8rem;">
-          <div class="flex justify-between mb-1">
-            <span class="badge badge-info">{{ l.category }}</span>
-            <span class="text-dim" style="font-size: 0.7rem;">w {{ '%.1f' | format(l.weight) }}</span>
-          </div>
-          <div>{{ l.content }}</div>
-        </div>
-      {% else %}
-        <div class="empty">No lessons yet. Run a training session to generate some.</div>
-      {% endfor %}
-    </div>
+    <div class="card-header"><div class="card-title">How the bot learns</div></div>
+    <ol style="font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; color: var(--text-muted);">
+      <li><strong style="color: var(--text);">Decide.</strong> The technical engine produces a signal; Claude reviews it with the full playbook and recent history before choosing an action.</li>
+      <li><strong style="color: var(--text);">Act.</strong> The trade is opened in paper mode through the existing risk manager. All caps still apply.</li>
+      <li><strong style="color: var(--text);">Reflect.</strong> When the trade closes, Claude writes a verdict (good_call / bad_call / lucky / unlucky / neutral) and a -1..1 process-quality score.</li>
+      <li><strong style="color: var(--text);">Remember.</strong> Up to 3 generalizable lessons per reflection are added to the playbook with weights.</li>
+      <li><strong style="color: var(--text);">Consolidate.</strong> Periodically the playbook is compressed: duplicates merged, contradictions resolved, weights re-ranked.</li>
+      <li><strong style="color: var(--text);">Graduate.</strong> Once the readiness score crosses 75 with a healthy sample size and win rate, you can flip a wallet to <span class="mono">live_shadow</span> and finally to <span class="mono">live</span>.</li>
+    </ol>
   </div>
 </div>
 
