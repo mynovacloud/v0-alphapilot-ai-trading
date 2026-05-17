@@ -612,45 +612,50 @@ class BotEngine:
             wallet_ids = [w[0] for w in wallet_ids]
 
         closed_count = 0
-        self._log("bot", f"[MONITOR] Checking {len(wallet_ids)} wallets, {len(price_map)} prices available", level="debug")
+        self._log("bot", f"[MONITOR] Checking {len(wallet_ids)} wallets, {len(price_map)} prices: {list(price_map.keys())[:10]}...", level="info")
         for wallet_id in wallet_ids:
-            exits = self.position_monitor.check_all_positions(wallet_id, price_map)
-            self._log("bot", f"[MONITOR] Wallet {wallet_id}: {len(exits)} exit signals", level="debug")
-            for exit_signal in exits:
-                # Close the position through the paper engine
-                outcome = self.paper.close_trade(
-                    trade_id=exit_signal.trade_id,
-                    exit_price=exit_signal.current_price,
-                    notes=f"auto-exit/{exit_signal.reason}: triggered at ${exit_signal.current_price:.4f}",
-                )
-                if outcome.get("ok"):
-                    closed_count += 1
-                    result.actions += 1
-                    # Update the exit_reason on the trade record
-                    with session_scope() as s:
-                        trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()
-                        if trade:
-                            trade.exit_reason = exit_signal.reason
-                    # Log it
-                    self._log(
-                        "bot",
-                        f"AUTO-EXIT ({exit_signal.reason}): {exit_signal.symbol} "
-                        f"closed at ${exit_signal.current_price:.4f} "
-                        f"(P&L: {exit_signal.pnl_pct:+.2%})",
-                        level="info",
+            try:
+                exits = self.position_monitor.check_all_positions(wallet_id, price_map)
+                self._log("bot", f"[MONITOR] Wallet {wallet_id}: {len(exits)} exit signals", level="info")
+                for exit_signal in exits:
+                    self._log("bot", f"[MONITOR] Processing exit: {exit_signal.symbol} reason={exit_signal.reason}", level="info")
+                    # Close the position through the paper engine
+                    outcome = self.paper.close_trade(
+                        trade_id=exit_signal.trade_id,
+                        exit_price=exit_signal.current_price,
+                        notes=f"auto-exit/{exit_signal.reason}: triggered at ${exit_signal.current_price:.4f}",
                     )
-                    # Notify
-                    try:
-                        from services.notifier import notify
-                        notify(
-                            f"Auto-exit ({exit_signal.reason}): {exit_signal.symbol} "
+                    self._log("bot", f"[MONITOR] close_trade result: {outcome}", level="info")
+                    if outcome.get("ok"):
+                        closed_count += 1
+                        result.actions += 1
+                        # Update the exit_reason on the trade record
+                        with session_scope() as s:
+                            trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()
+                            if trade:
+                                trade.exit_reason = exit_signal.reason
+                        # Log it
+                        self._log(
+                            "bot",
+                            f"AUTO-EXIT ({exit_signal.reason}): {exit_signal.symbol} "
                             f"closed at ${exit_signal.current_price:.4f} "
                             f"(P&L: {exit_signal.pnl_pct:+.2%})",
                             level="info",
-                            category="auto_exit",
                         )
-                    except Exception:
-                        pass
+                        # Notify
+                        try:
+                            from services.notifier import notify
+                            notify(
+                                f"Auto-exit ({exit_signal.reason}): {exit_signal.symbol} "
+                                f"closed at ${exit_signal.current_price:.4f} "
+                                f"(P&L: {exit_signal.pnl_pct:+.2%})",
+                                level="info",
+                                category="auto_exit",
+                            )
+                        except Exception:
+                            pass
+            except Exception as e:
+                self._log("bot", f"[MONITOR] Error processing wallet {wallet_id}: {e}", level="error")
 
         return closed_count
 

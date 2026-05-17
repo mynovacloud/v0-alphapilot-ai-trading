@@ -65,6 +65,7 @@ class PositionMonitor:
             List of ExitSignal objects for positions that should be closed
         """
         exits: list[ExitSignal] = []
+        import logging
 
         with session_scope() as s:
             open_trades = (
@@ -73,11 +74,27 @@ class PositionMonitor:
                 .filter(PaperTrade.status == "open")
                 .all()
             )
+            
+            logging.info(f"[POSITION_MONITOR] Wallet {wallet_id}: {len(open_trades)} open trades, {len(price_map)} prices in map")
 
             for trade in open_trades:
                 current_price = price_map.get(trade.symbol)
                 if current_price is None:
-                    continue
+                    # Try to fetch price directly if not in map
+                    import logging
+                    logging.warning(f"[POSITION_MONITOR] No price for {trade.symbol} in map, fetching...")
+                    try:
+                        from connectors.live_prices import get_price
+                        price_result = get_price(trade.symbol)
+                        if price_result.get("ok"):
+                            current_price = float(price_result["price"])
+                            logging.info(f"[POSITION_MONITOR] Fetched {trade.symbol} price: ${current_price}")
+                        else:
+                            logging.warning(f"[POSITION_MONITOR] Failed to fetch {trade.symbol}: {price_result}")
+                            continue
+                    except Exception as e:
+                        logging.error(f"[POSITION_MONITOR] Error fetching {trade.symbol}: {e}")
+                        continue
 
                 exit_signal = self._check_single_position(s, trade, current_price)
                 if exit_signal:

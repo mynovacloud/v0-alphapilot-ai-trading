@@ -2138,61 +2138,81 @@ def api_take_all_profits() -> JSONResponse:
     Close only PROFITABLE positions - lock in gains immediately.
     Perfect for scalping: take your wins, let losers run to stop-loss.
     """
+    import logging
     from connectors.live_prices import get_price
     from trading.paper_trading_engine import PaperTradingEngine
 
     engine = PaperTradingEngine()
     closed = 0
     skipped = 0
+    errors = []
     total_pnl = 0.0
 
-    with session_scope() as s:
-        open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-        trade_info = [(t.id, t.symbol, t.side, float(t.entry_price), float(t.qty)) for t in open_trades]
-
-    for trade_id, symbol, side, entry_price, qty in trade_info:
-        p = get_price(symbol)
-        if not p.get("ok"):
-            skipped += 1
-            continue
+    try:
+        with session_scope() as s:
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+            trade_info = [(t.id, t.symbol, t.side, float(t.entry_price), float(t.qty)) for t in open_trades]
         
-        current_price = float(p["price"])
-        
-        # Calculate P&L
-        if side.upper() == "BUY":
-            pnl = (current_price - entry_price) * qty
-        else:
-            pnl = (entry_price - current_price) * qty
-        
-        # Only close if profitable
-        if pnl <= 0:
-            skipped += 1
-            continue
+        logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
 
-        result = engine.close_trade(trade_id, current_price, notes="take-profits via API")
-        if result.get("ok"):
-            closed += 1
-            total_pnl += float(result.get("pnl", 0))
-            with session_scope() as s:
-                trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                if trade:
-                    trade.exit_reason = "take_profit_manual"
-        else:
-            skipped += 1
+        for trade_id, symbol, side, entry_price, qty in trade_info:
+            try:
+                p = get_price(symbol)
+                if not p.get("ok"):
+                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}")
+                    skipped += 1
+                    continue
+                
+                current_price = float(p["price"])
+                
+                # Calculate P&L
+                if side.upper() == "BUY":
+                    pnl = (current_price - entry_price) * qty
+                else:
+                    pnl = (entry_price - current_price) * qty
+                
+                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}")
+                
+                # Only close if profitable
+                if pnl <= 0:
+                    skipped += 1
+                    continue
 
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="positions",
-                level="info",
-                message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+                result = engine.close_trade(trade_id, current_price, notes="take-profits via API")
+                logging.info(f"[TAKE_PROFITS] close_trade result for {symbol}: {result}")
+                
+                if result.get("ok"):
+                    closed += 1
+                    total_pnl += float(result.get("pnl", 0))
+                    with session_scope() as s:
+                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                        if trade:
+                            trade.exit_reason = "take_profit_manual"
+                else:
+                    errors.append(f"{symbol}: {result.get('reason', 'unknown')}")
+                    skipped += 1
+            except Exception as e:
+                logging.error(f"[TAKE_PROFITS] Error processing {symbol}: {e}")
+                errors.append(f"{symbol}: {str(e)}")
+                skipped += 1
+
+        with session_scope() as s:
+            s.add(
+                ActivityLog(
+                    category="positions",
+                    level="info",
+                    message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+                )
             )
-        )
+    except Exception as e:
+        logging.exception("[TAKE_PROFITS] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
     return JSONResponse({
         "ok": True,
         "closed": closed,
         "skipped": skipped,
+        "errors": errors,
         "total_pnl": round(total_pnl, 2),
     })
 
