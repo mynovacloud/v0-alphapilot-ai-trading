@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Type
 
 from connectors.base_connector import BaseConnector
+from connectors.coinbase_perp_connector import CoinbasePerpConnector
 from connectors.crypto_connectors import (
     BinanceConnector,
     CoinbaseConnector,
@@ -23,6 +24,7 @@ from connectors.polymarket_connector import PolymarketConnector
 
 CONNECTOR_REGISTRY: dict[str, Type[BaseConnector]] = {
     "Coinbase": CoinbaseConnector,
+    "Coinbase Perp": CoinbasePerpConnector,
     "Binance": BinanceConnector,
     "Kraken": KrakenConnector,
     "Crypto.com": CryptocomConnector,
@@ -39,7 +41,15 @@ CONNECTOR_REGISTRY: dict[str, Type[BaseConnector]] = {
 # Platforms with REAL authenticated read-only API support today.
 # When the user adds a wallet on one of these and provides API keys, we
 # actually validate the keys and can pull live balances.
-REAL_AUTH_PLATFORMS: set[str] = {"Coinbase", "Binance", "Kraken"}
+REAL_AUTH_PLATFORMS: set[str] = {"Coinbase", "Coinbase Perp", "Binance", "Kraken"}
+
+# Platforms that support perpetual futures (leverage, shorts).
+PERP_PLATFORMS: set[str] = {"Coinbase Perp"}
+
+# Platforms VISIBLE in the UI for new-wallet creation. We keep all the
+# connector classes registered (so existing wallets keep working) but limit
+# what the user can create to the surfaces we actively support end-to-end.
+VISIBLE_PLATFORMS: list[str] = ["Coinbase", "Polymarket"]
 
 
 def get_connector(platform: str, **kwargs) -> BaseConnector:

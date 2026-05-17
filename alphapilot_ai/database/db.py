@@ -27,12 +27,61 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, futu
 
 
 def init_db() -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, then run lightweight column migrations."""
     from database import models  # noqa: F401  (registers models on Base)
     from database.models import Base
 
     logger.info("Initializing database at %s", settings.database_url)
     Base.metadata.create_all(bind=engine)
+    _migrate_schema()
+
+
+def _migrate_schema() -> None:
+    """
+    SQLite-friendly forward-only schema migration.
+
+    `create_all` only creates missing tables — it never alters existing ones.
+    When we add a new column to a model we have to ALTER manually here.
+    Idempotent: safe to call on every startup.
+    """
+    from sqlalchemy import inspect, text
+
+    desired = {
+        "wallets": [
+            ("trading_mode", "VARCHAR(20) DEFAULT 'paper'"),
+            ("bot_paused", "BOOLEAN DEFAULT 0"),
+            ("max_position_usd", "FLOAT DEFAULT 500.0"),
+            ("max_open_positions", "INTEGER DEFAULT 3"),
+            ("max_daily_loss_usd", "FLOAT DEFAULT 200.0"),
+            ("max_daily_trades", "INTEGER DEFAULT 10"),
+            ("futures_enabled", "BOOLEAN DEFAULT 0"),
+            ("max_leverage", "FLOAT DEFAULT 1.0"),
+            ("default_leverage", "FLOAT DEFAULT 1.0"),
+            ("margin_mode", "VARCHAR(20) DEFAULT 'isolated'"),
+            ("liquidation_buffer_pct", "FLOAT DEFAULT 0.10"),
+        ],
+        "paper_trades": [
+            ("is_perp", "BOOLEAN DEFAULT 0"),
+            ("leverage", "FLOAT DEFAULT 1.0"),
+            ("margin_used", "FLOAT DEFAULT 0.0"),
+            ("liquidation_price", "FLOAT"),
+            ("funding_paid", "FLOAT DEFAULT 0.0"),
+        ],
+    }
+
+    insp = inspect(engine)
+    with engine.begin() as conn:
+        for table, cols in desired.items():
+            if not insp.has_table(table):
+                continue
+            existing = {c["name"] for c in insp.get_columns(table)}
+            for name, ddl in cols:
+                if name not in existing:
+                    try:
+                        conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}'))
+                        logger.info("Migrated: added %s.%s", table, name)
+                    except Exception as e:
+                        logger.warning("Could not add %s.%s: %s", table, name, e)
 
 
 def reset_db() -> None:

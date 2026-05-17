@@ -6,7 +6,384 @@
 <div class="page-head">
   <div>
     <h1>Settings</h1>
-    <p>Application preferences and runtime status. Live trading is locked at the environment level for safety.</p>
+    <p>Application preferences, autonomous bot configuration, and runtime status.</p>
+  </div>
+</div>
+
+<div class="card mb-4" style="border: 1px solid var(--border);">
+  <div class="card-header">
+    <div class="card-title">Risk &amp; Emergency Controls</div>
+    <div class="flex gap-2 items-center">
+      {% if kill_switch %}
+        <span class="badge badge-bad badge-dot">KILL SWITCH ENGAGED</span>
+      {% else %}
+        <span class="badge badge-good badge-dot">Kill switch off</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-muted mb-3">
+    The kill switch is a global, instant halt. While engaged, every paper and live
+    order is rejected by the risk manager and the bot tick short-circuits before
+    touching the network. Use it any time something feels off.
+  </p>
+
+  <div class="flex gap-2 items-center" style="flex-wrap: wrap;">
+    {% if kill_switch %}
+      <form method="post" action="/settings/risk/kill-switch">
+        <input type="hidden" name="action" value="release">
+        <button class="btn btn-primary" type="submit">Release Kill Switch</button>
+      </form>
+    {% else %}
+      <form method="post" action="/settings/risk/kill-switch"
+            onsubmit="return confirm('Engage the global kill switch? This halts ALL trading immediately.');">
+        <input type="hidden" name="action" value="engage">
+        <button class="btn btn-danger" type="submit">Engage Kill Switch</button>
+      </form>
+    {% endif %}
+
+    {% if paused_wallets %}
+      <form method="post" action="/settings/risk/unpause-all"
+            onsubmit="return confirm('Unpause all wallets? They were auto-paused for hitting risk caps.');">
+        <button class="btn" type="submit">Unpause All Wallets ({{ paused_wallets|length }})</button>
+      </form>
+    {% endif %}
+  </div>
+
+  {% if paused_wallets %}
+  <div class="banner banner-warn mt-3">
+    <strong>Auto-paused wallets:</strong>
+    {{ paused_wallets | map(attribute='name') | join(', ') }} —
+    these wallets hit a risk cap (typically the daily-loss circuit breaker) and the
+    bot will not touch them again until you unpause.
+  </div>
+  {% endif %}
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Autonomous Trading Bot</div>
+    <div class="flex gap-2 items-center">
+      {% if bot_status.scheduler_running %}
+        <span class="badge badge-good badge-dot">Scheduler running</span>
+      {% else %}
+        <span class="badge badge-bad badge-dot">Scheduler stopped</span>
+      {% endif %}
+      {% if bot_cfg.bot_enabled %}
+        <span class="badge badge-good">Bot: ON</span>
+      {% else %}
+        <span class="badge badge-warn">Bot: OFF</span>
+      {% endif %}
+      {% if bot_cfg.dry_run %}
+        <span class="badge badge-warn">Dry run</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <p class="text-muted mb-3">
+    The bot wakes up on a configurable interval, walks the selected symbol universe,
+    asks the AI engine for a decision per symbol, and (when confidence is high enough)
+    routes a trade through the paper-trading engine. All wallet caps and the risk manager
+    still apply. Live trading remains gated by <span class="mono">LIVE_TRADING_ENABLED</span>.
+  </p>
+
+  <form method="post" action="/settings/bot/save" class="form-grid">
+    <div class="field">
+      <label>Bot Enabled</label>
+      <select class="select" name="bot_enabled">
+        <option value="true"  {{ 'selected' if bot_cfg.bot_enabled else '' }}>On — run on schedule</option>
+        <option value="false" {{ '' if bot_cfg.bot_enabled else 'selected' }}>Off — paused</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Wake-up Interval (seconds)</label>
+      <input class="input" type="number" name="bot_tick_seconds" min="5" step="5" value="{{ bot_cfg.tick_seconds }}">
+      <small class="text-muted">How often the bot re-evaluates the market. Minimum 5s.</small>
+    </div>
+    <div class="field">
+      <label>Symbol Universe</label>
+      <select class="select" name="bot_universe">
+        <option value="coinbase_usd" {{ 'selected' if bot_cfg.universe == 'coinbase_usd' else '' }}>All Coinbase USD pairs</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Max Symbols Per Tick</label>
+      <input class="input" type="number" name="bot_universe_limit" min="1" max="500" value="{{ bot_cfg.universe_limit }}">
+      <small class="text-muted">Caps how many symbols the bot scores in a single tick. Larger = slower ticks.</small>
+    </div>
+    <div class="field">
+      <label>Minimum AI Confidence</label>
+      <input class="input" type="number" name="bot_min_confidence" min="0" max="1" step="0.01" value="{{ '%.2f' % bot_cfg.min_confidence }}">
+      <small class="text-muted">0.0–1.0. Lower = more trades, higher = pickier.</small>
+    </div>
+    <div class="field">
+      <label>Default Strategy Type</label>
+      <select class="select" name="bot_default_strategy_type">
+        {% for st in ['Momentum', 'Mean Reversion', 'Probability Edge', 'Volatility Breakout'] %}
+          <option value="{{ st }}" {{ 'selected' if bot_cfg.default_strategy_type == st else '' }}>{{ st }}</option>
+        {% endfor %}
+      </select>
+      <small class="text-muted">Used when a wallet has no strategy assigned.</small>
+    </div>
+    <div class="field">
+      <label>Position Size (USD)</label>
+      <input class="input" type="number" name="bot_position_size_usd" min="1" step="1" value="{{ '%.2f' % bot_cfg.position_size_usd }}">
+      <small class="text-muted">Per-trade notional. Capped by wallet's max_position_usd.</small>
+    </div>
+    <div class="field">
+      <label>Max Open Positions / Wallet</label>
+      <input class="input" type="number" name="bot_max_open_per_wallet" min="1" max="50" value="{{ bot_cfg.max_open_per_wallet }}">
+    </div>
+    <div class="field">
+      <label>Mode</label>
+      <select class="select" name="bot_dry_run">
+        <option value="true"  {{ 'selected' if bot_cfg.dry_run else '' }}>Dry run — log decisions only</option>
+        <option value="false" {{ '' if bot_cfg.dry_run else 'selected' }}>Live paper — actually open trades</option>
+      </select>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Bot Settings</button>
+    </div>
+  </form>
+
+  <div class="flex gap-2 items-center mt-3" style="flex-wrap: wrap;">
+    <form method="post" action="/settings/bot/tick-now">
+      <button class="btn" type="submit">Run a tick now</button>
+    </form>
+    <form method="post" action="/settings/bot/reconcile-now">
+      <button class="btn" type="submit">Reconcile orders now</button>
+    </form>
+    <span class="text-muted" style="font-size: 0.86rem;">
+      Next scheduled tick: <span class="mono">{{ bot_status.next_tick or '—' }}</span>
+    </span>
+  </div>
+
+  {% if recent_ticks %}
+  <div class="mt-4">
+    <div class="card-title" style="font-size: 0.95rem;">Recent ticks</div>
+    <div class="table-wrap mt-2">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Started</th>
+            <th class="num">Universe</th>
+            <th class="num">Wallets</th>
+            <th class="num">Decisions</th>
+            <th class="num">Actions</th>
+            <th class="num">Skipped</th>
+            <th class="num">Errors</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for t in recent_ticks %}
+          <tr>
+            <td class="mono" style="font-size: 0.78rem;">{{ t.started_at }}</td>
+            <td class="num">{{ t.universe_size }}</td>
+            <td class="num">{{ t.wallets_evaluated }}</td>
+            <td class="num">{{ t.decisions }}</td>
+            <td class="num">{{ t.actions }}</td>
+            <td class="num">{{ t.skipped }}</td>
+            <td class="num">{{ t.errors }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if recent_recons %}
+  <div class="mt-4">
+    <div class="card-title" style="font-size: 0.95rem;">Recent reconciles</div>
+    <p class="text-muted" style="font-size: 0.82rem;">
+      Polls open exchange orders, updates fills/fees in our DB, times out stale submits,
+      and flags any drift (orders on the exchange the bot did not place).
+    </p>
+    <div class="table-wrap mt-2">
+      <table class="table">
+        <thead>
+          <tr>
+            <th>Started</th>
+            <th class="num">Polled</th>
+            <th class="num">Updated</th>
+            <th class="num">Filled</th>
+            <th class="num">Timed-out</th>
+            <th class="num">Drift</th>
+            <th class="num">Errors</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in recent_recons %}
+          <tr>
+            <td class="mono" style="font-size: 0.78rem;">{{ r.started_at }}</td>
+            <td class="num">{{ r.orders_polled }}</td>
+            <td class="num">{{ r.orders_updated }}</td>
+            <td class="num">{{ r.orders_filled }}</td>
+            <td class="num">{{ r.orders_failed_timeout }}</td>
+            <td class="num">{{ r.drift_orders }}</td>
+            <td class="num">{{ r.errors }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Claude AI (Anthropic)</div>
+    {% if claude_cfg.configured %}
+      <span class="badge badge-good">Configured</span>
+    {% else %}
+      <span class="badge badge-warn">Not configured</span>
+    {% endif %}
+  </div>
+
+  <p class="text-muted mb-3" style="font-size: 0.88rem;">
+    AlphaPilot uses Claude for signal commentary, news interpretation, and
+    decision summaries. The key is stored in the
+    <span class="mono">app_settings</span> table on the server and sent only as
+    the <span class="mono">x-api-key</span> header on requests to
+    <span class="mono">api.anthropic.com</span>.
+    {% if claude_cfg.configured %}
+      Current key: <span class="mono">{{ claude_cfg.key_masked }}</span>.
+      Leave the key field blank with <strong>&quot;Keep existing key&quot;</strong>
+      checked to update only the model.
+    {% endif %}
+  </p>
+
+  <form method="post" action="/settings/claude/save" class="form-grid">
+    <div class="field" style="grid-column: 1 / -1;">
+      <label>Anthropic API Key</label>
+      <input class="input" type="password" name="anthropic_api_key"
+             autocomplete="off" placeholder="sk-ant-...">
+      <small class="text-muted">
+        Create at console.anthropic.com → API Keys. We never log or echo this value.
+      </small>
+    </div>
+
+    <div class="field">
+      <label>Model</label>
+      <select class="select" name="anthropic_model">
+        {% set _models = [
+          'claude-sonnet-4-6',
+          'claude-opus-4-1',
+          'claude-haiku-4-5',
+          'claude-3-5-sonnet-latest',
+          'claude-3-5-haiku-latest'
+        ] %}
+        {% for m in _models %}
+          <option value="{{ m }}" {{ 'selected' if claude_cfg.model == m else '' }}>{{ m }}</option>
+        {% endfor %}
+        {% if claude_cfg.model not in _models %}
+          <option value="{{ claude_cfg.model }}" selected>{{ claude_cfg.model }} (custom)</option>
+        {% endif %}
+      </select>
+    </div>
+
+    <div class="field">
+      <label class="flex items-center gap-2" style="font-weight: normal;">
+        <input type="checkbox" name="keep_existing" value="true"
+               {{ 'checked' if claude_cfg.configured else '' }}>
+        Keep existing key if blank
+      </label>
+      <small class="text-muted">Uncheck and submit a blank key to clear it.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Claude Settings</button>
+    </div>
+  </form>
+
+  <div class="flex gap-2 items-center mt-3" style="flex-wrap: wrap;">
+    <form method="post" action="/settings/claude/test">
+      <button class="btn" type="submit" {{ '' if claude_cfg.configured else 'disabled' }}>
+        Send test request
+      </button>
+    </form>
+    <span class="text-muted" style="font-size: 0.85rem;">
+      Sends a one-token &quot;OK&quot; round-trip to verify the key. Result lands in Activity Log.
+    </span>
+  </div>
+</div>
+
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">Notifications</div></div>
+  <p class="text-muted mb-3">
+    AlphaPilot can ping a Telegram chat or Discord webhook on every fill,
+    kill-switch event, or daily P&amp;L summary. Sends are best-effort and never
+    block the trading loop.
+  </p>
+
+  <form method="post" action="/settings/notifier/save" class="form-grid">
+    <div class="field">
+      <label>Provider</label>
+      <select class="select" name="notifier_provider">
+        {% for p in ['none', 'telegram', 'discord'] %}
+          <option value="{{ p }}" {{ 'selected' if notifier_cfg.provider == p else '' }}>{{ p|capitalize }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field">
+      <label>Minimum Level</label>
+      <select class="select" name="notifier_min_level">
+        {% for l in ['info', 'warn', 'error'] %}
+          <option value="{{ l }}" {{ 'selected' if notifier_cfg.min_level == l else '' }}>{{ l }}</option>
+        {% endfor %}
+      </select>
+      <small class="text-muted">Filter low-importance events.</small>
+    </div>
+
+    <div class="field">
+      <label>Telegram Bot Token</label>
+      <input class="input" type="text" name="notifier_telegram_bot_token"
+             value="{{ notifier_cfg.tg_token }}" placeholder="123456:ABC...">
+      <small class="text-muted">Create with @BotFather, then send a message to your bot.</small>
+    </div>
+    <div class="field">
+      <label>Telegram Chat ID</label>
+      <input class="input" type="text" name="notifier_telegram_chat_id"
+             value="{{ notifier_cfg.tg_chat }}" placeholder="-1001234567890 or 12345678">
+      <small class="text-muted">Use @userinfobot or getUpdates to find it.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <label>Discord Webhook URL</label>
+      <input class="input" type="text" name="notifier_discord_webhook_url"
+             value="{{ notifier_cfg.discord_url }}"
+             placeholder="https://discord.com/api/webhooks/...">
+      <small class="text-muted">Server Settings → Integrations → Webhooks → Copy URL.</small>
+    </div>
+
+    <div class="field">
+      <label>Daily Summary</label>
+      <select class="select" name="notifier_daily_summary">
+        <option value="true"  {{ 'selected' if notifier_cfg.daily else '' }}>On</option>
+        <option value="false" {{ '' if notifier_cfg.daily else 'selected' }}>Off</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Daily Summary Hour (UTC)</label>
+      <input class="input" type="number" name="notifier_daily_summary_hour_utc"
+             min="0" max="23" value="{{ notifier_cfg.daily_hour }}">
+      <small class="text-muted">0–23. Sends once per UTC date at or after this hour.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Notifier</button>
+    </div>
+  </form>
+
+  <div class="flex gap-2 items-center mt-3" style="flex-wrap: wrap;">
+    <form method="post" action="/settings/notifier/test">
+      <button class="btn" type="submit">Send test message</button>
+    </form>
+    <form method="post" action="/settings/notifier/send-summary-now">
+      <button class="btn" type="submit">Send daily summary now</button>
+    </form>
   </div>
 </div>
 

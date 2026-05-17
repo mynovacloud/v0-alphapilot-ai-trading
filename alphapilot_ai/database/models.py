@@ -33,6 +33,27 @@ class Wallet(Base):
     risk_profile = Column(String(40), default="Moderate")
     sandbox_mode = Column(Boolean, default=True)
     paper_trading_only = Column(Boolean, default=True)
+    # Trading mode: "paper" | "live" | "live_shadow"  (live_shadow = real order + paper copy)
+    trading_mode = Column(String(20), default="paper")
+    # Highest-level kill switch on the wallet. If True, the bot ignores this wallet entirely.
+    bot_paused = Column(Boolean, default=False)
+    # Hard caps the bot must respect for THIS wallet (overrides strategy caps).
+    max_position_usd = Column(Float, default=500.0)
+    max_open_positions = Column(Integer, default=3)
+    max_daily_loss_usd = Column(Float, default=200.0)
+    max_daily_trades = Column(Integer, default=10)
+    # Perpetual futures controls. When `futures_enabled` is True, the bot is
+    # allowed to open SHORT positions and apply leverage. `max_leverage` caps
+    # the requested leverage; `default_leverage` is what the bot uses when a
+    # signal does not specify one. `margin_mode` is "isolated" or "cross" and
+    # is sent through to the exchange where supported. `liquidation_buffer_pct`
+    # adds a safety margin to the bot's liquidation-price estimate so we close
+    # positions before the exchange does.
+    futures_enabled = Column(Boolean, default=False)
+    max_leverage = Column(Float, default=1.0)
+    default_leverage = Column(Float, default=1.0)
+    margin_mode = Column(String(20), default="isolated")
+    liquidation_buffer_pct = Column(Float, default=0.10)
     connection_status = Column(String(40), default="disconnected")
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
@@ -84,12 +105,77 @@ class PaperTrade(Base):
     realized_pnl = Column(Float, default=0.0)
     unrealized_pnl = Column(Float, default=0.0)
     confidence = Column(Float, default=0.5)
+    # Perpetual-futures fields. For spot trades these stay at defaults.
+    is_perp = Column(Boolean, default=False)
+    leverage = Column(Float, default=1.0)
+    margin_used = Column(Float, default=0.0)        # USD locked as margin for this trade
+    liquidation_price = Column(Float, nullable=True) # estimated, NOT exchange-of-record
+    funding_paid = Column(Float, default=0.0)
     status = Column(String(20), default="open")  # open / closed / cancelled
     opened_at = Column(DateTime, default=utcnow)
     closed_at = Column(DateTime, nullable=True)
     notes = Column(Text, default="")
 
     wallet = relationship("Wallet", back_populates="trades")
+    strategy = relationship("Strategy")
+
+
+class LiveOrder(Base):
+    """
+    A real order placed on a real exchange. The bot's autonomous loop creates
+    these. Every state change from the exchange is persisted here so we can
+    reconstruct what the bot did even after a process restart.
+    """
+
+    __tablename__ = "live_orders"
+
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False)
+    strategy_id = Column(Integer, ForeignKey("strategies.id"), nullable=True)
+
+    # Idempotency key sent to the exchange (UUID). Same key on retry => no dup order.
+    client_order_id = Column(String(64), unique=True, nullable=False, index=True)
+
+    # Set after the exchange accepts the order.
+    exchange_order_id = Column(String(120), nullable=True, index=True)
+
+    platform = Column(String(40), nullable=False)         # Coinbase / Binance / etc
+    symbol = Column(String(40), nullable=False)           # BTC-USD, ETH-USDT
+    side = Column(String(8), nullable=False)              # BUY / SELL
+    order_type = Column(String(20), nullable=False)       # market / limit / stop_limit / bracket
+    time_in_force = Column(String(8), default="GTC")      # GTC / IOC / GTD
+
+    # Sizing (one of base_qty or quote_size will be set depending on order type)
+    base_qty = Column(Float, nullable=True)
+    quote_size = Column(Float, nullable=True)
+
+    # Pricing (filled in for limit/stop variants)
+    limit_price = Column(Float, nullable=True)
+    stop_price = Column(Float, nullable=True)
+    take_profit_price = Column(Float, nullable=True)
+    stop_loss_price = Column(Float, nullable=True)
+
+    # Status: pending_submit / open / partially_filled / filled / cancelled / rejected / failed
+    status = Column(String(24), default="pending_submit", index=True)
+    filled_qty = Column(Float, default=0.0)
+    avg_fill_price = Column(Float, default=0.0)
+    fees = Column(Float, default=0.0)
+    realized_pnl = Column(Float, default=0.0)
+
+    # Error/debug info from exchange
+    last_error = Column(Text, default="")
+    raw_payload = Column(Text, default="")  # last raw response from exchange (for debugging)
+
+    # Risk + bot context
+    confidence = Column(Float, default=0.5)
+    is_paper_shadow = Column(Boolean, default=False)  # if True, also recorded as PaperTrade
+
+    submitted_at = Column(DateTime, default=utcnow)
+    accepted_at = Column(DateTime, nullable=True)
+    filled_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+
+    wallet = relationship("Wallet")
     strategy = relationship("Strategy")
 
 
@@ -240,3 +326,68 @@ class BacktestResult(Base):
     risk_score = Column(Float, default=0.0)
     recommendation = Column(String(40), default="moderate")
     created_at = Column(DateTime, default=utcnow)
+
+
+class ClaudeDecision(Base):
+    """
+    A single decision the Claude bot produced for one (wallet, symbol) candidate.
+
+    We persist EVERY decision (BUY/SELL/HOLD/CLOSE), not just the ones we acted
+    on. This gives us:
+      - a full audit trail of what the bot considered and why,
+      - the dataset the Training Center uses to show decision quality drift,
+      - the join key the reflection loop uses to correlate fills with reasoning.
+    """
+    __tablename__ = "claude_decisions"
+
+    id = Column(Integer, primary_key=True)
+    wallet_id = Column(Integer, ForeignKey("wallets.id"), nullable=False, index=True)
+    symbol = Column(String(80), nullable=False, index=True)
+    price = Column(Float, default=0.0)
+
+    # The "raw" technical signal we asked Claude to interpret.
+    technical_side = Column(String(8), default="HOLD")
+    technical_confidence = Column(Float, default=0.0)
+
+    # Claude's (or fallback's) decision.
+    action = Column(String(8), default="HOLD")          # BUY / SELL / HOLD / CLOSE
+    confidence = Column(Float, default=0.0)
+    size_multiplier = Column(Float, default=1.0)
+    stop_loss_pct = Column(Float, default=0.05)
+    take_profit_pct = Column(Float, default=0.10)
+    rationale = Column(Text, default="")
+    key_factors = Column(Text, default="[]")            # JSON-serialized list[str]
+    risk_flags = Column(Text, default="[]")             # JSON-serialized list[str]
+
+    source = Column(String(20), default="technical")    # claude / technical / fallback
+    model = Column(String(80), default="")
+    prompt_used = Column(Text, default="")
+    raw_response = Column(Text, default="")
+
+    created_at = Column(DateTime, default=utcnow, index=True)
+
+
+class TradeReflection(Base):
+    """
+    Post-trade reflection produced by Claude after a paper trade closes.
+
+    Stores the verdict, a -1..1 score (process quality, not outcome), a short
+    summary, and the JSON snapshot of the original decision + trade payload
+    used as input. Lessons extracted from each reflection are also written to
+    AILearningMemory so they show up in future system prompts.
+    """
+    __tablename__ = "trade_reflections"
+
+    id = Column(Integer, primary_key=True)
+    trade_id = Column(Integer, ForeignKey("paper_trades.id"), nullable=False, index=True)
+
+    verdict = Column(String(40), default="neutral")  # good_call / bad_call / lucky / unlucky / neutral
+    score = Column(Float, default=0.0)               # -1.0 .. 1.0
+    summary = Column(Text, default="")
+
+    lessons_json = Column(Text, default="[]")
+    decision_json = Column(Text, default="")
+    trade_json = Column(Text, default="")
+    raw_response = Column(Text, default="")
+
+    created_at = Column(DateTime, default=utcnow, index=True)

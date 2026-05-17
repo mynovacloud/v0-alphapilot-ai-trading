@@ -26,10 +26,17 @@ from analytics.portfolio import (
     pnl_by_wallet,
     portfolio_summary,
 )
+from config import bot_config
+from config.bot_config import BotConfig
 from config.settings import settings
 from connectors.live_prices import get_price as live_price
 from connectors.live_prices import known_symbols
-from connectors.registry import CONNECTOR_REGISTRY, REAL_AUTH_PLATFORMS, get_connector
+from connectors.registry import (
+    CONNECTOR_REGISTRY,
+    REAL_AUTH_PLATFORMS,
+    VISIBLE_PLATFORMS,
+    get_connector,
+)
 from database.db import reset_db, session_scope
 from database.models import (
     ActivityLog,
@@ -41,13 +48,17 @@ from database.models import (
     Wallet,
 )
 from trading.backtester import run_backtest
+from trading.bot_engine import bot_engine
 from trading.market_scanner import scan_markets
 from trading.paper_trading_engine import PaperTradingEngine
+from trading.reconciler import reconciler
+from trading.risk_manager import RiskManager
 from trading.strategy_manager import (
     create_strategy,
     delete_strategy,
     list_strategies,
 )
+from services.scheduler import bot_scheduler
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -221,7 +232,7 @@ def add_wallet_page(request: Request) -> HTMLResponse:
     return templates.TemplateResponse(request=request, name="add_wallet.html", context=_ctx(
             request,
             active="wallets",
-            platforms=list(CONNECTOR_REGISTRY.keys()),
+            platforms=list(VISIBLE_PLATFORMS),
             real_auth_platforms=sorted(REAL_AUTH_PLATFORMS),
             risk_profiles=["Conservative", "Moderate", "Aggressive", "Degenerate"],
         ),
@@ -294,6 +305,51 @@ def add_wallet_submit(
             )
         )
     return RedirectResponse(url="/wallets", status_code=303)
+
+
+@router.post("/wallets/{wallet_id}/futures")
+def wallet_update_futures(
+    wallet_id: int,
+    futures_enabled: str = Form("off"),
+    max_leverage: float = Form(1.0),
+    default_leverage: float = Form(1.0),
+    margin_mode: str = Form("isolated"),
+    liquidation_buffer_pct: float = Form(0.10),
+) -> RedirectResponse:
+    """
+    Update perpetual-futures controls on a wallet. Bounded so users cannot
+    accidentally configure dangerous values:
+      - max_leverage clamped to [1, 20]
+      - default_leverage clamped to [1, max_leverage]
+      - liquidation_buffer_pct clamped to [0.02, 0.5]
+    """
+    enabled = futures_enabled in {"on", "true", "1"}
+    max_lev = max(1.0, min(float(max_leverage or 1.0), 20.0))
+    def_lev = max(1.0, min(float(default_leverage or 1.0), max_lev))
+    buf = max(0.02, min(float(liquidation_buffer_pct or 0.10), 0.5))
+    mm = "cross" if (margin_mode or "isolated").lower() == "cross" else "isolated"
+
+    with session_scope() as s:
+        w = s.get(Wallet, wallet_id)
+        if not w:
+            return RedirectResponse(url="/wallets", status_code=303)
+        w.futures_enabled = enabled
+        w.max_leverage = max_lev
+        w.default_leverage = def_lev
+        w.margin_mode = mm
+        w.liquidation_buffer_pct = buf
+        s.add(
+            ActivityLog(
+                category="wallet",
+                level="info",
+                wallet_id=wallet_id,
+                message=(
+                    f"Futures controls updated on '{w.name}': enabled={enabled}, "
+                    f"max_lev={max_lev}x, default_lev={def_lev}x, mode={mm}, buf={buf:.2%}"
+                ),
+            )
+        )
+    return RedirectResponse(url=f"/wallets/{wallet_id}", status_code=303)
 
 
 @router.get("/wallets/{wallet_id}", response_class=HTMLResponse)
@@ -667,15 +723,25 @@ def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form
 
 @router.get("/training", response_class=HTMLResponse)
 def training_page(request: Request) -> HTMLResponse:
+    from ai.claude_learning import (
+        get_playbook_with_metadata,
+        readiness_score,
+        recent_decisions,
+        recent_reflections,
+    )
+    from services.claude_client import is_configured as claude_is_configured
     wallets = get_wallets()
     strategies = list_strategies()
-    lessons = _memory.list_lessons(limit=20)
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
             wallets=wallets,
             strategies=strategies,
-            lessons=lessons,
+            playbook=get_playbook_with_metadata(limit=100),
+            readiness=readiness_score(),
+            recent_decisions=recent_decisions(limit=20),
+            recent_reflections=recent_reflections(limit=15),
+            claude_configured=claude_is_configured(),
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
@@ -700,7 +766,6 @@ def training_run(
         num_trades=num_trades,
         starting_balance=starting_balance,
     )
-    # Build equity curve from decisions
     eq: list[float] = [result.starting_balance]
     for d in result.decisions:
         eq.append(d.get("balance", eq[-1]))
@@ -713,7 +778,46 @@ def training_run(
 
 @router.post("/training/memory/reset")
 def training_memory_reset() -> RedirectResponse:
+    from ai.claude_learning import reset_playbook
+    reset_playbook()
     _memory.reset()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/consolidate")
+def training_memory_consolidate() -> RedirectResponse:
+    from ai.claude_learning import consolidate_lessons
+    consolidate_lessons()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/delete/{rule_id}")
+def training_memory_delete(rule_id: int) -> RedirectResponse:
+    from database.models import AILearningMemory
+    with session_scope() as s:
+        row = s.get(AILearningMemory, rule_id)
+        if row:
+            s.delete(row)
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/add")
+def training_memory_add(
+    category: str = Form("rule"),
+    content: str = Form(...),
+    weight: float = Form(1.5),
+) -> RedirectResponse:
+    """Manually pin a rule to the playbook so Claude obeys it on every decision."""
+    from database.models import AILearningMemory
+    content = (content or "").strip()
+    if not content:
+        return RedirectResponse(url="/training", status_code=303)
+    with session_scope() as s:
+        s.add(AILearningMemory(
+            category=(category or "rule").strip()[:60] or "rule",
+            content=content[:2000],
+            weight=max(0.05, min(float(weight or 1.5), 5.0)),
+        ))
     return RedirectResponse(url="/training", status_code=303)
 
 
@@ -836,13 +940,46 @@ def settings_page(request: Request) -> HTMLResponse:
         "max_concurrent_trades": _get_setting("max_concurrent_trades", "5"),
         "default_position_size": _get_setting("default_position_size", "1000"),
     }
+    bot_cfg = BotConfig.load()
+    bot_status = bot_scheduler.status()
+    recent_ticks = bot_engine.recent_ticks(limit=10)
+    recent_recons = reconciler.recent(limit=10)
+    kill_switch = RiskManager.kill_switch_status()
+    notifier_cfg = {
+        "provider": bot_config.get("notifier_provider") or "none",
+        "tg_token": bot_config.get("notifier_telegram_bot_token") or "",
+        "tg_chat": bot_config.get("notifier_telegram_chat_id") or "",
+        "discord_url": bot_config.get("notifier_discord_webhook_url") or "",
+        "min_level": bot_config.get("notifier_min_level") or "info",
+        "daily": (bot_config.get("notifier_daily_summary") or "true").lower() in {"1", "true", "yes", "on"},
+        "daily_hour": bot_config.get("notifier_daily_summary_hour_utc") or "23",
+    }
+    _claude_key = bot_config.get("anthropic_api_key") or ""
+    claude_cfg = {
+        "configured": bool(_claude_key),
+        "key_masked": (_claude_key[:7] + "…" + _claude_key[-4:]) if len(_claude_key) > 12 else ("set" if _claude_key else ""),
+        "model": bot_config.get("anthropic_model") or "claude-sonnet-4-6",
+    }
+    with session_scope() as s:
+        paused_wallets = [
+            {"id": w.id, "name": w.name}
+            for w in s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
+        ]
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
-            request,
-            active="settings",
-            prefs=prefs,
-            settings=settings,
-        ),
-)
+        request,
+        active="settings",
+        prefs=prefs,
+        bot_cfg=bot_cfg,
+        bot_status=bot_status,
+        recent_ticks=recent_ticks,
+        recent_recons=recent_recons,
+        notifier_cfg=notifier_cfg,
+        claude_cfg=claude_cfg,
+        kill_switch=kill_switch,
+        paused_wallets=paused_wallets,
+        settings=settings,
+    ),
+    )
 
 
 @router.post("/settings/save")
@@ -864,6 +1001,207 @@ def settings_save(
                 category="settings",
                 level="info",
                 message="Preferences updated.",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/save")
+def settings_bot_save(
+    bot_enabled: str = Form("false"),
+    bot_tick_seconds: str = Form("60"),
+    bot_universe: str = Form("coinbase_usd"),
+    bot_universe_limit: str = Form("30"),
+    bot_min_confidence: str = Form("0.65"),
+    bot_default_strategy_type: str = Form("Momentum"),
+    bot_position_size_usd: str = Form("100"),
+    bot_max_open_per_wallet: str = Form("5"),
+    bot_dry_run: str = Form("true"),
+) -> RedirectResponse:
+    """
+    Persist autonomous-bot settings and reload the scheduler so the new
+    interval / config takes effect immediately — no restart required.
+    """
+    # Checkboxes only post their value when checked. Normalize.
+    enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
+    dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
+
+    bot_config.set_many(
+        {
+            "bot_enabled": enabled,
+            "bot_tick_seconds": str(max(5, int(float(bot_tick_seconds or 60)))),
+            "bot_universe": bot_universe or "coinbase_usd",
+            "bot_universe_limit": str(max(1, int(float(bot_universe_limit or 30)))),
+            "bot_min_confidence": str(max(0.0, min(1.0, float(bot_min_confidence or 0.65)))),
+            "bot_default_strategy_type": bot_default_strategy_type or "Momentum",
+            "bot_position_size_usd": str(max(1.0, float(bot_position_size_usd or 100))),
+            "bot_max_open_per_wallet": str(max(1, int(float(bot_max_open_per_wallet or 5)))),
+            "bot_dry_run": dry,
+        }
+    )
+
+    # Apply the new tick interval to the running scheduler immediately.
+    bot_scheduler.reload()
+
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="settings",
+                level="info",
+                message=(
+                    f"Bot settings updated: enabled={enabled}, "
+                    f"tick={bot_tick_seconds}s, universe={bot_universe}, dry_run={dry}"
+                ),
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/tick-now")
+def settings_bot_tick_now() -> RedirectResponse:
+    """Run a single tick immediately (manual override, ignores bot_enabled)."""
+    bot_engine.tick(manual=True)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/bot/reconcile-now")
+def settings_bot_reconcile_now() -> RedirectResponse:
+    """Run a single reconciler pass on demand."""
+    reconciler.reconcile()
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/save")
+def settings_notifier_save(
+    notifier_provider: str = Form("none"),
+    notifier_telegram_bot_token: str = Form(""),
+    notifier_telegram_chat_id: str = Form(""),
+    notifier_discord_webhook_url: str = Form(""),
+    notifier_min_level: str = Form("info"),
+    notifier_daily_summary: str = Form("false"),
+    notifier_daily_summary_hour_utc: str = Form("23"),
+) -> RedirectResponse:
+    bot_config.set_many(
+        {
+            "notifier_provider": notifier_provider,
+            "notifier_telegram_bot_token": notifier_telegram_bot_token.strip(),
+            "notifier_telegram_chat_id": notifier_telegram_chat_id.strip(),
+            "notifier_discord_webhook_url": notifier_discord_webhook_url.strip(),
+            "notifier_min_level": notifier_min_level,
+            "notifier_daily_summary": "true" if notifier_daily_summary in {"true", "on", "1"} else "false",
+            "notifier_daily_summary_hour_utc": notifier_daily_summary_hour_utc.strip() or "23",
+        }
+    )
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="notifier",
+                level="info",
+                message=f"Notifier settings updated (provider={notifier_provider}).",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/test")
+def settings_notifier_test() -> RedirectResponse:
+    from services.notifier import send_test
+    res = send_test()
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="notifier",
+                level="info" if res.get("ok") else "warn",
+                message=f"Notifier test: {res}",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/notifier/send-summary-now")
+def settings_notifier_send_summary_now() -> RedirectResponse:
+    from services.daily_summary import maybe_send_daily_summary
+    maybe_send_daily_summary(force=True)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/claude/save")
+def settings_claude_save(
+    anthropic_api_key: str = Form(""),
+    anthropic_model: str = Form("claude-sonnet-4-6"),
+    keep_existing: str = Form("false"),
+) -> RedirectResponse:
+    """
+    Save Anthropic API key + model. If `keep_existing` is true and the
+    submitted key is blank, we leave the existing key untouched (so the
+    masked-input field doesn't accidentally wipe a configured key).
+    """
+    updates: dict[str, str] = {"anthropic_model": (anthropic_model or "claude-sonnet-4-6").strip()}
+    submitted_key = (anthropic_api_key or "").strip()
+    keep = keep_existing in {"true", "on", "1"}
+    if submitted_key:
+        updates["anthropic_api_key"] = submitted_key
+    elif not keep:
+        # User explicitly cleared the field with keep_existing=false → wipe.
+        updates["anthropic_api_key"] = ""
+
+    bot_config.set_many(updates)
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="ai",
+                level="info",
+                message=(
+                    f"Claude settings updated (model={updates['anthropic_model']}, "
+                    f"key_changed={'yes' if 'anthropic_api_key' in updates else 'no'})."
+                ),
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/claude/test")
+def settings_claude_test() -> RedirectResponse:
+    from services.claude_client import send_test
+    res = send_test()
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="ai",
+                level="info" if res.get("ok") else "warn",
+                message=f"Claude test: {res}",
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/risk/kill-switch")
+def settings_kill_switch(action: str = Form("engage")) -> RedirectResponse:
+    """
+    Engage / release the global kill switch.
+    When engaged, every paper and live order is rejected by RiskManager and
+    the bot tick short-circuits before hitting the network.
+    """
+    if action.lower() == "engage":
+        RiskManager.set_kill_switch(True, reason="manual via Settings")
+    else:
+        RiskManager.set_kill_switch(False, reason="manual via Settings")
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/risk/unpause-all")
+def settings_unpause_all() -> RedirectResponse:
+    """Clear the bot_paused flag on every wallet (after a daily-loss auto-pause)."""
+    with session_scope() as s:
+        wallets = s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
+        count = len(wallets)
+        for w in wallets:
+            w.bot_paused = False
+        s.add(
+            ActivityLog(
+                category="risk",
+                level="info",
+                message=f"Manually unpaused {count} wallet(s) from Settings.",
             )
         )
     return RedirectResponse(url="/settings", status_code=303)

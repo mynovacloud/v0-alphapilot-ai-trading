@@ -126,6 +126,69 @@
   </div>
 </div>
 
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Perpetual Futures</div>
+    <span class="text-muted" style="font-size: 0.85rem;">
+      {% if wallet.platform == 'Coinbase Perp' %}
+        Live perp trading supported on {{ wallet.platform }}.
+      {% else %}
+        {{ wallet.platform }} does not yet support live perp trading in AlphaPilot — settings here apply to paper/shadow only.
+      {% endif %}
+    </span>
+  </div>
+
+  <p class="text-muted mb-3" style="font-size: 0.88rem;">
+    Enabling futures lets the bot open <strong>SHORT</strong> positions and apply
+    leverage. We enforce <span class="mono">max_leverage</span> and
+    <span class="mono">futures_enabled</span> in the risk gate before any
+    perp order is sent. The <span class="mono">liquidation_buffer</span>
+    is added to the bot&apos;s estimated liquidation price so positions are
+    closed early instead of liquidated by the exchange.
+  </p>
+
+  <form method="post" action="/wallets/{{ wallet.id }}/futures" class="form-grid">
+    <div class="field">
+      <label>Futures Enabled</label>
+      <select class="select" name="futures_enabled">
+        <option value="on"  {{ 'selected' if wallet.futures_enabled else '' }}>On</option>
+        <option value="off" {{ '' if wallet.futures_enabled else 'selected' }}>Off</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Margin Mode</label>
+      <select class="select" name="margin_mode">
+        <option value="isolated" {{ 'selected' if (wallet.margin_mode or 'isolated') == 'isolated' else '' }}>Isolated</option>
+        <option value="cross"    {{ 'selected' if (wallet.margin_mode or 'isolated') == 'cross' else '' }}>Cross</option>
+      </select>
+    </div>
+
+    <div class="field">
+      <label>Max Leverage</label>
+      <input class="input" type="number" step="0.5" min="1" max="20"
+             name="max_leverage" value="{{ '%.1f' % (wallet.max_leverage or 1.0) }}">
+      <small class="text-muted">Hard cap. The bot will never request more than this.</small>
+    </div>
+    <div class="field">
+      <label>Default Leverage</label>
+      <input class="input" type="number" step="0.5" min="1" max="20"
+             name="default_leverage" value="{{ '%.1f' % (wallet.default_leverage or 1.0) }}">
+      <small class="text-muted">Used when a signal does not specify leverage.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <label>Liquidation Buffer</label>
+      <input class="input" type="number" step="0.01" min="0.02" max="0.5"
+             name="liquidation_buffer_pct" value="{{ '%.2f' % (wallet.liquidation_buffer_pct or 0.10) }}">
+      <small class="text-muted">e.g. 0.10 = close at 10% above the estimated liquidation price.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Futures Settings</button>
+    </div>
+  </form>
+</div>
+
 <script>
   const symInput = document.getElementById('trade-symbol');
   const priceInput = document.getElementById('trade-price');

@@ -2,16 +2,18 @@
 Crypto exchange connectors.
 
 Three platforms have REAL authenticated implementations:
-  - Coinbase Advanced Trade
-  - Binance (binance.com)
-  - Kraken
+  - Coinbase Advanced Trade (read + LIVE TRADING with safety gate)
+  - Binance (binance.com) - read only
+  - Kraken - read only
 
 The rest (Crypto.com, generic ones) fall back to a public-price-only mock so
 the rest of the app keeps working. Live prices for every connector are
 provided by CoinGecko via `connectors.live_prices`.
 
-Live trading is still locked at the framework level (see BaseConnector).
-These connectors only READ from real APIs (auth + balances + prices).
+Live trading is gated by:
+  1. settings.live_trading_enabled (env var)
+  2. The wallet's `trading_mode` field ("live" or "live_shadow")
+  3. RiskManager evaluation
 """
 from __future__ import annotations
 
@@ -21,10 +23,12 @@ import hmac
 import json
 import time
 import urllib.parse
+import uuid
 from typing import Any
 
 import httpx
 
+from config.settings import settings
 from connectors.base_connector import BaseConnector
 from connectors.live_prices import get_price as live_price
 
@@ -137,6 +141,331 @@ class CoinbaseConnector(BaseConnector):
             return {"cash": round(total_usd, 2), "currency": "USD", "balances": balances, "live": True}
         except Exception as e:
             return {"error": f"fetch_balance failed: {e}", "live": False}
+
+    # =====================================================================
+    # LIVE TRADING (Coinbase Advanced Trade)
+    # =====================================================================
+    #
+    # Every order method:
+    #   - Returns a dict with shape: {"ok": bool, "order_id": str, "raw": ..., "error": ...}
+    #   - Generates a client_order_id (UUID) for idempotency
+    #   - Refuses to run if settings.live_trading_enabled is False
+    #
+    # Coinbase Advanced Trade order payload shape:
+    #   {
+    #     "client_order_id": "...",
+    #     "product_id": "BTC-USD",
+    #     "side": "BUY" | "SELL",
+    #     "order_configuration": { ... }  # one of: market_market_ioc, limit_limit_gtc,
+    #                                     #         stop_limit_stop_limit_gtc, etc.
+    #   }
+    # ---------------------------------------------------------------------
+
+    def _post_signed(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        body = json.dumps(payload, separators=(",", ":"))
+        headers = self._auth_headers("POST", path, body)
+        with httpx.Client(timeout=15.0) as c:
+            r = c.post(self.BASE_URL + path, headers=headers, content=body)
+        try:
+            data = r.json()
+        except Exception:
+            data = {"raw_text": r.text}
+        return {"status_code": r.status_code, "json": data}
+
+    def _ensure_live_enabled(self) -> dict[str, Any] | None:
+        if not settings.live_trading_enabled:
+            return {
+                "ok": False,
+                "error": "Live trading disabled. Set LIVE_TRADING_ENABLED=true in .env.",
+            }
+        if not self.api_key or not self.api_secret:
+            return {"ok": False, "error": "Coinbase requires both API key and API secret."}
+        return None
+
+    @staticmethod
+    def _new_client_order_id() -> str:
+        return str(uuid.uuid4())
+
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        base_qty: float | None = None,
+        quote_size: float | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Market order. Specify EITHER base_qty (e.g. 0.001 BTC) OR quote_size
+        (e.g. $25 of BTC). Coinbase requires:
+          - BUY market: quote_size only (USD amount)
+          - SELL market: base_size only (asset amount)
+        """
+        gate = self._ensure_live_enabled()
+        if gate:
+            return gate
+
+        side = side.upper()
+        coid = client_order_id or self._new_client_order_id()
+
+        if side == "BUY":
+            if quote_size is None:
+                return {"ok": False, "error": "Coinbase market BUY requires quote_size (USD)."}
+            cfg = {"market_market_ioc": {"quote_size": str(quote_size)}}
+        elif side == "SELL":
+            if base_qty is None:
+                return {"ok": False, "error": "Coinbase market SELL requires base_qty (asset amount)."}
+            cfg = {"market_market_ioc": {"base_size": str(base_qty)}}
+        else:
+            return {"ok": False, "error": f"Invalid side: {side}"}
+
+        payload = {
+            "client_order_id": coid,
+            "product_id": symbol,
+            "side": side,
+            "order_configuration": cfg,
+        }
+        return self._submit_order(payload, coid)
+
+    def place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        base_qty: float,
+        limit_price: float,
+        time_in_force: str = "GTC",
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Limit order, GTC by default."""
+        gate = self._ensure_live_enabled()
+        if gate:
+            return gate
+
+        coid = client_order_id or self._new_client_order_id()
+        cfg_key = "limit_limit_gtc" if time_in_force == "GTC" else "limit_limit_gtd"
+        payload = {
+            "client_order_id": coid,
+            "product_id": symbol,
+            "side": side.upper(),
+            "order_configuration": {
+                cfg_key: {
+                    "base_size": str(base_qty),
+                    "limit_price": str(limit_price),
+                    "post_only": False,
+                }
+            },
+        }
+        return self._submit_order(payload, coid)
+
+    def place_stop_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        base_qty: float,
+        stop_price: float,
+        limit_price: float,
+        stop_direction: str = "STOP_DIRECTION_STOP_DOWN",
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Stop-limit order. `stop_direction` is one of:
+          STOP_DIRECTION_STOP_UP   -> trigger when price >= stop_price (used for SELL stop)
+          STOP_DIRECTION_STOP_DOWN -> trigger when price <= stop_price (used for BUY stop)
+
+        Common usage: SELL stop-loss below current price -> STOP_DIRECTION_STOP_DOWN.
+        """
+        gate = self._ensure_live_enabled()
+        if gate:
+            return gate
+
+        coid = client_order_id or self._new_client_order_id()
+        payload = {
+            "client_order_id": coid,
+            "product_id": symbol,
+            "side": side.upper(),
+            "order_configuration": {
+                "stop_limit_stop_limit_gtc": {
+                    "base_size": str(base_qty),
+                    "limit_price": str(limit_price),
+                    "stop_price": str(stop_price),
+                    "stop_direction": stop_direction,
+                }
+            },
+        }
+        return self._submit_order(payload, coid)
+
+    def place_bracket_order(
+        self,
+        symbol: str,
+        side: str,
+        base_qty: float,
+        limit_price: float,
+        stop_trigger_price: float,
+        stop_limit_price: float,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any]:
+        """
+        Bracket order: a TP limit + a SL stop-limit attached to the entry.
+        Coinbase exposes this as `trigger_bracket_gtc`.
+        """
+        gate = self._ensure_live_enabled()
+        if gate:
+            return gate
+
+        coid = client_order_id or self._new_client_order_id()
+        payload = {
+            "client_order_id": coid,
+            "product_id": symbol,
+            "side": side.upper(),
+            "order_configuration": {
+                "trigger_bracket_gtc": {
+                    "base_size": str(base_qty),
+                    "limit_price": str(limit_price),
+                    "stop_trigger_price": str(stop_trigger_price),
+                }
+            },
+        }
+        return self._submit_order(payload, coid)
+
+    def _submit_order(self, payload: dict[str, Any], client_order_id: str) -> dict[str, Any]:
+        path = "/api/v3/brokerage/orders"
+        try:
+            res = self._post_signed(path, payload)
+        except Exception as e:
+            return {"ok": False, "error": f"network: {e}", "client_order_id": client_order_id}
+
+        body = res.get("json", {})
+        if res["status_code"] in (200, 201) and body.get("success"):
+            order_id = (body.get("success_response") or {}).get("order_id", "")
+            return {
+                "ok": True,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "raw": body,
+            }
+        # Coinbase failure
+        err = (body.get("error_response") or {}).get("message") or body.get("error") or body.get("message") or "unknown error"
+        return {
+            "ok": False,
+            "error": err,
+            "client_order_id": client_order_id,
+            "status_code": res["status_code"],
+            "raw": body,
+        }
+
+    def cancel_orders(self, exchange_order_ids: list[str]) -> dict[str, Any]:
+        """Cancel one or more open orders. Coinbase accepts a batch."""
+        gate = self._ensure_live_enabled()
+        if gate:
+            return gate
+        path = "/api/v3/brokerage/orders/batch_cancel"
+        payload = {"order_ids": exchange_order_ids}
+        try:
+            res = self._post_signed(path, payload)
+            return {"ok": res["status_code"] == 200, "raw": res.get("json", {})}
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def list_orders(self, status: str = "OPEN", limit: int = 250) -> dict[str, Any]:
+        """
+        List orders for the authenticated account.
+
+        status:
+          - "OPEN"   -> only currently working orders
+          - "FILLED" -> recently filled
+          - "CANCELLED"
+          - ""       -> all (Coinbase returns most recent first)
+        """
+        if not self.api_key or not self.api_secret:
+            return {"ok": False, "error": "no credentials"}
+        path = "/api/v3/brokerage/orders/historical/batch"
+        query = f"?limit={limit}"
+        if status:
+            query += f"&order_status={status}"
+        try:
+            with httpx.Client(timeout=15.0) as c:
+                r = c.get(
+                    self.BASE_URL + path + query,
+                    headers=self._auth_headers("GET", path),
+                )
+            data = r.json()
+            if r.status_code != 200:
+                return {"ok": False, "error": data, "status": r.status_code}
+            return {
+                "ok": True,
+                "orders": [
+                    {
+                        "exchange_order_id": o.get("order_id"),
+                        "client_order_id": o.get("client_order_id"),
+                        "product_id": o.get("product_id"),
+                        "side": o.get("side"),
+                        "status": o.get("status"),
+                        "filled_size": float(o.get("filled_size", 0) or 0),
+                        "average_filled_price": float(o.get("average_filled_price", 0) or 0),
+                        "total_fees": float(o.get("total_fees", 0) or 0),
+                        "created_time": o.get("created_time"),
+                    }
+                    for o in data.get("orders", [])
+                ],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def get_order(self, exchange_order_id: str) -> dict[str, Any]:
+        """Fetch the latest state of one order."""
+        if not self.api_key or not self.api_secret:
+            return {"ok": False, "error": "no credentials"}
+        path = f"/api/v3/brokerage/orders/historical/{exchange_order_id}"
+        try:
+            with httpx.Client(timeout=15.0) as c:
+                r = c.get(self.BASE_URL + path, headers=self._auth_headers("GET", path))
+            data = r.json()
+            if r.status_code != 200:
+                return {"ok": False, "error": data.get("error_response", data), "status": r.status_code}
+            order = data.get("order", {})
+            return {
+                "ok": True,
+                "status": order.get("status"),  # OPEN / FILLED / CANCELLED / FAILED / EXPIRED
+                "filled_size": float(order.get("filled_size", 0) or 0),
+                "average_filled_price": float(order.get("average_filled_price", 0) or 0),
+                "total_fees": float(order.get("total_fees", 0) or 0),
+                "raw": order,
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+
+    def list_products(self, product_type: str = "SPOT") -> dict[str, Any]:
+        """List available products (markets) from Coinbase."""
+        path = f"/api/v3/brokerage/products?product_type={product_type}"
+        try:
+            with httpx.Client(timeout=15.0) as c:
+                # public endpoint also works unauthenticated, but we sign anyway
+                # so the same path is used in tests.
+                if self.api_key and self.api_secret:
+                    r = c.get(
+                        self.BASE_URL + path,
+                        headers=self._auth_headers("GET", "/api/v3/brokerage/products"),
+                    )
+                else:
+                    r = c.get(self.BASE_URL + path)
+            data = r.json()
+            if r.status_code != 200:
+                return {"ok": False, "error": data}
+            return {
+                "ok": True,
+                "products": [
+                    {
+                        "product_id": p.get("product_id"),
+                        "base_currency": p.get("base_currency_id"),
+                        "quote_currency": p.get("quote_currency_id"),
+                        "min_market_funds": p.get("quote_min_size"),
+                        "base_increment": p.get("base_increment"),
+                        "quote_increment": p.get("quote_increment"),
+                    }
+                    for p in data.get("products", [])
+                ],
+            }
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
 
 
 # --------------------------------------------------------------------- #

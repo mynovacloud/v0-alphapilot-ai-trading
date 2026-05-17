@@ -125,7 +125,16 @@ class PaperTradingEngine:
                 )
             )
 
-            return {"ok": True, "pnl": round(pnl, 2)}
+        # Trade is now closed. Kick the Claude reflection loop so it can
+        # learn from this fill. Best-effort: reflection failures must never
+        # break the close. The function is idempotent if called twice.
+        try:
+            from ai.claude_learning import record_trade_outcome
+            record_trade_outcome(trade_id)
+        except Exception:
+            logger.exception("Reflection failed for trade %s", trade_id)
+
+        return {"ok": True, "pnl": round(pnl, 2)}
 
     # --- Helpers --------------------------------------------------------
 
