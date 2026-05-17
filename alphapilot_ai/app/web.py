@@ -1001,13 +1001,16 @@ def training_session_start(
         min_confidence = min(min_confidence, 0.35)
         max_open_per_wallet = max(max_open_per_wallet, 8)
 
-    tick = max(2, min(120, int(tick_seconds or 15)))
-    min_conf = max(0.0, min(0.95, float(min_confidence or 0.55)))
-    pos_usd = max(5.0, min(100_000.0, float(position_size_usd or 100.0)))
-    max_open = max(1, min(50, int(max_open_per_wallet or 5)))
+    tick = max(2, min(120, int(tick_seconds if tick_seconds is not None else 15)))
+    # Preserve 0.0 explicitly — `or 0.55` would silently bump the user's
+    # "I want trades on every signal" floor of 0.0 up to 0.55, which is the
+    # exact bug that kept Claude vetoing every borderline decision.
+    min_conf = max(0.0, min(0.95, float(min_confidence if min_confidence is not None else 0.55)))
+    pos_usd = max(5.0, min(100_000.0, float(position_size_usd if position_size_usd is not None else 100.0)))
+    max_open = max(1, min(50, int(max_open_per_wallet if max_open_per_wallet is not None else 5)))
     # Universe floor: 10. Anything smaller and the bot's just looking at 5 random
     # micro-cap tokens with thin candle history, which is why no signals fire.
-    uni_limit = max(10, min(150, int(universe_limit or 40)))
+    uni_limit = max(10, min(150, int(universe_limit if universe_limit is not None else 40)))
 
     # The bot's kill switch is the #1 reason "nothing happens" during a session.
     # Auto-release it when the user explicitly starts a training session — they
