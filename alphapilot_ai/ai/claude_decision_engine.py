@@ -64,22 +64,24 @@ SYSTEM_PROMPT_BASE = """You are AlphaPilot, an autonomous trading copilot operat
 Your job is to convert a technical signal + market context into a tradeable decision. \
 You are NOT a passive analyst — the operator wants you to trade actively when the \
 technical engine surfaces a directional signal, so they can observe the resulting \
-fills, reflect on outcomes, and improve the playbook. Refusing to trade on every \
+fills, reflect on outcomes, and improve over time. Refusing to trade on every \
 borderline signal produces zero learning and is the WORST possible outcome.
 
 Decision policy:
   - When the technical signal direction is BUY or SELL and the technical \
-    confidence meets or exceeds the operator's min_confidence_floor, you should \
-    normally TRADE in that direction. Only override to HOLD if there is concrete, \
-    specific evidence in the provided context that the signal is a trap (e.g. \
-    a still-open position on the same symbol in the opposite direction, or a \
-    risk_flag explicitly raised in extra_context).
-  - When the technical side is HOLD, return HOLD.
-  - Use the operator's min_confidence_floor as your threshold — do not invent \
-    your own higher one. The floor is already the operator's calibration.
-  - Confidence in your output should reflect the technical confidence, optionally \
-    nudged up to +0.10 if multiple corroborating indicators agree, or down to \
-    -0.10 if a real concrete contradiction exists in the provided data.
+    confidence meets or exceeds the operator's min_confidence_floor, you MUST \
+    return that direction. Only override to HOLD if extra_context contains a \
+    concrete, explicitly-stated risk_flag (e.g. "kill_switch_engaged: true" or \
+    "duplicate_position: true"). Vague concerns about "weak signals" or \
+    "single indicator" are NOT grounds to override — the operator's floor IS \
+    the calibration.
+  - You have NO prior memory of past trades except what is explicitly listed \
+    under recent_history.last_10_closed_trades in the user payload. If that \
+    list is empty, you have no history. Do not invent rules about "high-confidence \
+    trades that lost money" or "consecutive losses" — these are hallucinations.
+  - Confidence in your output should mirror the technical_confidence, optionally \
+    nudged ±0.05 only if a corroborating or contradicting indicator is concretely \
+    present in the payload.
 
 Hard rules (these are the only firm vetoes):
   1. NEVER recommend size_multiplier > 1.0 or leverage > the wallet's max_leverage.
@@ -152,26 +154,48 @@ def decide(
     """
     fallback = _technical_fallback(technical_signal)
 
-    # ----- Strong-signal passthrough -------------------------------------
-    # If the technical engine is already confident and directional, calling
-    # Claude purely dilutes the decision. The bias-toward-HOLD failure mode
-    # (Claude pulls a 0.62 SELL down to 0.50 "because there are no
-    # corroborating indicators") is the #1 reason no trades fire on a fresh
-    # database. Skip the LLM round-trip in that case and persist a "technical"
-    # decision so the audit trail still exists.
+    # Read the operator's calibration knobs ONCE up front. The whole point of
+    # the floor + training-mode flag is that the operator has explicitly told
+    # the system "I want trades at this level of evidence". Claude has been
+    # consistently overriding that floor (citing pre-existing seed rules about
+    # "high-confidence trades losing money" and pulling every 0.51 signal to
+    # 0.50 HOLD) — so when training mode is active, we treat the operator's
+    # floor as authoritative and bypass Claude entirely on directional signals.
+    floor = 0.55
+    is_training = False
+    try:
+        from config.bot_config import get as cfg_get
+        floor = float(cfg_get("bot_min_confidence") or 0.55)
+        is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        pass
+
     side = (technical_signal.side or "HOLD").upper()
     tech_conf = float(technical_signal.confidence or 0.0)
-    if side in {"BUY", "SELL"} and tech_conf >= 0.62:
+
+    # ----- Strong-signal passthrough -------------------------------------
+    # Path A: Always bypass Claude when the technical signal is very confident.
+    # Path B: In training mode, bypass Claude whenever the technical signal is
+    #         directional AND meets the operator's floor. This is the path
+    #         that actually produces fills during a training session — the
+    #         operator picked floor=0.00 deliberately to see lots of trades.
+    bypass_threshold = max(0.0, min(0.62, floor)) if is_training else 0.62
+    if side in {"BUY", "SELL"} and tech_conf >= bypass_threshold:
         passthrough = TradeDecision(
             action=side,
             confidence=tech_conf,
             size_multiplier=1.0,
             stop_loss_pct=0.05,
             take_profit_pct=0.10,
-            rationale=f"Technical passthrough (conf {tech_conf:.2f} >= 0.62): {technical_signal.reasoning}",
-            key_factors=[f"strategy={technical_signal.strategy}"],
+            rationale=(
+                f"Training-mode passthrough (tech conf {tech_conf:.2f} >= floor {bypass_threshold:.2f}). "
+                f"{technical_signal.reasoning}"
+                if is_training
+                else f"Technical passthrough (conf {tech_conf:.2f} >= 0.62): {technical_signal.reasoning}"
+            ),
+            key_factors=[f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"],
             risk_flags=[],
-            source="technical_strong",
+            source="technical_strong" if not is_training else "training_passthrough",
         )
         _persist_decision(wallet, symbol, price, technical_signal, passthrough, prompt_used="")
         return passthrough
