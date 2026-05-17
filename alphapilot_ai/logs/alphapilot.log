@@ -3,3 +3,14 @@
 2026-05-17 02:54:22,209 | INFO    | database.seed | Seed complete.
 2026-05-17 02:54:48,264 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
 2026-05-17 02:54:48,306 | INFO    | httpx | HTTP Request: GET http://testserver/health "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,866 | INFO    | database.db | Initializing database at sqlite:///./alphapilot.db
+2026-05-17 02:56:57,898 | INFO    | httpx | HTTP Request: GET http://testserver/health "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,904 | INFO    | httpx | HTTP Request: GET http://testserver/wallets "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,910 | INFO    | httpx | HTTP Request: GET http://testserver/strategies "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,919 | INFO    | httpx | HTTP Request: GET http://testserver/scan?n=5 "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,950 | INFO    | httpx | HTTP Request: GET http://testserver/analytics/summary "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,958 | INFO    | httpx | HTTP Request: GET http://testserver/logs?limit=5 "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,960 | INFO    | httpx | HTTP Request: GET http://testserver/platforms "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,970 | INFO    | httpx | HTTP Request: POST http://testserver/wallets "HTTP/1.1 200 OK"
+2026-05-17 02:56:57,978 | INFO    | ai.learning_memory | AI lesson added: Avoid low-liquidity markets after slippage-driven losses.
+2026-05-17 02:56:57,985 | INFO    | httpx | HTTP Request: POST http://testserver/ai/train "HTTP/1.1 200 OK"
