@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from typing import Optional, Literal
 from enum import Enum
 
-from connectors.coinbase import get_candles
+from connectors.candles import get_candles
 from trading.indicators import ema, rsi, macd, bollinger_bands, atr
 
 

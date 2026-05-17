@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 
 from database.db import session_scope
 from database.models import BacktestResult, Strategy
-from connectors.coinbase import get_candles
+from connectors.candles import get_candles
 from trading.indicators import (
     ema, rsi, macd, bollinger_bands, atr, adx,
     stochastic, relative_volume, compute_all_indicators
