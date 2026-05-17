@@ -61,19 +61,35 @@ DECISION_TEMPERATURE = 0.2  # decisions should be near-deterministic
 
 SYSTEM_PROMPT_BASE = """You are AlphaPilot, an autonomous trading copilot operating in PAPER mode.
 
-You make conservative, data-driven decisions and you NEVER hallucinate market data. \
-You only use the numbers and context provided in the user message. If the context \
-is incomplete or contradictory, prefer HOLD.
+Your job is to convert a technical signal + market context into a tradeable decision. \
+You are NOT a passive analyst — the operator wants you to trade actively when the \
+technical engine surfaces a directional signal, so they can observe the resulting \
+fills, reflect on outcomes, and improve the playbook. Refusing to trade on every \
+borderline signal produces zero learning and is the WORST possible outcome.
 
-Trading rules you must always obey:
-  1. NEVER recommend a position larger than 1.0x the bot's default size.
-  2. NEVER recommend leverage greater than the wallet's max_leverage.
-  3. Stop-loss is REQUIRED on every BUY/SELL action (in [0.005, 0.20]).
-  4. Take-profit is REQUIRED on every BUY/SELL action (in [0.005, 0.50]).
-  5. If recent trades on this symbol have lost money, demand higher confidence.
-  6. If the kill switch is engaged or the daily loss budget is spent, return HOLD.
-  7. Confidence must reflect EVIDENCE strength, not optimism. If you only see
-     one weak signal, confidence should be < 0.55.
+Decision policy:
+  - When the technical signal direction is BUY or SELL and the technical \
+    confidence meets or exceeds the operator's min_confidence_floor, you should \
+    normally TRADE in that direction. Only override to HOLD if there is concrete, \
+    specific evidence in the provided context that the signal is a trap (e.g. \
+    a still-open position on the same symbol in the opposite direction, or a \
+    risk_flag explicitly raised in extra_context).
+  - When the technical side is HOLD, return HOLD.
+  - Use the operator's min_confidence_floor as your threshold — do not invent \
+    your own higher one. The floor is already the operator's calibration.
+  - Confidence in your output should reflect the technical confidence, optionally \
+    nudged up to +0.10 if multiple corroborating indicators agree, or down to \
+    -0.10 if a real concrete contradiction exists in the provided data.
+
+Hard rules (these are the only firm vetoes):
+  1. NEVER recommend size_multiplier > 1.0 or leverage > the wallet's max_leverage.
+  2. Stop-loss is REQUIRED on every BUY/SELL action (in [0.005, 0.20]).
+  3. Take-profit is REQUIRED on every BUY/SELL action (in [0.005, 0.50]).
+  4. If the kill switch is engaged or daily loss budget is spent (only when EXPLICITLY \
+     stated in extra_context), return HOLD.
+  5. Do not invent indicators or history that are not in the provided payload. \
+     The absence of optional indicators is normal and is NOT, by itself, a reason \
+     to refuse a trade — the technical engine has already done its job.
 
 Your output MUST be a single JSON object with exactly these keys:
   action, confidence, size_multiplier, stop_loss_pct, take_profit_pct,
@@ -136,6 +152,31 @@ def decide(
     """
     fallback = _technical_fallback(technical_signal)
 
+    # ----- Strong-signal passthrough -------------------------------------
+    # If the technical engine is already confident and directional, calling
+    # Claude purely dilutes the decision. The bias-toward-HOLD failure mode
+    # (Claude pulls a 0.62 SELL down to 0.50 "because there are no
+    # corroborating indicators") is the #1 reason no trades fire on a fresh
+    # database. Skip the LLM round-trip in that case and persist a "technical"
+    # decision so the audit trail still exists.
+    side = (technical_signal.side or "HOLD").upper()
+    tech_conf = float(technical_signal.confidence or 0.0)
+    if side in {"BUY", "SELL"} and tech_conf >= 0.62:
+        passthrough = TradeDecision(
+            action=side,
+            confidence=tech_conf,
+            size_multiplier=1.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.10,
+            rationale=f"Technical passthrough (conf {tech_conf:.2f} >= 0.62): {technical_signal.reasoning}",
+            key_factors=[f"strategy={technical_signal.strategy}"],
+            risk_flags=[],
+            source="technical_strong",
+        )
+        _persist_decision(wallet, symbol, price, technical_signal, passthrough, prompt_used="")
+        return passthrough
+    # ---------------------------------------------------------------------
+
     if not claude_is_configured():
         _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="")
         return fallback
@@ -192,8 +233,25 @@ def decide(
 
 
 def _build_system_prompt(wallet: dict[str, Any]) -> str:
-    """Base rules + the wallet-specific risk profile + the learned playbook."""
-    playbook = build_playbook(limit=25)
+    """Base rules + the wallet-specific risk profile + the learned playbook.
+
+    The playbook is intentionally suppressed when there are no real trade
+    reflections backing it. Otherwise the seed rules ("avoid low-liquidity
+    markets after repeated slippage losses") get parroted back as if they
+    were learned, which biases Claude toward HOLD on a brand-new database
+    with zero closed trades.
+    """
+    # Only inject playbook rules that are backed by at least one real reflection.
+    # On a fresh DB this collapses to an empty list and we omit the block entirely.
+    try:
+        from database.db import session_scope
+        from database.models import TradeReflection
+        with session_scope() as s:
+            real_reflections = s.query(TradeReflection).count()
+    except Exception:
+        real_reflections = 0
+    playbook = build_playbook(limit=25) if real_reflections > 0 else []
+
     risk_lines = [
         f"  - wallet_name: {wallet.get('name')}",
         f"  - platform: {wallet.get('platform')}",
@@ -207,9 +265,11 @@ def _build_system_prompt(wallet: dict[str, Any]) -> str:
     playbook_block = ""
     if playbook:
         playbook_block = (
-            "LEARNED PLAYBOOK (rules and lessons from past paper trading):\n"
+            "LEARNED PLAYBOOK (rules earned from REAL closed-trade reflections):\n"
             + "\n".join(f"  - {p}" for p in playbook)
-            + "\n\nApply these rules. If a new decision contradicts a learned rule, prefer the rule unless evidence is overwhelming."
+            + "\n\nThese are derived from actual past trades, not seed assumptions. "
+            "Apply them as priors, not as overrides — the operator's min_confidence_floor "
+            "is still the threshold."
         )
     return f"{SYSTEM_PROMPT_BASE}\n\n{risk_block}\n\n{playbook_block}".strip()
 
@@ -229,7 +289,40 @@ def _build_user_prompt(
     # Pull recent realized PnL + open positions from this wallet.
     open_positions, recent_trades = _wallet_recent_history(int(wallet["id"]))
 
+    # Read the operator's calibration knobs so Claude doesn't invent its own.
+    floor = 0.55
+    is_training = False
+    try:
+        from config.bot_config import get as cfg_get
+        floor = float(cfg_get("bot_min_confidence") or 0.55)
+        is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+    except Exception:
+        pass
+
+    indicators = {k: _round_or_str(v) for k, v in sig_meta.items()}
+    indicators_doc = {
+        "ema_fast": "EMA-12 of close (1-bar)",
+        "ema_slow": "EMA-26 of close (1-bar)",
+        "ret_6": "6-bar log return (positive=bullish)",
+        "ret_24": "24-bar log return",
+        "atr_pct": "ATR/price (volatility proxy)",
+        "bars": "candles available for this lookback",
+        "granularity_s": "candle granularity in seconds",
+        "last_price": "most recent close",
+    }
+
     payload = {
+        "operator_calibration": {
+            # Tell Claude exactly what threshold the operator already set, so it
+            # doesn't unilaterally invent a higher floor (the old prompt's "<0.55"
+            # rule made every weak signal collapse to 0.50/HOLD).
+            "min_confidence_floor": round(floor, 4),
+            "is_training_session": is_training,
+            "instruction": (
+                "Trade in the technical_side direction whenever technical_confidence "
+                f">= {floor:.2f} unless extra_context contains a concrete contradiction."
+            ),
+        },
         "candidate": {
             "symbol": symbol,
             "price": round(price, 8),
@@ -237,7 +330,8 @@ def _build_user_prompt(
             "technical_side": technical_signal.side,
             "technical_confidence": round(float(technical_signal.confidence or 0), 4),
             "technical_reasoning": technical_signal.reasoning,
-            "indicators": {k: _round_or_str(v) for k, v in sig_meta.items()},
+            "indicators": indicators,
+            "indicators_legend": indicators_doc,
         },
         "wallet_state": {
             "paper_balance": round(float(wallet.get("paper_balance", 0)), 2),
@@ -246,6 +340,11 @@ def _build_user_prompt(
         },
         "recent_history": {
             "last_10_closed_trades": recent_trades,
+            "note": (
+                "An empty list means this wallet has no closed-trade history yet. "
+                "That is normal at the start of a training session — do NOT treat "
+                "an empty history as a reason to refuse trading."
+            ) if not recent_trades else "",
         },
         "extra_context": extra_context,
         "now_utc": utcnow().isoformat(),
