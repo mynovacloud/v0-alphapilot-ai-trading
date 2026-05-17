@@ -26,7 +26,97 @@
 {% endif %}
 
 <!-- ============================================================ -->
-<!-- READINESS SCORE                                                -->
+<!-- POSITIONS LAB                                                   -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="positions-lab">
+  <div class="card-header">
+    <div class="card-title">Positions Lab</div>
+    <div class="flex gap-2 items-center">
+      <span class="badge badge-info">live candles + bot trades + decisions</span>
+      <select id="lab-granularity" class="select" style="width: 120px;">
+        <option value="300">5m</option>
+        <option value="900" selected>15m</option>
+        <option value="3600">1h</option>
+        <option value="21600">6h</option>
+        <option value="86400">1d</option>
+      </select>
+    </div>
+  </div>
+  <p class="text-muted mb-3" style="font-size: 0.85rem;">
+    Pick any symbol the bot has touched. The chart shows real Coinbase candles with green up-arrows where the bot opened longs, red down-arrows for shorts, and X marks at the exits colored by P&amp;L. The faint dots are every Claude decision (including HOLDs) so you can see what the bot considered but skipped.
+  </p>
+
+  <div class="grid" style="grid-template-columns: 240px 1fr; gap: 1rem; align-items: start;">
+    <!-- Symbol list -->
+    <div class="flex flex-col gap-1" id="lab-symbol-list" style="max-height: 540px; overflow-y: auto;">
+      {% for row in traded_symbols %}
+        <button type="button"
+                class="lab-symbol"
+                data-symbol="{{ row.symbol }}"
+                data-wallet-id="{{ row.wallet_id }}"
+                data-wallet-name="{{ row.wallet_name }}"
+                style="text-align: left; padding: 0.55rem 0.7rem; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; color: var(--text);">
+          <div class="mono" style="font-size: 0.9rem; font-weight: 600;">{{ row.symbol }}</div>
+          <div class="text-dim" style="font-size: 0.72rem;">{{ row.wallet_name }}</div>
+        </button>
+      {% else %}
+        <div class="empty">No paper trades yet. Once the bot opens a position, the symbol appears here.</div>
+      {% endfor %}
+    </div>
+
+    <!-- Chart + stats + ledger -->
+    <div class="flex flex-col gap-3" id="lab-pane">
+      <div id="lab-empty" class="empty" style="padding: 4rem 2rem;">
+        Select a symbol on the left to see the bot&apos;s entries, exits, and decisions plotted on the live chart.
+      </div>
+
+      <div id="lab-content" style="display: none;">
+        <!-- KPI strip -->
+        <div class="grid" style="grid-template-columns: repeat(6, 1fr); gap: 0.5rem;">
+          <div class="kpi"><div class="kpi-label">Symbol</div><div class="kpi-value mono" id="lab-kpi-symbol">—</div></div>
+          <div class="kpi"><div class="kpi-label">Realized P&amp;L</div><div class="kpi-value mono" id="lab-kpi-pnl">$0.00</div></div>
+          <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value mono" id="lab-kpi-winrate">0%</div></div>
+          <div class="kpi"><div class="kpi-label">Trades</div><div class="kpi-value mono" id="lab-kpi-trades">0</div></div>
+          <div class="kpi"><div class="kpi-label">Open</div><div class="kpi-value mono" id="lab-kpi-open">0</div></div>
+          <div class="kpi"><div class="kpi-label">Avg Hold</div><div class="kpi-value mono" id="lab-kpi-hold">—</div></div>
+        </div>
+
+        <!-- Chart canvas -->
+        <div style="position: relative; background: var(--bg-elev); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.5rem;">
+          <canvas id="lab-chart" style="width: 100%; height: 460px; display: block;"></canvas>
+          <div id="lab-tooltip" style="position: absolute; pointer-events: none; display: none; background: rgba(15,17,21,0.96); border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem 0.7rem; font-size: 0.8rem; line-height: 1.45; color: var(--text); max-width: 320px; z-index: 5;"></div>
+          <div style="position: absolute; bottom: 0.6rem; right: 0.8rem; display: flex; gap: 0.8rem; font-size: 0.72rem; color: var(--text-muted);">
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--good);border-radius:2px;margin-right:4px;"></span>Long entry</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--bad);border-radius:2px;margin-right:4px;"></span>Short entry</span>
+            <span><span style="display:inline-block;width:10px;height:10px;background:var(--accent, #4aa3ff);border-radius:50%;margin-right:4px;"></span>Decision</span>
+            <span><span style="display:inline-block;width:0;height:0;border-left:5px solid transparent;border-right:5px solid transparent;border-bottom:8px solid var(--text-muted);margin-right:4px;"></span>Exit</span>
+          </div>
+        </div>
+
+        <!-- Trade ledger for this symbol -->
+        <div>
+          <h4 style="font-size: 0.85rem; margin: 0 0 0.4rem 0;">Trade ledger for <span id="lab-ledger-symbol" class="mono">—</span></h4>
+          <div style="overflow-x: auto;">
+            <table class="table" style="width: 100%; font-size: 0.78rem;">
+              <thead>
+                <tr>
+                  <th>#</th><th>Side</th><th>Qty</th><th>Entry</th><th>Exit</th>
+                  <th>P&amp;L</th><th>Conf</th><th>Status</th><th>Opened</th><th>Closed</th><th>Notes</th>
+                </tr>
+              </thead>
+              <tbody id="lab-ledger-body">
+                <tr><td colspan="11" class="empty">No trades for this symbol yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<!-- READINESS SCORE                                                 -->
 <!-- ============================================================ -->
 <div class="card mb-4">
   <div class="card-header">
@@ -89,7 +179,7 @@
 </div>
 
 <!-- ============================================================ -->
-<!-- PLAYBOOK EDITOR                                                -->
+<!-- PLAYBOOK EDITOR                                                 -->
 <!-- ============================================================ -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
@@ -173,7 +263,7 @@
 </div>
 
 <!-- ============================================================ -->
-<!-- DECISION LOG                                                   -->
+<!-- DECISION LOG                                                    -->
 <!-- ============================================================ -->
 <div class="card mb-4">
   <div class="card-header">
@@ -226,7 +316,7 @@
 </div>
 
 <!-- ============================================================ -->
-<!-- SYNTHETIC TRAINING SESSION                                     -->
+<!-- SYNTHETIC TRAINING SESSION                                      -->
 <!-- ============================================================ -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
@@ -271,5 +361,7 @@
 </div>
 
 <div id="training-result"></div>
+
+<script src="/static/positions_lab.js?v=2"></script>
 
 {% endblock %}

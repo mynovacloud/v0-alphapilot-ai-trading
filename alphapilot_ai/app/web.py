@@ -11,8 +11,8 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Form, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from ai.ai_engine import AIEngine
@@ -732,6 +732,28 @@ def training_page(request: Request) -> HTMLResponse:
     from services.claude_client import is_configured as claude_is_configured
     wallets = get_wallets()
     strategies = list_strategies()
+    # Symbols the bot has actually traded (open or closed paper trades).
+    # Used to populate the Positions Lab grid on the page.
+    with session_scope() as s:
+        rows = (
+            s.query(
+                PaperTrade.symbol,
+                PaperTrade.wallet_id,
+            )
+            .all()
+        )
+        wallet_names = {w["id"]: w["name"] for w in wallets}
+        seen: dict[tuple[str, int], dict[str, Any]] = {}
+        for sym, wid in rows:
+            key = (sym, wid)
+            if key in seen:
+                continue
+            seen[key] = {
+                "symbol": sym,
+                "wallet_id": wid,
+                "wallet_name": wallet_names.get(wid, "?"),
+            }
+        traded_symbols = sorted(seen.values(), key=lambda r: (r["wallet_name"], r["symbol"]))
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
@@ -742,10 +764,138 @@ def training_page(request: Request) -> HTMLResponse:
             recent_decisions=recent_decisions(limit=20),
             recent_reflections=recent_reflections(limit=15),
             claude_configured=claude_is_configured(),
+            traded_symbols=traded_symbols,
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
         ),
 )
+
+
+@router.get("/training/chart-data")
+def training_chart_data(
+    symbol: str = Query(..., min_length=1),
+    wallet_id: int | None = Query(None),
+    granularity: int = Query(900, ge=60, le=86400),
+) -> JSONResponse:
+    """
+    Return everything the Positions Lab chart needs in one payload:
+      - candles:    OHLC bars from Coinbase (public endpoint, no key needed)
+      - trades:     every paper trade for (symbol, wallet?) with entry+exit
+      - decisions:  every Claude decision (BUY/SELL/HOLD/CLOSE) the bot made
+      - stats:      symbol-level KPIs (P&L, win rate, hold time, best/worst)
+    The frontend draws candles + entry/exit markers + a decision overlay.
+    """
+    from connectors.candles import get_candles
+    from database.models import ClaudeDecision
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return JSONResponse({"ok": False, "error": "missing symbol"}, status_code=400)
+
+    candles = get_candles(sym, granularity=granularity, limit=300)
+
+    with session_scope() as s:
+        q = s.query(PaperTrade).filter(PaperTrade.symbol == sym)
+        if wallet_id:
+            q = q.filter(PaperTrade.wallet_id == wallet_id)
+        trades = q.order_by(PaperTrade.opened_at.asc()).all()
+
+        trade_rows: list[dict[str, Any]] = []
+        for t in trades:
+            trade_rows.append(
+                {
+                    "id": t.id,
+                    "side": t.side,
+                    "qty": t.qty,
+                    "entry_price": t.entry_price,
+                    "exit_price": t.exit_price,
+                    "realized_pnl": t.realized_pnl or 0.0,
+                    "unrealized_pnl": t.unrealized_pnl or 0.0,
+                    "confidence": t.confidence or 0.0,
+                    "status": t.status,
+                    "opened_at_ts": int(t.opened_at.timestamp()) if t.opened_at else None,
+                    "closed_at_ts": int(t.closed_at.timestamp()) if t.closed_at else None,
+                    "opened_at": t.opened_at.isoformat() if t.opened_at else None,
+                    "closed_at": t.closed_at.isoformat() if t.closed_at else None,
+                    "notes": (t.notes or "")[:300],
+                    "is_perp": bool(t.is_perp),
+                    "leverage": t.leverage or 1.0,
+                }
+            )
+
+        dq = s.query(ClaudeDecision).filter(ClaudeDecision.symbol == sym)
+        if wallet_id:
+            dq = dq.filter(ClaudeDecision.wallet_id == wallet_id)
+        decisions = (
+            dq.order_by(ClaudeDecision.created_at.desc()).limit(150).all()
+        )
+        decision_rows: list[dict[str, Any]] = []
+        for d in decisions:
+            decision_rows.append(
+                {
+                    "id": d.id,
+                    "ts": int(d.created_at.timestamp()) if d.created_at else None,
+                    "created_at": d.created_at.isoformat() if d.created_at else None,
+                    "action": d.action,
+                    "confidence": d.confidence or 0.0,
+                    "size_multiplier": d.size_multiplier or 1.0,
+                    "stop_loss_pct": d.stop_loss_pct or 0.0,
+                    "take_profit_pct": d.take_profit_pct or 0.0,
+                    "technical_side": d.technical_side,
+                    "technical_confidence": d.technical_confidence or 0.0,
+                    "price": d.price or 0.0,
+                    "rationale": (d.rationale or "")[:500],
+                    "source": d.source,
+                }
+            )
+        decision_rows.reverse()  # oldest -> newest for charting
+
+    closed = [t for t in trade_rows if t["status"] == "closed"]
+    realized = sum(t["realized_pnl"] for t in closed)
+    wins = [t for t in closed if t["realized_pnl"] > 0]
+    losses = [t for t in closed if t["realized_pnl"] < 0]
+    best = max((t["realized_pnl"] for t in closed), default=0.0)
+    worst = min((t["realized_pnl"] for t in closed), default=0.0)
+    avg_hold_min = 0.0
+    holds = [
+        (t["closed_at_ts"] - t["opened_at_ts"]) / 60.0
+        for t in closed
+        if t["opened_at_ts"] and t["closed_at_ts"]
+    ]
+    if holds:
+        avg_hold_min = sum(holds) / len(holds)
+
+    open_trades = [t for t in trade_rows if t["status"] == "open"]
+
+    stats = {
+        "total_trades": len(trade_rows),
+        "open_trades": len(open_trades),
+        "closed_trades": len(closed),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": (len(wins) / len(closed)) if closed else 0.0,
+        "realized_pnl": realized,
+        "best_pnl": best,
+        "worst_pnl": worst,
+        "avg_hold_minutes": avg_hold_min,
+        "avg_confidence": (
+            sum(t["confidence"] for t in trade_rows) / len(trade_rows)
+            if trade_rows
+            else 0.0
+        ),
+    }
+
+    return JSONResponse(
+        {
+            "ok": True,
+            "symbol": sym,
+            "granularity": granularity,
+            "candles": candles,
+            "trades": trade_rows,
+            "decisions": decision_rows,
+            "stats": stats,
+        }
+    )
 
 
 @router.post("/training/run", response_class=HTMLResponse)
