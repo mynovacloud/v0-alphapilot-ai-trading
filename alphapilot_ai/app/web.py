@@ -2299,3 +2299,84 @@ def api_emergency_exit() -> JSONResponse:
         "positions_closed": close_result.get("closed", 0),
         "total_pnl": close_result.get("total_pnl", 0),
     })
+
+
+@router.get("/api/portfolio-intel")
+def api_portfolio_intel() -> JSONResponse:
+    """
+    Get portfolio intelligence state - whether recovery mode is active,
+    recent actions taken, and current portfolio health metrics.
+    """
+    from connectors.live_prices import get_price
+    from trading.portfolio_intelligence import PortfolioIntelligence
+    
+    intel = PortfolioIntelligence()
+    
+    # Get all wallets with positions
+    with session_scope() as s:
+        wallet_ids = (
+            s.query(PaperTrade.wallet_id)
+            .filter(PaperTrade.status == "open")
+            .distinct()
+            .all()
+        )
+        wallet_ids = [w[0] for w in wallet_ids]
+        
+        # Get all open positions for price lookup
+        positions = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+        symbols = list(set(p.symbol for p in positions))
+    
+    # Build price map
+    price_map: dict[str, float] = {}
+    for symbol in symbols:
+        p = get_price(symbol)
+        if p.get("ok"):
+            price_map[symbol] = float(p["price"])
+    
+    # Analyze portfolio for each wallet
+    portfolio_states = []
+    for wallet_id in wallet_ids:
+        state = intel.analyze_portfolio(wallet_id, price_map)
+        portfolio_states.append({
+            "wallet_id": wallet_id,
+            "total_positions": state.total_positions,
+            "total_pnl_usd": round(state.total_pnl_usd, 2),
+            "total_pnl_pct": round(state.total_pnl_pct * 100, 2),
+            "winning_count": state.winning_count,
+            "losing_count": state.losing_count,
+            "biggest_loser_pct": round(state.biggest_loser_pct * 100, 2),
+            "biggest_winner_pct": round(state.biggest_winner_pct * 100, 2),
+            "available_capital": round(state.available_capital, 2),
+            "is_recovery_mode": state.is_recovery_mode,
+        })
+    
+    # Get recent intel activity logs
+    recent_actions = []
+    with session_scope() as s:
+        logs = (
+            s.query(ActivityLog)
+            .filter(ActivityLog.category == "portfolio_intel")
+            .order_by(ActivityLog.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        recent_actions = [
+            {
+                "message": log.message,
+                "level": log.level,
+                "time": log.created_at.isoformat() if log.created_at else None,
+            }
+            for log in logs
+        ]
+    
+    # Aggregate
+    is_any_recovery = any(ps["is_recovery_mode"] for ps in portfolio_states)
+    total_pnl = sum(ps["total_pnl_usd"] for ps in portfolio_states)
+    
+    return JSONResponse({
+        "ok": True,
+        "is_recovery_mode": is_any_recovery,
+        "total_pnl_usd": round(total_pnl, 2),
+        "portfolios": portfolio_states,
+        "recent_actions": recent_actions,
+    })

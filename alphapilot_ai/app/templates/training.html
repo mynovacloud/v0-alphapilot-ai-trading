@@ -18,12 +18,111 @@
   </div>
 </div>
 
-{% if not claude_configured %}
-  <div class="banner banner-warn mb-4">
-    <strong>Claude is not configured.</strong> The bot will fall back to raw technical signals until you add an API key on the
-    <a href="/settings">Settings</a> page. Reflections, playbook generation, and consolidation are paused.
+<!-- ============================================================ -->
+<!-- PORTFOLIO INTELLIGENCE STATUS                                   -->
+<!-- Shows when the bot is actively managing the portfolio           -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="portfolio-intel-card" style="display: none;">
+  <div class="card-header" style="padding: 0.6rem 1rem;">
+    <div class="flex items-center gap-3">
+      <div id="intel-status-indicator" style="width: 8px; height: 8px; border-radius: 50%; background: var(--accent);"></div>
+      <span class="card-title" style="font-size: 0.9rem;">Portfolio Intelligence</span>
+      <span id="intel-mode-badge" class="badge badge-outline" style="font-size: 0.7rem;">ACTIVE</span>
+    </div>
+    <div id="intel-stats" class="flex gap-4 text-dim" style="font-size: 0.75rem;">
+      <span>Actions: <span id="intel-action-count" class="mono">0</span></span>
+      <span>DCAs: <span id="intel-dca-count" class="mono">0</span></span>
+      <span>Offsets: <span id="intel-offset-count" class="mono">0</span></span>
+    </div>
   </div>
-{% endif %}
+  <div id="intel-actions-list" style="padding: 0.5rem 1rem; max-height: 120px; overflow-y: auto; font-size: 0.78rem;">
+    <!-- Filled by JS when actions occur -->
+  </div>
+</div>
+
+<style>
+  #portfolio-intel-card.recovery-mode {
+    border-color: var(--warn);
+    background: rgba(245, 158, 11, 0.05);
+  }
+  #portfolio-intel-card.recovery-mode #intel-mode-badge {
+    background: var(--warn);
+    color: var(--bg);
+    border-color: var(--warn);
+  }
+  .intel-action-item {
+    padding: 0.3rem 0;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .intel-action-item:last-child {
+    border-bottom: none;
+  }
+  .intel-action-type {
+    font-weight: 600;
+    font-size: 0.7rem;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+  .intel-action-type.dca { background: var(--accent); color: white; }
+  .intel-action-type.scale_in { background: var(--good); color: white; }
+  .intel-action-type.offset { background: var(--warn); color: var(--bg); }
+</style>
+
+<script>
+// Portfolio Intelligence tracking
+let intelActionCounts = { total: 0, dca: 0, offset: 0, scale_in: 0 };
+let intelActions = [];
+
+function showPortfolioIntel(actions, isRecoveryMode) {
+  const card = document.getElementById('portfolio-intel-card');
+  if (!card) return;
+  
+  card.style.display = 'block';
+  
+  if (isRecoveryMode) {
+    card.classList.add('recovery-mode');
+    document.getElementById('intel-mode-badge').textContent = 'RECOVERY MODE';
+  } else {
+    card.classList.remove('recovery-mode');
+    document.getElementById('intel-mode-badge').textContent = 'ACTIVE';
+  }
+  
+  // Update counts
+  document.getElementById('intel-action-count').textContent = intelActionCounts.total;
+  document.getElementById('intel-dca-count').textContent = intelActionCounts.dca;
+  document.getElementById('intel-offset-count').textContent = intelActionCounts.offset;
+  
+  // Update action list
+  const list = document.getElementById('intel-actions-list');
+  if (intelActions.length === 0) {
+    list.innerHTML = '<div class="text-dim">No recent actions</div>';
+  } else {
+    list.innerHTML = intelActions.slice(-5).reverse().map(a => `
+      <div class="intel-action-item">
+        <div class="flex items-center gap-2">
+          <span class="intel-action-type ${a.type}">${a.type}</span>
+          <span class="mono">${a.symbol}</span>
+        </div>
+        <span class="text-dim">${a.reason.substring(0, 60)}...</span>
+      </div>
+    `).join('');
+  }
+}
+
+function recordIntelAction(type, symbol, reason) {
+  intelActionCounts.total++;
+  if (type === 'dca') intelActionCounts.dca++;
+  if (type === 'offset') intelActionCounts.offset++;
+  if (type === 'scale_in') intelActionCounts.scale_in++;
+  
+  intelActions.push({ type, symbol, reason, time: new Date() });
+  if (intelActions.length > 20) intelActions.shift();
+}
+</script>
 
 <!-- ============================================================ -->
 <!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->

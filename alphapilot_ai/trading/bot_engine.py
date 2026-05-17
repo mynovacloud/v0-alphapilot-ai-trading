@@ -34,6 +34,10 @@ from database.models import (
     Wallet,
 )
 from trading.paper_trading_engine import PaperTradingEngine
+from trading.portfolio_intelligence import (
+    PortfolioIntelligence,
+    execute_portfolio_action,
+)
 from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol
@@ -63,6 +67,7 @@ class BotEngine:
         self.ai = AIEngine()
         self.paper = PaperTradingEngine()
         self.position_monitor = PositionMonitor()
+        self.portfolio_intel = PortfolioIntelligence()
         self._lock = threading.Lock()
         # In-memory ring buffer of recent tick results so the UI can show "what the bot did".
         self._recent_ticks: list[TickResult] = []
@@ -133,6 +138,19 @@ class BotEngine:
         auto_exits = self._monitor_positions(cfg, universe, result)
         if auto_exits > 0:
             result.notes.append(f"auto_exits={auto_exits}")
+
+        # -----------------------------------------------------------------
+        # PORTFOLIO INTELLIGENCE: Proactive portfolio management.
+        # This is where the "smart" behavior happens - instead of passively
+        # waiting for losing positions to recover, we:
+        #   1. DCA into losers at better prices
+        #   2. Scale into winners that keep working
+        #   3. Open offset trades to balance underwater positions
+        # This runs EVERY tick, regardless of slot availability.
+        # -----------------------------------------------------------------
+        intel_actions = self._run_portfolio_intelligence(cfg, universe, result)
+        if intel_actions > 0:
+            result.notes.append(f"portfolio_intel_actions={intel_actions}")
 
         # Walk every active wallet.
         with session_scope() as s:
@@ -417,6 +435,103 @@ class BotEngine:
             wallet_id=wallet["id"],
             level="info",
         )
+
+    # ------------------------------------------------------------------ #
+    # Portfolio Intelligence
+    # ------------------------------------------------------------------ #
+
+    def _run_portfolio_intelligence(
+        self,
+        cfg: BotConfig,
+        universe: list[dict[str, Any]],
+        result: TickResult,
+    ) -> int:
+        """
+        Proactive portfolio management - DCA, scale-in, offset trades.
+        
+        This is what makes the bot ACTIVE instead of passive.
+        Instead of opening 3 positions and hoping they recover,
+        we continuously look for ways to improve portfolio P&L.
+        
+        Returns the number of actions executed.
+        """
+        # Build price map
+        price_map: dict[str, float] = {}
+        for product in universe:
+            symbol = product["product_id"]
+            price_payload = get_price(symbol)
+            if price_payload.get("ok"):
+                price_map[symbol] = float(price_payload["price"])
+        
+        if not price_map:
+            return 0
+        
+        # Get all wallets with positions
+        with session_scope() as s:
+            wallet_ids = (
+                s.query(PaperTrade.wallet_id)
+                .filter(PaperTrade.status == "open")
+                .distinct()
+                .all()
+            )
+            wallet_ids = [w[0] for w in wallet_ids]
+        
+        actions_executed = 0
+        
+        for wallet_id in wallet_ids:
+            # Generate portfolio improvement actions
+            actions = self.portfolio_intel.generate_actions(
+                wallet_id=wallet_id,
+                price_map=price_map,
+                universe=universe,
+                cfg=cfg,
+                max_actions=3,  # Max 3 actions per wallet per tick
+            )
+            
+            for action in actions:
+                self._log(
+                    "portfolio",
+                    f"Portfolio Intel: {action.action_type.upper()} {action.symbol} - {action.reason}",
+                    wallet_id=wallet_id,
+                    level="info",
+                )
+                
+                # Execute the action
+                outcome = execute_portfolio_action(
+                    action=action,
+                    wallet_id=wallet_id,
+                    paper_engine=self.paper,
+                    cfg=cfg,
+                )
+                
+                if outcome.get("ok"):
+                    actions_executed += 1
+                    self._log(
+                        "portfolio",
+                        f"Portfolio Intel SUCCESS: {action.action_type} {action.symbol} executed",
+                        wallet_id=wallet_id,
+                        level="success",
+                    )
+                    
+                    # Notify
+                    try:
+                        from services.notifier import notify
+                        notify(
+                            f"Portfolio Intel: {action.action_type.upper()} {action.symbol} - {action.reason[:100]}",
+                            level="info",
+                            category="portfolio_intel",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    self._log(
+                        "portfolio",
+                        f"Portfolio Intel FAILED: {action.action_type} {action.symbol} - {outcome.get('error')}",
+                        wallet_id=wallet_id,
+                        level="warn",
+                    )
+        
+        return actions_executed
 
     # ------------------------------------------------------------------ #
     # Position Monitoring
