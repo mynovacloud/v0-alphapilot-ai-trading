@@ -196,6 +196,127 @@ function recordIntelAction(type, symbol, reason) {
 </div>
 
 <!-- ============================================================ -->
+<!-- P&L BY TIME PERIOD                                            -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="pnl-period-card">
+  <div class="card-header">
+    <div class="card-title">Performance by Period</div>
+    <div class="flex gap-1" id="pnl-period-filters">
+      <button type="button" class="btn btn-sm btn-outline pnl-filter active" data-period="today">Today</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="3days">3 Days</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="week">This Week</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="2weeks">2 Weeks</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="month">Month</button>
+      <button type="button" class="btn btn-sm btn-outline pnl-filter" data-period="all">All Time</button>
+    </div>
+  </div>
+  
+  <div class="grid" style="grid-template-columns: repeat(6, 1fr); gap: 1rem; padding-top: 0.5rem;">
+    <!-- Total P&L -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Total P&L</div>
+      <div id="pnl-total" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--text);">$0.00</div>
+    </div>
+    
+    <!-- Trade Count -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Trades</div>
+      <div id="pnl-trades" class="mono" style="font-size: 1.5rem; font-weight: 800;">0</div>
+      <div id="pnl-wl" class="text-dim" style="font-size: 0.72rem;">0W / 0L</div>
+    </div>
+    
+    <!-- Win Rate -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Win Rate</div>
+      <div id="pnl-winrate" class="mono" style="font-size: 1.5rem; font-weight: 800;">0%</div>
+    </div>
+    
+    <!-- Avg Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Avg Trade</div>
+      <div id="pnl-avg" class="mono" style="font-size: 1.5rem; font-weight: 800;">$0.00</div>
+    </div>
+    
+    <!-- Best Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Best Trade</div>
+      <div id="pnl-best" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--good);">$0.00</div>
+    </div>
+    
+    <!-- Worst Trade -->
+    <div>
+      <div class="text-muted" style="font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.05em;">Worst Trade</div>
+      <div id="pnl-worst" class="mono" style="font-size: 1.5rem; font-weight: 800; color: var(--bad);">$0.00</div>
+    </div>
+  </div>
+  
+  <div style="margin-top: 0.8rem; padding-top: 0.6rem; border-top: 1px solid var(--border);">
+    <span class="text-dim" style="font-size: 0.72rem;">
+      Daily average: <span id="pnl-daily-avg" class="mono">$0.00</span> · 
+      Volume traded: <span id="pnl-volume" class="mono">$0.00</span>
+    </span>
+  </div>
+</div>
+
+<script>
+// P&L Period Stats
+async function loadPnlStats(period = 'today') {
+  try {
+    const res = await fetch(`/v1/pnl-stats?period=${period}`);
+    const data = await res.json();
+    if (!data.ok) return;
+    
+    const totalEl = document.getElementById('pnl-total');
+    const pnl = data.total_pnl;
+    totalEl.textContent = (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2);
+    totalEl.style.color = pnl > 0 ? 'var(--good)' : (pnl < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-trades').textContent = data.trade_count;
+    document.getElementById('pnl-wl').textContent = `${data.wins}W / ${data.losses}L`;
+    
+    const wrEl = document.getElementById('pnl-winrate');
+    wrEl.textContent = data.win_rate.toFixed(1) + '%';
+    wrEl.style.color = data.win_rate >= 55 ? 'var(--good)' : (data.win_rate >= 40 ? 'var(--warn)' : 'var(--bad)');
+    
+    const avgEl = document.getElementById('pnl-avg');
+    avgEl.textContent = (data.avg_trade >= 0 ? '+' : '') + '$' + data.avg_trade.toFixed(2);
+    avgEl.style.color = data.avg_trade > 0 ? 'var(--good)' : (data.avg_trade < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-best').textContent = '+$' + data.best_trade.toFixed(2);
+    document.getElementById('pnl-worst').textContent = '-$' + Math.abs(data.worst_trade).toFixed(2);
+    
+    const dailyEl = document.getElementById('pnl-daily-avg');
+    dailyEl.textContent = (data.daily_avg >= 0 ? '+' : '') + '$' + data.daily_avg.toFixed(2);
+    dailyEl.style.color = data.daily_avg > 0 ? 'var(--good)' : (data.daily_avg < 0 ? 'var(--bad)' : 'var(--text)');
+    
+    document.getElementById('pnl-volume').textContent = '$' + data.total_volume.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+  } catch (err) {
+    console.error('Failed to load P&L stats:', err);
+  }
+}
+
+// Filter button handlers
+document.querySelectorAll('.pnl-filter').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.pnl-filter').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    loadPnlStats(btn.dataset.period);
+  });
+});
+
+// Load initial stats
+loadPnlStats('today');
+</script>
+
+<style>
+.pnl-filter.active {
+  background: var(--accent) !important;
+  color: white !important;
+  border-color: var(--accent) !important;
+}
+</style>
+
+<!-- ============================================================ -->
 <!-- LIVE TRADING SESSION                                            -->
 <!-- Real-time paper trading with the autonomous engine running.     -->
 <!-- ============================================================ -->

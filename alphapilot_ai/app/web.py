@@ -2580,3 +2580,85 @@ def api_portfolio_intel() -> JSONResponse:
         "portfolios": portfolio_states,
         "recent_actions": recent_actions,
     })
+
+
+@router.get("/v1/pnl-stats")
+def api_pnl_stats(period: str = "today") -> JSONResponse:
+    """
+    Get realized P&L stats for a given time period.
+    
+    period: today, 3days, week, 2weeks, month, all
+    """
+    from datetime import datetime, timedelta
+    
+    now = datetime.utcnow()
+    
+    # Calculate start date based on period
+    if period == "today":
+        start_date = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "3days":
+        start_date = (now - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "week":
+        start_date = (now - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "2weeks":
+        start_date = (now - timedelta(days=14)).replace(hour=0, minute=0, second=0, microsecond=0)
+    elif period == "month":
+        start_date = (now - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0)
+    else:  # all
+        start_date = None
+    
+    with session_scope() as s:
+        query = s.query(PaperTrade).filter(PaperTrade.status == "closed")
+        
+        if start_date:
+            query = query.filter(PaperTrade.closed_at >= start_date)
+        
+        closed_trades = query.all()
+        
+        # Calculate stats
+        total_pnl = 0.0
+        wins = 0
+        losses = 0
+        best_trade = 0.0
+        worst_trade = 0.0
+        total_volume = 0.0
+        
+        for trade in closed_trades:
+            pnl = float(trade.realized_pnl or 0)
+            total_pnl += pnl
+            total_volume += float(trade.entry_price or 0) * float(trade.qty or 0)
+            
+            if pnl > 0:
+                wins += 1
+                if pnl > best_trade:
+                    best_trade = pnl
+            elif pnl < 0:
+                losses += 1
+                if pnl < worst_trade:
+                    worst_trade = pnl
+        
+        trade_count = len(closed_trades)
+        win_rate = (wins / trade_count * 100) if trade_count > 0 else 0
+        avg_trade = (total_pnl / trade_count) if trade_count > 0 else 0
+        
+        # Calculate daily average if not "today"
+        if start_date and period != "today":
+            days = (now - start_date).days or 1
+            daily_avg = total_pnl / days
+        else:
+            daily_avg = total_pnl
+    
+    return JSONResponse({
+        "ok": True,
+        "period": period,
+        "total_pnl": round(total_pnl, 2),
+        "trade_count": trade_count,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 1),
+        "avg_trade": round(avg_trade, 2),
+        "best_trade": round(best_trade, 2),
+        "worst_trade": round(worst_trade, 2),
+        "daily_avg": round(daily_avg, 2),
+        "total_volume": round(total_volume, 2),
+    })
