@@ -54,6 +54,12 @@ def _migrate_schema() -> None:
             ("max_open_positions", "INTEGER DEFAULT 3"),
             ("max_daily_loss_usd", "FLOAT DEFAULT 200.0"),
             ("max_daily_trades", "INTEGER DEFAULT 10"),
+            # Scalper mode settings
+            ("trading_style", "VARCHAR(20) DEFAULT 'hybrid'"),
+            ("micro_profit_target_usd", "FLOAT DEFAULT 0.25"),
+            ("min_profit_pct", "FLOAT DEFAULT 0.003"),
+            ("auto_reinvest", "BOOLEAN DEFAULT 1"),
+            # Futures settings
             ("futures_enabled", "BOOLEAN DEFAULT 0"),
             ("max_leverage", "FLOAT DEFAULT 1.0"),
             ("default_leverage", "FLOAT DEFAULT 1.0"),
