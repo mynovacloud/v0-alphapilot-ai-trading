@@ -1952,7 +1952,7 @@ def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
 # ============================================================================ #
 
 
-@router.get("/api/positions")
+@router.get("/v1/positions")
 def api_positions() -> JSONResponse:
     """
     Get all open positions with current P&L and SL/TP proximity.
@@ -2044,7 +2044,7 @@ def api_positions() -> JSONResponse:
     return JSONResponse({"ok": True, "positions": positions})
 
 
-@router.post("/api/positions/{trade_id}/close")
+@router.post("/v1/positions/{trade_id}/close")
 def api_close_position(trade_id: int) -> JSONResponse:
     """
     Close a single position at current market price.
@@ -2081,7 +2081,7 @@ def api_close_position(trade_id: int) -> JSONResponse:
         return JSONResponse({"ok": False, "error": result.get("error", "Unknown error")}, status_code=500)
 
 
-@router.post("/api/positions/close-all")
+@router.post("/v1/positions/close-all")
 def api_close_all_positions() -> JSONResponse:
     """
     Close all open positions at current market prices.
@@ -2132,7 +2132,7 @@ def api_close_all_positions() -> JSONResponse:
     })
 
 
-@router.post("/api/positions/take-profits")
+@router.post("/v1/positions/take-profits")
 def api_take_all_profits() -> JSONResponse:
     """
     Close only PROFITABLE positions - lock in gains immediately.
@@ -2197,7 +2197,7 @@ def api_take_all_profits() -> JSONResponse:
     })
 
 
-@router.post("/api/wallet/trading-style")
+@router.post("/v1/wallet/trading-style")
 def api_update_trading_style(
     trading_style: str = Form(...),  # scalper, swing, hybrid
     micro_profit_target_usd: float = Form(0.25),
@@ -2244,7 +2244,7 @@ def api_update_trading_style(
     })
 
 
-@router.get("/api/wallet/trading-style")
+@router.get("/v1/wallet/trading-style")
 def api_get_trading_style() -> JSONResponse:
     """Get current wallet trading style settings."""
     with session_scope() as s:
@@ -2262,7 +2262,7 @@ def api_get_trading_style() -> JSONResponse:
         })
 
 
-@router.post("/api/positions/{trade_id}/close-partial")
+@router.post("/v1/positions/{trade_id}/close-partial")
 def api_close_partial(
     trade_id: int,
     fraction: float = Form(...),
@@ -2333,7 +2333,7 @@ def api_close_partial(
     })
 
 
-@router.post("/api/positions/{trade_id}/sl-tp")
+@router.post("/v1/positions/{trade_id}/sl-tp")
 def api_update_sl_tp(
     trade_id: int,
     stop_loss_price: float | None = Form(None),
@@ -2366,7 +2366,7 @@ def api_update_sl_tp(
     return JSONResponse({"ok": True})
 
 
-@router.post("/api/positions/{trade_id}/trailing")
+@router.post("/v1/positions/{trade_id}/trailing")
 def api_set_trailing_stop(
     trade_id: int,
     trailing_stop_pct: float = Form(...),
@@ -2421,7 +2421,7 @@ def api_set_trailing_stop(
     return JSONResponse({"ok": True, "trailing_stop_price": trade.trailing_stop_price})
 
 
-@router.post("/api/positions/{trade_id}/dca")
+@router.post("/v1/positions/{trade_id}/dca")
 def api_dca_position(
     trade_id: int,
     add_usd: float = Form(...),
@@ -2470,7 +2470,7 @@ def api_dca_position(
         return JSONResponse({"ok": False, "error": "DCA failed"}, status_code=500)
 
 
-@router.post("/api/positions/emergency-exit")
+@router.post("/v1/positions/emergency-exit")
 def api_emergency_exit() -> JSONResponse:
     """
     Emergency exit: Close all positions AND engage kill switch.
@@ -2501,7 +2501,7 @@ def api_emergency_exit() -> JSONResponse:
     })
 
 
-@router.get("/api/portfolio-intel")
+@router.get("/v1/portfolio-intel")
 def api_portfolio_intel() -> JSONResponse:
     """
     Get portfolio intelligence state - whether recovery mode is active,

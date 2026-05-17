@@ -471,7 +471,7 @@ let positionsData = [];
 
 async function refreshPositions() {
   try {
-    const res = await fetch('/api/positions');
+    const res = await fetch('/v1/positions');
     const data = await res.json();
     if (data.ok) {
       positionsData = data.positions;
@@ -544,7 +544,7 @@ function renderPositions(positions) {
 async function closePosition(tradeId) {
   if (!confirm('Close this position at market price?')) return;
   try {
-    const res = await fetch(`/api/positions/${tradeId}/close`, { method: 'POST' });
+    const res = await fetch(`/v1/positions/${tradeId}/close`, { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Position closed. Realized P&L: $${data.realized_pnl.toFixed(2)}`);
@@ -560,7 +560,7 @@ async function closePosition(tradeId) {
 async function closeAllPositions() {
   if (!confirm('Close ALL open positions? This cannot be undone.')) return;
   try {
-    const res = await fetch('/api/positions/close-all', { method: 'POST' });
+    const res = await fetch('/v1/positions/close-all', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Closed ${data.closed} positions. Total P&L: $${data.total_pnl.toFixed(2)}`);
@@ -576,7 +576,7 @@ async function closeAllPositions() {
 async function emergencyExit() {
   if (!confirm('EMERGENCY EXIT: This will close ALL positions AND engage the kill switch. Continue?')) return;
   try {
-    const res = await fetch('/api/positions/emergency-exit', { method: 'POST' });
+    const res = await fetch('/v1/positions/emergency-exit', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Emergency exit complete.\n- Positions closed: ${data.positions_closed}\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Kill switch: ENGAGED`);
@@ -592,7 +592,7 @@ async function emergencyExit() {
 async function takeProfits() {
   if (!confirm('Close ALL profitable positions? This will lock in gains on all winning trades.')) return;
   try {
-    const res = await fetch('/api/positions/take-profits', { method: 'POST' });
+    const res = await fetch('/v1/positions/take-profits', { method: 'POST' });
     const data = await res.json();
     if (data.ok) {
       alert(`Profits taken!\n- Closed: ${data.closed} winners\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Held: ${data.skipped} positions`);
@@ -609,7 +609,7 @@ async function openTradingStyleModal() {
   // Fetch current settings
   let settings = { trading_style: 'hybrid', micro_profit_target_usd: 0.25, min_profit_pct: 0.003, auto_reinvest: true, max_daily_trades: 100 };
   try {
-    const res = await fetch('/api/wallet/trading-style');
+    const res = await fetch('/v1/wallet/trading-style');
     const data = await res.json();
     if (data.ok) settings = data;
   } catch (err) {}
@@ -669,7 +669,7 @@ async function saveTradingStyle() {
   formData.append('auto_reinvest', reinvest);
   
   try {
-    const res = await fetch('/api/wallet/trading-style', { method: 'POST', body: formData });
+    const res = await fetch('/v1/wallet/trading-style', { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Trading style updated!\n- Mode: ${mode}\n- Micro-target: $${microUsd}\n- Max trades/day: ${maxTrades}`);
@@ -805,7 +805,7 @@ async function updateSlTp(tradeId, type) {
   if ((type === 'tp' || type === 'both') && tpVal) formData.append('take_profit_price', tpVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/sl-tp`, {
+    const res = await fetch(`/v1/positions/${tradeId}/sl-tp`, {
       method: 'POST',
       body: formData
     });
@@ -846,7 +846,7 @@ async function setTrailingQuick(tradeId, pct) {
   const formData = new FormData();
   formData.append('trailing_stop_pct', pct);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/trailing`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/trailing`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Trailing stop set at $${data.trailing_stop_price.toFixed(4)}`);
@@ -861,7 +861,7 @@ async function quickDca(tradeId, amount) {
   const formData = new FormData();
   formData.append('add_usd', amount);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/dca`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/dca`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Added $${amount}. New avg: $${data.new_entry.toFixed(4)}`);
@@ -893,7 +893,7 @@ async function closePartial(tradeId, fraction) {
   const formData = new FormData();
   formData.append('fraction', fraction);
   try {
-    const res = await fetch(`/api/positions/${tradeId}/close-partial`, { method: 'POST', body: formData });
+    const res = await fetch(`/v1/positions/${tradeId}/close-partial`, { method: 'POST', body: formData });
     const data = await res.json();
     if (data.ok) {
       alert(`Closed ${(fraction*100).toFixed(0)}%. Realized: $${data.realized_pnl.toFixed(2)}`);
@@ -916,7 +916,7 @@ async function setTrailing(tradeId) {
   formData.append('trailing_stop_pct', trailVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/trailing`, {
+    const res = await fetch(`/v1/positions/${tradeId}/trailing`, {
       method: 'POST',
       body: formData
     });
@@ -944,7 +944,7 @@ async function executeDca(tradeId) {
   formData.append('add_usd', dcaVal);
 
   try {
-    const res = await fetch(`/api/positions/${tradeId}/dca`, {
+    const res = await fetch(`/v1/positions/${tradeId}/dca`, {
       method: 'POST',
       body: formData
     });
