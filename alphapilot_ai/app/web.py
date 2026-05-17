@@ -901,6 +901,12 @@ def settings_page(request: Request) -> HTMLResponse:
         "daily": (bot_config.get("notifier_daily_summary") or "true").lower() in {"1", "true", "yes", "on"},
         "daily_hour": bot_config.get("notifier_daily_summary_hour_utc") or "23",
     }
+    _claude_key = bot_config.get("anthropic_api_key") or ""
+    claude_cfg = {
+        "configured": bool(_claude_key),
+        "key_masked": (_claude_key[:7] + "…" + _claude_key[-4:]) if len(_claude_key) > 12 else ("set" if _claude_key else ""),
+        "model": bot_config.get("anthropic_model") or "claude-sonnet-4-6",
+    }
     with session_scope() as s:
         paused_wallets = [
             {"id": w.id, "name": w.name}
@@ -915,6 +921,7 @@ def settings_page(request: Request) -> HTMLResponse:
         recent_ticks=recent_ticks,
         recent_recons=recent_recons,
         notifier_cfg=notifier_cfg,
+        claude_cfg=claude_cfg,
         kill_switch=kill_switch,
         paused_wallets=paused_wallets,
         settings=settings,
@@ -1062,6 +1069,56 @@ def settings_notifier_test() -> RedirectResponse:
 def settings_notifier_send_summary_now() -> RedirectResponse:
     from services.daily_summary import maybe_send_daily_summary
     maybe_send_daily_summary(force=True)
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/claude/save")
+def settings_claude_save(
+    anthropic_api_key: str = Form(""),
+    anthropic_model: str = Form("claude-sonnet-4-6"),
+    keep_existing: str = Form("false"),
+) -> RedirectResponse:
+    """
+    Save Anthropic API key + model. If `keep_existing` is true and the
+    submitted key is blank, we leave the existing key untouched (so the
+    masked-input field doesn't accidentally wipe a configured key).
+    """
+    updates: dict[str, str] = {"anthropic_model": (anthropic_model or "claude-sonnet-4-6").strip()}
+    submitted_key = (anthropic_api_key or "").strip()
+    keep = keep_existing in {"true", "on", "1"}
+    if submitted_key:
+        updates["anthropic_api_key"] = submitted_key
+    elif not keep:
+        # User explicitly cleared the field with keep_existing=false → wipe.
+        updates["anthropic_api_key"] = ""
+
+    bot_config.set_many(updates)
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="ai",
+                level="info",
+                message=(
+                    f"Claude settings updated (model={updates['anthropic_model']}, "
+                    f"key_changed={'yes' if 'anthropic_api_key' in updates else 'no'})."
+                ),
+            )
+        )
+    return RedirectResponse(url="/settings", status_code=303)
+
+
+@router.post("/settings/claude/test")
+def settings_claude_test() -> RedirectResponse:
+    from services.claude_client import send_test
+    res = send_test()
+    with session_scope() as s:
+        s.add(
+            ActivityLog(
+                category="ai",
+                level="info" if res.get("ok") else "warn",
+                message=f"Claude test: {res}",
+            )
+        )
     return RedirectResponse(url="/settings", status_code=303)
 
 

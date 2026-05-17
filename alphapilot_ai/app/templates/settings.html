@@ -233,6 +233,84 @@
 </div>
 
 <div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Claude AI (Anthropic)</div>
+    {% if claude_cfg.configured %}
+      <span class="badge badge-good">Configured</span>
+    {% else %}
+      <span class="badge badge-warn">Not configured</span>
+    {% endif %}
+  </div>
+
+  <p class="text-muted mb-3" style="font-size: 0.88rem;">
+    AlphaPilot uses Claude for signal commentary, news interpretation, and
+    decision summaries. The key is stored in the
+    <span class="mono">app_settings</span> table on the server and sent only as
+    the <span class="mono">x-api-key</span> header on requests to
+    <span class="mono">api.anthropic.com</span>.
+    {% if claude_cfg.configured %}
+      Current key: <span class="mono">{{ claude_cfg.key_masked }}</span>.
+      Leave the key field blank with <strong>&quot;Keep existing key&quot;</strong>
+      checked to update only the model.
+    {% endif %}
+  </p>
+
+  <form method="post" action="/settings/claude/save" class="form-grid">
+    <div class="field" style="grid-column: 1 / -1;">
+      <label>Anthropic API Key</label>
+      <input class="input" type="password" name="anthropic_api_key"
+             autocomplete="off" placeholder="sk-ant-...">
+      <small class="text-muted">
+        Create at console.anthropic.com → API Keys. We never log or echo this value.
+      </small>
+    </div>
+
+    <div class="field">
+      <label>Model</label>
+      <select class="select" name="anthropic_model">
+        {% set _models = [
+          'claude-sonnet-4-6',
+          'claude-opus-4-1',
+          'claude-haiku-4-5',
+          'claude-3-5-sonnet-latest',
+          'claude-3-5-haiku-latest'
+        ] %}
+        {% for m in _models %}
+          <option value="{{ m }}" {{ 'selected' if claude_cfg.model == m else '' }}>{{ m }}</option>
+        {% endfor %}
+        {% if claude_cfg.model not in _models %}
+          <option value="{{ claude_cfg.model }}" selected>{{ claude_cfg.model }} (custom)</option>
+        {% endif %}
+      </select>
+    </div>
+
+    <div class="field">
+      <label class="flex items-center gap-2" style="font-weight: normal;">
+        <input type="checkbox" name="keep_existing" value="true"
+               {{ 'checked' if claude_cfg.configured else '' }}>
+        Keep existing key if blank
+      </label>
+      <small class="text-muted">Uncheck and submit a blank key to clear it.</small>
+    </div>
+
+    <div class="field" style="grid-column: 1 / -1;">
+      <button class="btn btn-primary" type="submit">Save Claude Settings</button>
+    </div>
+  </form>
+
+  <div class="flex gap-2 items-center mt-3" style="flex-wrap: wrap;">
+    <form method="post" action="/settings/claude/test">
+      <button class="btn" type="submit" {{ '' if claude_cfg.configured else 'disabled' }}>
+        Send test request
+      </button>
+    </form>
+    <span class="text-muted" style="font-size: 0.85rem;">
+      Sends a one-token &quot;OK&quot; round-trip to verify the key. Result lands in Activity Log.
+    </span>
+  </div>
+</div>
+
+<div class="card mb-4">
   <div class="card-header"><div class="card-title">Notifications</div></div>
   <p class="text-muted mb-3">
     AlphaPilot can ping a Telegram chat or Discord webhook on every fill,

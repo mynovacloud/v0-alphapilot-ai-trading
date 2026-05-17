@@ -32,6 +32,9 @@ DEFAULTS: dict[str, str] = {
     "notifier_min_level": "info",          # "info" | "warn" | "error"
     "notifier_daily_summary": "true",      # send a daily P&L summary
     "notifier_daily_summary_hour_utc": "23",  # 0..23
+    # Anthropic / Claude
+    "anthropic_api_key": "",
+    "anthropic_model": "claude-sonnet-4-6",
 }
 
 
