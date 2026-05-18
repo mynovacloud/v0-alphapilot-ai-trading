@@ -23,7 +23,7 @@ DEFAULTS: dict[str, str] = {
     "bot_position_size_usd": "80",         # default per-trade notional in USD
     "bot_max_open_per_wallet": "25",       # max concurrent positions (increased for scalping)
     "bot_max_ticks_log": "200",            # how many tick rows to keep visible
-    "bot_dry_run": "true",                 # if true, decisions are logged only (paper layer ignored)
+    "bot_dry_run": "false",                # if true, decisions are logged only (paper layer ignored)
     # Aggressive trading settings
     "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
     "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+

@@ -25,7 +25,20 @@ def performance_metrics() -> dict[str, Any]:
         }
     closed = df[df["status"] == "closed"].copy()
     if closed.empty:
-        return performance_metrics.__wrapped__() if hasattr(performance_metrics, "__wrapped__") else {}
+        return {
+            "profit_factor": 0.0,
+            "sharpe_placeholder": 0.0,
+            "max_drawdown": 0.0,
+            "avg_rr": 0.0,
+            "max_consecutive_wins": 0,
+            "max_consecutive_losses": 0,
+            "biggest_win": 0.0,
+            "biggest_loss": 0.0,
+            "avg_trade_duration_hours": 0.0,
+            "avg_win": 0.0,
+            "avg_loss": 0.0,
+            "total_closed": 0,
+        }
 
     pnl = closed["realized_pnl"].astype(float)
     gross_profit = pnl[pnl > 0].sum()

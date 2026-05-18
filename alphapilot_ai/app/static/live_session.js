@@ -12,7 +12,7 @@
 (function () {
   "use strict";
 
-  const POLL_MS = 1500;
+  const POLL_MS = 3000;  // Poll every 3 seconds (was 1.5s - too aggressive)
   const MAX_FEED_ITEMS = 120;
 
   // --- DOM ---

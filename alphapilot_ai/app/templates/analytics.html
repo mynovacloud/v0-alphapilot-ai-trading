@@ -6,22 +6,26 @@
 <div class="page-head">
   <div>
     <h1>Analytics</h1>
-    <p>Portfolio-wide performance breakdown. All numbers are computed live from your paper trade history.</p>
+    <p>Complete trading history and performance breakdown. All buys, sells, and positions.</p>
+  </div>
+  <div class="flex gap-2">
+    <button class="btn btn-sm btn-outline" onclick="refreshAnalytics()">Refresh</button>
   </div>
 </div>
 
-<div class="kpi-grid">
+<!-- Summary KPIs -->
+<div class="kpi-grid mb-4">
+  <div class="kpi"><div class="kpi-label">Total Trades</div><div class="kpi-value tnum">{{ total_trades }}</div></div>
+  <div class="kpi"><div class="kpi-label">Win Rate</div><div class="kpi-value tnum {{ 'text-good' if perf.win_rate >= 0.5 else 'text-bad' }}">{{ (summary.win_rate * 100) | round(1) }}%</div></div>
   <div class="kpi"><div class="kpi-label">Profit Factor</div><div class="kpi-value tnum">{{ perf.profit_factor }}</div></div>
-  <div class="kpi"><div class="kpi-label">Sharpe (proxy)</div><div class="kpi-value tnum">{{ perf.sharpe_placeholder }}</div></div>
-  <div class="kpi"><div class="kpi-label">Avg R:R</div><div class="kpi-value tnum">{{ perf.avg_rr }}</div></div>
-  <div class="kpi"><div class="kpi-label">Max DD</div><div class="kpi-value tnum text-bad">{{ (perf.max_drawdown * 100) | round(1) }}%</div></div>
+  <div class="kpi"><div class="kpi-label">Total P&amp;L</div><div class="kpi-value tnum {{ 'text-good' if summary.total_pnl >= 0 else 'text-bad' }}">{{ summary.total_pnl | signed }}</div></div>
+  <div class="kpi"><div class="kpi-label">Unrealized P&amp;L</div><div class="kpi-value tnum {{ 'text-good' if summary.unrealized_pnl >= 0 else 'text-bad' }}">{{ summary.unrealized_pnl | signed }}</div></div>
+  <div class="kpi"><div class="kpi-label">Open Positions</div><div class="kpi-value tnum">{{ open_count }}</div></div>
   <div class="kpi"><div class="kpi-label">Best Win</div><div class="kpi-value tnum text-good">{{ perf.biggest_win | money }}</div></div>
   <div class="kpi"><div class="kpi-label">Worst Loss</div><div class="kpi-value tnum text-bad">{{ perf.biggest_loss | money }}</div></div>
-  <div class="kpi"><div class="kpi-label">Win Streak</div><div class="kpi-value tnum">{{ perf.max_consecutive_wins }}</div></div>
-  <div class="kpi"><div class="kpi-label">Loss Streak</div><div class="kpi-value tnum">{{ perf.max_consecutive_losses }}</div></div>
-  <div class="kpi"><div class="kpi-label">Avg Duration</div><div class="kpi-value tnum">{{ perf.avg_trade_duration_hours }}h</div></div>
 </div>
 
+<!-- Period P&L and Performance -->
 <div class="grid grid-2-1 mb-4">
   <div class="card">
     <div class="card-header"><div class="card-title">Equity Curve</div></div>
@@ -34,11 +38,127 @@
       <div class="flex justify-between"><span class="text-muted">Weekly</span><span class="tnum {{ 'text-good' if summary.weekly_pnl >= 0 else 'text-bad' }}">{{ summary.weekly_pnl | signed }}</span></div>
       <div class="flex justify-between"><span class="text-muted">Monthly</span><span class="tnum {{ 'text-good' if summary.monthly_pnl >= 0 else 'text-bad' }}">{{ summary.monthly_pnl | signed }}</span></div>
       <div class="flex justify-between"><span class="text-muted">YTD</span><span class="tnum {{ 'text-good' if summary.ytd_pnl >= 0 else 'text-bad' }}">{{ summary.ytd_pnl | signed }}</span></div>
-      <div class="flex justify-between"><span class="text-muted">Total</span><span class="tnum {{ 'text-good' if summary.total_pnl >= 0 else 'text-bad' }}">{{ summary.total_pnl | signed }}</span></div>
+      <div class="flex justify-between font-medium"><span class="text-muted">Total Realized</span><span class="tnum {{ 'text-good' if summary.total_pnl >= 0 else 'text-bad' }}">{{ summary.total_pnl | signed }}</span></div>
     </div>
   </div>
 </div>
 
+<!-- Advanced Metrics -->
+<div class="kpi-grid mb-4">
+  <div class="kpi"><div class="kpi-label">Avg Win</div><div class="kpi-value tnum text-good">{{ perf.avg_win | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Avg Loss</div><div class="kpi-value tnum text-bad">{{ perf.avg_loss | money }}</div></div>
+  <div class="kpi"><div class="kpi-label">Avg R:R</div><div class="kpi-value tnum">{{ perf.avg_rr }}</div></div>
+  <div class="kpi"><div class="kpi-label">Max Drawdown</div><div class="kpi-value tnum text-bad">{{ (perf.max_drawdown * 100) | round(1) }}%</div></div>
+  <div class="kpi"><div class="kpi-label">Win Streak</div><div class="kpi-value tnum text-good">{{ perf.max_consecutive_wins }}</div></div>
+  <div class="kpi"><div class="kpi-label">Loss Streak</div><div class="kpi-value tnum text-bad">{{ perf.max_consecutive_losses }}</div></div>
+  <div class="kpi"><div class="kpi-label">Avg Duration</div><div class="kpi-value tnum">{{ perf.avg_trade_duration_hours }}h</div></div>
+  <div class="kpi"><div class="kpi-label">Sharpe (proxy)</div><div class="kpi-value tnum">{{ perf.sharpe_placeholder }}</div></div>
+</div>
+
+<!-- Open Positions -->
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Open Positions ({{ open_count }})</div>
+  </div>
+  {% if open_positions %}
+  <div class="table-wrap">
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Qty</th>
+          <th>Entry</th>
+          <th>Current</th>
+          <th>Unrealized P&amp;L</th>
+          <th>P&amp;L %</th>
+          <th>Opened</th>
+          <th>Duration</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in open_positions %}
+        <tr>
+          <td class="font-medium">{{ t.symbol }}</td>
+          <td><span class="badge {{ 'badge-good' if t.side == 'BUY' else 'badge-bad' }}">{{ t.side }}</span></td>
+          <td class="tnum">{{ t.qty | round(6) }}</td>
+          <td class="tnum">${{ t.entry_price | round(4) }}</td>
+          <td class="tnum">${{ t.current_price | round(4) }}</td>
+          <td class="tnum {{ 'text-good' if t.unrealized_pnl >= 0 else 'text-bad' }}">{{ t.unrealized_pnl | signed }}</td>
+          <td class="tnum {{ 'text-good' if t.pnl_pct >= 0 else 'text-bad' }}">{{ t.pnl_pct | round(2) }}%</td>
+          <td class="text-muted">{{ t.opened_at | timeago }}</td>
+          <td class="tnum">{{ t.duration_hours | round(1) }}h</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">No open positions.</div>
+  {% endif %}
+</div>
+
+<!-- Closed Trades History -->
+<div class="card mb-4">
+  <div class="card-header">
+    <div class="card-title">Trade History ({{ closed_count }} closed trades)</div>
+    <div class="flex gap-2">
+      <select id="filterSymbol" class="input input-sm" onchange="filterTrades()" style="width: 120px;">
+        <option value="">All Symbols</option>
+        {% for sym in symbols %}
+        <option value="{{ sym }}">{{ sym }}</option>
+        {% endfor %}
+      </select>
+      <select id="filterOutcome" class="input input-sm" onchange="filterTrades()" style="width: 100px;">
+        <option value="">All</option>
+        <option value="win">Winners</option>
+        <option value="loss">Losers</option>
+      </select>
+    </div>
+  </div>
+  {% if closed_trades %}
+  <div class="table-wrap">
+    <table class="data-table" id="tradesTable">
+      <thead>
+        <tr>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th>Qty</th>
+          <th>Entry</th>
+          <th>Exit</th>
+          <th>P&amp;L</th>
+          <th>P&amp;L %</th>
+          <th>Opened</th>
+          <th>Closed</th>
+          <th>Duration</th>
+          <th>Exit Reason</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for t in closed_trades %}
+        <tr data-symbol="{{ t.symbol }}" data-outcome="{{ 'win' if t.realized_pnl > 0 else 'loss' }}">
+          <td class="font-medium">{{ t.symbol }}</td>
+          <td><span class="badge {{ 'badge-good' if t.side == 'BUY' else 'badge-bad' }}">{{ t.side }}</span></td>
+          <td class="tnum">{{ t.qty | round(6) }}</td>
+          <td class="tnum">${{ t.entry_price | round(4) }}</td>
+          <td class="tnum">${{ t.exit_price | round(4) if t.exit_price else '-' }}</td>
+          <td class="tnum {{ 'text-good' if t.realized_pnl >= 0 else 'text-bad' }}">{{ t.realized_pnl | signed }}</td>
+          <td class="tnum {{ 'text-good' if t.pnl_pct >= 0 else 'text-bad' }}">{{ t.pnl_pct | round(2) }}%</td>
+          <td class="text-muted">{{ t.opened_at | timeago }}</td>
+          <td class="text-muted">{{ t.closed_at | timeago }}</td>
+          <td class="tnum">{{ t.duration_hours | round(1) }}h</td>
+          <td><span class="badge badge-dim">{{ t.exit_reason or 'manual' }}</span></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">No closed trades yet.</div>
+  {% endif %}
+</div>
+
+<!-- P&L by Wallet and Strategy -->
 <div class="grid grid-2 mb-4">
   <div class="card">
     <div class="card-header"><div class="card-title">P&amp;L by Wallet</div></div>
@@ -50,6 +170,7 @@
   </div>
 </div>
 
+<!-- P&L Distribution Histogram -->
 <div class="card">
   <div class="card-header"><div class="card-title">P&amp;L Distribution</div></div>
   {% set max_h = histogram | max %}
@@ -67,5 +188,28 @@
     <div class="empty">Not enough closed trades to plot.</div>
   {% endif %}
 </div>
+
+<script>
+function refreshAnalytics() {
+  window.location.reload();
+}
+
+function filterTrades() {
+  const symbol = document.getElementById('filterSymbol').value;
+  const outcome = document.getElementById('filterOutcome').value;
+  const rows = document.querySelectorAll('#tradesTable tbody tr');
+  
+  rows.forEach(row => {
+    const rowSymbol = row.dataset.symbol;
+    const rowOutcome = row.dataset.outcome;
+    
+    let show = true;
+    if (symbol && rowSymbol !== symbol) show = false;
+    if (outcome && rowOutcome !== outcome) show = false;
+    
+    row.style.display = show ? '' : 'none';
+  });
+}
+</script>
 
 {% endblock %}

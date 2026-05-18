@@ -1207,7 +1207,7 @@ def training_session_feed(
     since_trade_id: int = Query(0, ge=0),
 ) -> JSONResponse:
     """
-    Polled every 2s by the Training Center while a live session is running.
+    Polled every 3s by the Training Center while a live session is running.
 
     Returns:
       - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
@@ -1218,7 +1218,7 @@ def training_session_feed(
       - ticks:     last 5 tick summaries for the "what just happened" panel
     """
     from config.bot_config import get as cfg_get
-    from connectors.live_prices import get_price
+    from connectors.live_prices import get_prices_batch
     from database.models import ClaudeDecision
     from services.scheduler import bot_scheduler
     from trading.bot_engine import bot_engine
@@ -1238,9 +1238,11 @@ def training_session_feed(
         invested_open = 0.0
         wins = 0
         losses = 0
-        # Re-mark every open position to the latest live price so the
-        # "Currently Sitting At" number truly updates in real time.
-        symbol_prices: dict[str, float] = {}
+        
+        # Collect all open position symbols for batch price fetch
+        open_symbols = [t.symbol for t in all_trades if t.status == "open"]
+        symbol_prices = get_prices_batch(list(set(open_symbols))) if open_symbols else {}
+        
         for t in all_trades:
             if t.status == "closed":
                 pnl = float(t.realized_pnl or 0)
@@ -1253,11 +1255,7 @@ def training_session_feed(
             entry = float(t.entry_price or 0)
             qty = float(t.qty or 0)
             invested_open += entry * qty
-            mark = symbol_prices.get(t.symbol)
-            if mark is None:
-                p = get_price(t.symbol)
-                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
-                symbol_prices[t.symbol] = mark
+            mark = symbol_prices.get(t.symbol, 0.0)
             if mark > 0 and entry > 0:
                 if (t.side or "").upper() == "BUY":
                     unrealized += (mark - entry) * qty
@@ -1485,50 +1483,171 @@ def training_memory_add(
 
 @router.get("/analytics", response_class=HTMLResponse)
 def analytics_page(request: Request) -> HTMLResponse:
-    summary = portfolio_summary()
-    perf = performance_metrics()
+    """Comprehensive analytics page with all trades and positions."""
+    import traceback
+    from connectors.live_prices import get_prices_batch
+    
+    try:
+        summary = portfolio_summary()
+        perf = performance_metrics()
 
-    eq = equity_curve_df()
-    equity_points: list[dict[str, Any]] = []
-    if not eq.empty:
-        for _, row in eq.iterrows():
-            equity_points.append({"date": str(row["date"]), "equity": float(row["equity"])})
+        eq = equity_curve_df()
+        equity_points: list[dict[str, Any]] = []
+        if not eq.empty:
+            for _, row in eq.iterrows():
+                equity_points.append({"date": str(row["date"]), "equity": float(row["equity"])})
 
-    by_wallet = pnl_by_wallet()
-    wallet_pnl = []
-    if not by_wallet.empty:
-        wallet_pnl = [{"label": r["wallet"], "value": float(r["pnl"])} for _, r in by_wallet.iterrows()]
+        by_wallet = pnl_by_wallet()
+        wallet_pnl = []
+        if not by_wallet.empty:
+            wallet_pnl = [{"label": r["wallet"], "value": float(r["pnl"])} for _, r in by_wallet.iterrows()]
 
-    by_strat = pnl_by_strategy()
-    strategy_pnl = []
-    if not by_strat.empty:
-        strategy_pnl = [{"label": r["strategy"], "value": float(r["pnl"])} for _, r in by_strat.iterrows()]
+        by_strat = pnl_by_strategy()
+        strategy_pnl = []
+        if not by_strat.empty:
+            strategy_pnl = [{"label": r["strategy"], "value": float(r["pnl"])} for _, r in by_strat.iterrows()]
 
-    # Win/loss histogram
-    df = get_all_trades_df()
-    histogram: list[int] = [0] * 10
-    if not df.empty:
-        closed = df[df["status"] == "closed"]
-        if not closed.empty:
-            pnls = closed["realized_pnl"].astype(float).tolist()
-            if pnls:
-                lo, hi = min(pnls), max(pnls)
-                rng = hi - lo if hi > lo else 1.0
-                for v in pnls:
-                    bucket = min(9, max(0, int((v - lo) / rng * 10)))
-                    histogram[bucket] += 1
+        # Get all trades from database
+        df = get_all_trades_df()
+        
+        # Prepare open positions with current prices
+        open_positions = []
+        closed_trades = []
+        symbols = set()
+        
+        if not df.empty:
+            # Get unique symbols for batch price fetch
+            open_df = df[df["status"] == "open"]
+            open_symbols = open_df["symbol"].unique().tolist() if not open_df.empty else []
+            price_map = get_prices_batch(open_symbols) if open_symbols else {}
+            
+            # Process open positions
+            for _, row in open_df.iterrows():
+                symbol = row["symbol"]
+                symbols.add(symbol)
+                entry = float(row["entry_price"] or 0)
+                qty = float(row["qty"] or 0)
+                side = (row["side"] or "BUY").upper()
+                current = price_map.get(symbol, entry)
+                
+                if side == "BUY":
+                    unrealized = (current - entry) * qty
+                    pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+                else:
+                    unrealized = (entry - current) * qty
+                    pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
+                
+                opened_at = row["opened_at"]
+                duration_hours = 0
+                if opened_at:
+                    from utils.helpers import utcnow
+                    delta = utcnow().replace(tzinfo=None) - opened_at.replace(tzinfo=None)
+                    duration_hours = delta.total_seconds() / 3600
+                
+                open_positions.append({
+                    "id": row["id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry,
+                    "current_price": current,
+                    "unrealized_pnl": round(unrealized, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "opened_at": opened_at,
+                    "duration_hours": round(duration_hours, 1),
+                })
+            
+            # Process closed trades
+            closed_df = df[df["status"] == "closed"].sort_values("closed_at", ascending=False)
+            for _, row in closed_df.iterrows():
+                symbol = row["symbol"]
+                symbols.add(symbol)
+                entry = float(row["entry_price"] or 0)
+                exit_price = float(row["exit_price"]) if row["exit_price"] else None
+                qty = float(row["qty"] or 0)
+                realized = float(row["realized_pnl"] or 0)
+                
+                pnl_pct = 0
+                if entry > 0 and exit_price:
+                    side = (row["side"] or "BUY").upper()
+                    if side == "BUY":
+                        pnl_pct = ((exit_price - entry) / entry) * 100
+                    else:
+                        pnl_pct = ((entry - exit_price) / entry) * 100
+                
+                opened_at = row["opened_at"]
+                closed_at = row["closed_at"]
+                duration_hours = 0
+                if opened_at and closed_at:
+                    delta = closed_at.replace(tzinfo=None) - opened_at.replace(tzinfo=None)
+                    duration_hours = delta.total_seconds() / 3600
+                
+                closed_trades.append({
+                    "id": row["id"],
+                    "symbol": symbol,
+                    "side": (row["side"] or "BUY").upper(),
+                    "qty": qty,
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "realized_pnl": round(realized, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "opened_at": opened_at,
+                    "closed_at": closed_at,
+                    "duration_hours": round(duration_hours, 1),
+                    "exit_reason": getattr(row, "exit_reason", None) or row.get("exit_reason"),
+                })
 
-    return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
+        # Win/loss histogram
+        histogram: list[int] = [0] * 10
+        if not df.empty:
+            closed = df[df["status"] == "closed"]
+            if not closed.empty:
+                pnls = closed["realized_pnl"].astype(float).tolist()
+                if pnls:
+                    lo, hi = min(pnls), max(pnls)
+                    rng = hi - lo if hi > lo else 1.0
+                    for v in pnls:
+                        bucket = min(9, max(0, int((v - lo) / rng * 10)))
+                        histogram[bucket] += 1
+
+        return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
+                request,
+                active="analytics",
+                summary=summary,
+                perf=perf,
+                equity_points=equity_points,
+                wallet_pnl=wallet_pnl,
+                strategy_pnl=strategy_pnl,
+                histogram=histogram,
+                open_positions=open_positions,
+                closed_trades=closed_trades,
+                open_count=len(open_positions),
+                closed_count=len(closed_trades),
+                total_trades=len(open_positions) + len(closed_trades),
+                symbols=sorted(symbols),
+            ),
+        )
+    except Exception as e:
+        import logging
+        logging.exception("[ANALYTICS] Error loading page")
+        # Return error page instead of crashing
+        return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
             request,
             active="analytics",
-            summary=summary,
-            perf=perf,
-            equity_points=equity_points,
-            wallet_pnl=wallet_pnl,
-            strategy_pnl=strategy_pnl,
-            histogram=histogram,
-        ),
-)
+            summary={"total_pnl": 0, "unrealized_pnl": 0, "daily_pnl": 0, "weekly_pnl": 0, "monthly_pnl": 0, "ytd_pnl": 0, "win_rate": 0},
+            perf={"profit_factor": 0, "sharpe_placeholder": 0, "max_drawdown": 0, "avg_rr": 0, "max_consecutive_wins": 0, "max_consecutive_losses": 0, "biggest_win": 0, "biggest_loss": 0, "avg_trade_duration_hours": 0, "avg_win": 0, "avg_loss": 0, "win_rate": 0},
+            equity_points=[],
+            wallet_pnl=[],
+            strategy_pnl=[],
+            histogram=[0]*10,
+            open_positions=[],
+            closed_trades=[],
+            open_count=0,
+            closed_count=0,
+            total_trades=0,
+            symbols=[],
+            error=str(e),
+        ))
 
 
 # ----------------------------------------------------------------------
@@ -1961,7 +2080,7 @@ def api_positions() -> JSONResponse:
     import traceback
     
     try:
-        from connectors.live_prices import get_price
+        from connectors.live_prices import get_prices_batch
 
         with session_scope() as s:
             trades = (
@@ -1970,83 +2089,107 @@ def api_positions() -> JSONResponse:
                 .order_by(PaperTrade.opened_at.desc())
                 .all()
             )
-
-            positions = []
+            
+            # Extract trade data while in session
+            trade_data = []
+            symbols = []
             for t in trades:
-                try:
-                    entry = float(t.entry_price or 0)
-                    qty = float(t.qty or 0)
-                    side = (t.side or "BUY").upper()
+                trade_data.append({
+                    "id": t.id,
+                    "wallet_id": t.wallet_id,
+                    "symbol": t.symbol,
+                    "side": (t.side or "BUY").upper(),
+                    "qty": float(t.qty or 0),
+                    "entry_price": float(t.entry_price or 0),
+                    "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
+                    "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
+                    "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
+                    "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
+                    "max_loss_pct": float(t.max_loss_pct or 0.10),
+                    "dca_count": t.dca_count or 0,
+                    "opened_at": t.opened_at,
+                })
+                symbols.append(t.symbol)
+        
+        # Batch fetch all prices at once (much faster!)
+        price_map = get_prices_batch(list(set(symbols))) if symbols else {}
+        
+        positions = []
+        for t in trade_data:
+            try:
+                entry = t["entry_price"]
+                qty = t["qty"]
+                side = t["side"]
+                symbol = t["symbol"]
 
-                    # Get current price
-                    p = get_price(t.symbol)
-                    current = float(p.get("price") or 0) if p.get("ok") else entry
+                # Get current price from batch results
+                current = price_map.get(symbol, entry)
 
-                    # Calculate P&L
+                # Calculate P&L
+                if side == "BUY":
+                    pnl = (current - entry) * qty
+                    pnl_pct = (current - entry) / entry if entry > 0 else 0
+                else:
+                    pnl = (entry - current) * qty
+                    pnl_pct = (entry - current) / entry if entry > 0 else 0
+
+                # Calculate SL/TP proximity (0-1 where 1 = at the level)
+                sl_proximity = 0.0
+                tp_proximity = 0.0
+
+                if t["stop_loss_price"] and entry > 0:
+                    sl = t["stop_loss_price"]
                     if side == "BUY":
-                        pnl = (current - entry) * qty
-                        pnl_pct = (current - entry) / entry if entry > 0 else 0
+                        sl_range = entry - sl
+                        current_dist = current - sl
+                        sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
                     else:
-                        pnl = (entry - current) * qty
-                        pnl_pct = (entry - current) / entry if entry > 0 else 0
+                        sl_range = sl - entry
+                        current_dist = sl - current
+                        sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
 
-                    # Calculate SL/TP proximity (0-1 where 1 = at the level)
-                    sl_proximity = 0.0
-                    tp_proximity = 0.0
+                if t["take_profit_price"] and entry > 0:
+                    tp = t["take_profit_price"]
+                    if side == "BUY":
+                        tp_range = tp - entry
+                        current_dist = tp - current
+                        tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+                    else:
+                        tp_range = entry - tp
+                        current_dist = current - tp
+                        tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
 
-                    if t.stop_loss_price and entry > 0:
-                        sl = float(t.stop_loss_price)
-                        if side == "BUY":
-                            sl_range = entry - sl
-                            current_dist = current - sl
-                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
-                        else:
-                            sl_range = sl - entry
-                            current_dist = sl - current
-                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+                # Time in trade
+                opened = t["opened_at"]
+                time_in_trade_min = 0
+                if opened:
+                    from utils.helpers import time_since_minutes
+                    time_in_trade_min = time_since_minutes(opened)
 
-                    if t.take_profit_price and entry > 0:
-                        tp = float(t.take_profit_price)
-                        if side == "BUY":
-                            tp_range = tp - entry
-                            current_dist = tp - current
-                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
-                        else:
-                            tp_range = entry - tp
-                            current_dist = current - tp
-                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
-
-                    # Time in trade
-                    opened = t.opened_at
-                    time_in_trade_min = 0
-                    if opened:
-                        from utils.helpers import time_since_minutes
-                        time_in_trade_min = time_since_minutes(opened)
-
-                    positions.append({
-                        "id": t.id,
-                        "wallet_id": t.wallet_id,
-                        "symbol": t.symbol,
-                        "side": side,
-                        "qty": qty,
-                        "entry_price": entry,
-                        "current_price": current,
-                        "pnl": round(pnl, 2),
-                        "pnl_pct": round(pnl_pct * 100, 2),
-                        "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
-                        "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
-                        "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
-                        "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
-                        "sl_proximity": round(sl_proximity, 3),
-                        "tp_proximity": round(tp_proximity, 3),
-                        "max_loss_pct": float(t.max_loss_pct or 0.10),
-                        "dca_count": t.dca_count or 0,
-                        "time_in_trade_min": round(time_in_trade_min, 1),
-                        "opened_at": t.opened_at.isoformat() if t.opened_at else None,
-                    })
-                except Exception as e:
-                    logging.error(f"[POSITIONS] Error processing trade {t.id}: {e}")
-                    continue
+                positions.append({
+                    "id": t["id"],
+                    "wallet_id": t["wallet_id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry,
+                    "current_price": current,
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl_pct * 100, 2),
+                    "stop_loss_price": t["stop_loss_price"],
+                    "take_profit_price": t["take_profit_price"],
+                    "trailing_stop_pct": t["trailing_stop_pct"],
+                    "trailing_stop_price": t["trailing_stop_price"],
+                    "sl_proximity": round(sl_proximity, 3),
+                    "tp_proximity": round(tp_proximity, 3),
+                    "max_loss_pct": t["max_loss_pct"],
+                    "dca_count": t["dca_count"],
+                    "time_in_trade_min": round(time_in_trade_min, 1),
+                    "opened_at": opened.isoformat() if opened else None,
+                })
+            except Exception as e:
+                logging.error(f"[POSITIONS] Error processing trade {t['id']}: {e}")
+                continue
 
         return JSONResponse({"ok": True, "positions": positions})
     except Exception as e:
@@ -2797,4 +2940,273 @@ def api_pnl_stats(period: str = "today") -> JSONResponse:
         "worst_trade": round(worst_trade, 2),
         "daily_avg": round(daily_avg, 2),
         "total_volume": round(total_volume, 2),
+    })
+
+
+# ======================================================================
+# DIAGNOSTIC ENDPOINT - Why Trades Aren't Executing
+# ======================================================================
+
+@router.get("/v1/diagnostics/trade-blockers")
+def api_trade_blockers() -> JSONResponse:
+    """
+    Comprehensive diagnostic endpoint that shows EXACTLY why trades may not be executing.
+    This checks every possible blocker in the system.
+    """
+    import logging
+    from config.bot_config import BotConfig, get as cfg_get
+    from trading.risk_manager import RiskManager
+    from datetime import timedelta
+    
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+    info: list[dict] = []
+    
+    # Load bot configuration
+    cfg = BotConfig.load()
+    
+    # =================================================================
+    # CHECK 1: Bot Enabled
+    # =================================================================
+    if not cfg.bot_enabled:
+        blockers.append({
+            "blocker": "BOT_DISABLED",
+            "message": "Bot is DISABLED. Enable it in Settings > Bot Settings.",
+            "setting": "bot_enabled",
+            "current_value": "false",
+            "fix": "Set bot_enabled to true in Settings"
+        })
+    else:
+        info.append({"check": "bot_enabled", "status": "OK", "value": True})
+    
+    # =================================================================
+    # CHECK 2: Dry Run Mode (MOST COMMON ISSUE!)
+    # =================================================================
+    if cfg.dry_run:
+        blockers.append({
+            "blocker": "DRY_RUN_MODE",
+            "message": "DRY RUN is ON! The bot logs what it WOULD do but NEVER actually opens trades!",
+            "setting": "bot_dry_run",
+            "current_value": "true",
+            "fix": "Disable 'Dry Run' in Settings to actually execute trades"
+        })
+    else:
+        info.append({"check": "dry_run", "status": "OK", "value": False})
+    
+    # =================================================================
+    # CHECK 3: Kill Switch
+    # =================================================================
+    if RiskManager.kill_switch_status():
+        blockers.append({
+            "blocker": "KILL_SWITCH_ENGAGED",
+            "message": "The global KILL SWITCH is engaged. All trading is halted.",
+            "setting": "kill_switch",
+            "fix": "Release the kill switch in Settings or via the dashboard"
+        })
+    else:
+        info.append({"check": "kill_switch", "status": "OK", "value": False})
+    
+    # =================================================================
+    # CHECK 4: Wallets
+    # =================================================================
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        if not wallets:
+            blockers.append({
+                "blocker": "NO_WALLETS",
+                "message": "No wallets configured. Create a wallet first.",
+                "fix": "Go to Wallets page and create a paper trading wallet"
+            })
+        else:
+            active_wallets = 0
+            for w in wallets:
+                wallet_issues = []
+                
+                if w.bot_paused:
+                    wallet_issues.append("bot_paused=true")
+                
+                balance = float(w.paper_balance or 0)
+                if balance < cfg.position_size_usd:
+                    wallet_issues.append(f"balance=${balance:.2f} < position_size=${cfg.position_size_usd:.2f}")
+                
+                # Check max_open_positions
+                open_count = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "open"
+                ).count()
+                max_open = w.max_open_positions or cfg.max_open_per_wallet
+                if max_open and open_count >= max_open:
+                    wallet_issues.append(f"positions={open_count}/{max_open} (FULL)")
+                
+                # Check daily loss
+                today = utcnow().date()
+                day_trades = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "closed"
+                ).all()
+                day_pnl = sum(
+                    float(t.realized_pnl or 0) for t in day_trades
+                    if t.closed_at and t.closed_at.date() == today
+                )
+                if w.max_daily_loss_usd and day_pnl <= -float(w.max_daily_loss_usd):
+                    wallet_issues.append(f"daily_loss=${day_pnl:.2f} hit cap=${w.max_daily_loss_usd}")
+                
+                # Check cooldown
+                recent = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "closed"
+                ).order_by(PaperTrade.closed_at.desc()).limit(3).all()
+                if len(recent) >= 3 and all((t.realized_pnl or 0) < 0 for t in recent):
+                    if recent[0].closed_at:
+                        cooldown_until = recent[0].closed_at + timedelta(minutes=15)
+                        if utcnow() < cooldown_until:
+                            wallet_issues.append(f"cooldown until {cooldown_until.isoformat()}")
+                
+                if wallet_issues:
+                    warnings.append({
+                        "wallet": w.name,
+                        "wallet_id": w.id,
+                        "issues": wallet_issues,
+                        "can_trade": len(wallet_issues) == 0
+                    })
+                else:
+                    active_wallets += 1
+                    info.append({
+                        "wallet": w.name,
+                        "wallet_id": w.id,
+                        "balance": float(w.paper_balance or 0),
+                        "open_positions": open_count,
+                        "max_positions": max_open,
+                        "status": "OK"
+                    })
+            
+            if active_wallets == 0:
+                blockers.append({
+                    "blocker": "ALL_WALLETS_BLOCKED",
+                    "message": "All wallets are either paused, over-extended, or out of balance",
+                    "fix": "Check wallet settings, add paper balance, or unpause wallets"
+                })
+    
+    # =================================================================
+    # CHECK 5: Confidence Floor
+    # =================================================================
+    if cfg.min_confidence >= 0.70:
+        warnings.append({
+            "warning": "HIGH_CONFIDENCE_FLOOR",
+            "message": f"Confidence floor is {cfg.min_confidence:.2f} - very few signals will pass",
+            "setting": "bot_min_confidence",
+            "current_value": cfg.min_confidence,
+            "suggestion": "Lower to 0.55 or 0.50 to see more trades"
+        })
+    info.append({"check": "min_confidence", "value": cfg.min_confidence})
+    
+    # =================================================================
+    # CHECK 6: Claude API Key
+    # =================================================================
+    from services.claude_client import is_configured as claude_is_configured
+    if not claude_is_configured():
+        warnings.append({
+            "warning": "CLAUDE_NOT_CONFIGURED",
+            "message": "Claude API key not set. Bot will use technical signals only (no AI enhancement).",
+            "setting": "anthropic_api_key",
+            "fix": "Add Anthropic API key in Settings"
+        })
+    else:
+        info.append({"check": "claude_api", "status": "configured"})
+    
+    # =================================================================
+    # CHECK 7: Scheduler Status
+    # =================================================================
+    from services.scheduler import bot_scheduler
+    scheduler_status = bot_scheduler.status()
+    if not scheduler_status.get("scheduler_running"):
+        blockers.append({
+            "blocker": "SCHEDULER_NOT_RUNNING",
+            "message": "The bot scheduler is not running. Trades won't auto-execute.",
+            "fix": "Start the scheduler via the Bot Control panel"
+        })
+    else:
+        info.append({
+            "check": "scheduler",
+            "status": "running",
+            "next_tick": scheduler_status.get("next_tick"),
+            "tick_seconds": scheduler_status.get("tick_seconds")
+        })
+    
+    # =================================================================
+    # CHECK 8: Recent Activity (any trades in last 24h?)
+    # =================================================================
+    with session_scope() as s:
+        yesterday = utcnow() - timedelta(hours=24)
+        recent_opens = s.query(PaperTrade).filter(PaperTrade.opened_at >= yesterday).count()
+        recent_closes = s.query(PaperTrade).filter(
+            PaperTrade.closed_at >= yesterday,
+            PaperTrade.status == "closed"
+        ).count()
+        
+        if recent_opens == 0 and cfg.bot_enabled and not cfg.dry_run:
+            warnings.append({
+                "warning": "NO_RECENT_TRADES",
+                "message": "No trades opened in the last 24 hours despite bot being enabled",
+                "possible_causes": [
+                    "Confidence threshold too high",
+                    "All wallets paused or over-extended",
+                    "No strong signals in the market"
+                ]
+            })
+        
+        info.append({
+            "check": "recent_activity",
+            "trades_opened_24h": recent_opens,
+            "trades_closed_24h": recent_closes
+        })
+    
+    # =================================================================
+    # CHECK 9: Training Mode
+    # =================================================================
+    is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if is_training:
+        info.append({
+            "check": "training_mode",
+            "status": "ACTIVE",
+            "note": "Training session is active - bot should be trading more aggressively"
+        })
+    
+    # =================================================================
+    # Summary
+    # =================================================================
+    can_trade = len(blockers) == 0
+    summary = {
+        "can_trade": can_trade,
+        "blocker_count": len(blockers),
+        "warning_count": len(warnings),
+        "status": "BLOCKED" if blockers else ("WARNINGS" if warnings else "OK")
+    }
+    
+    # Quick fix suggestions
+    quick_fixes = []
+    if cfg.dry_run:
+        quick_fixes.append("Disable 'Dry Run' mode in Settings")
+    if not cfg.bot_enabled:
+        quick_fixes.append("Enable the bot in Settings")
+    if cfg.min_confidence > 0.60:
+        quick_fixes.append(f"Lower min_confidence from {cfg.min_confidence} to 0.50-0.55")
+    
+    return JSONResponse({
+        "ok": True,
+        "summary": summary,
+        "blockers": blockers,
+        "warnings": warnings,
+        "info": info,
+        "quick_fixes": quick_fixes,
+        "config": {
+            "bot_enabled": cfg.bot_enabled,
+            "dry_run": cfg.dry_run,
+            "tick_seconds": cfg.tick_seconds,
+            "min_confidence": cfg.min_confidence,
+            "position_size_usd": cfg.position_size_usd,
+            "max_open_per_wallet": cfg.max_open_per_wallet,
+            "universe": cfg.universe,
+            "universe_limit": cfg.universe_limit
+        }
     })
