@@ -1410,12 +1410,14 @@ def training_session_feed(
     session_active = _truthy(cfg_get("training_session_active"))
     started_at = cfg_get("training_session_started_at") or None
     
-    logging.info(f"[SESSION_FEED] session_active={session_active}, started_at={started_at}")
+    logging.info(f"[SESSION_FEED] session_active={session_active}, started_at={started_at}, scheduler={sched}")
     
     with session_scope() as s:
         # ---- Live portfolio mark-to-market ----
-        wallets = s.query(Wallet).all()
-        starting = sum(float(w.paper_balance or 0) for w in wallets)
+        # Get wallets using the same function as the dashboard for consistency
+        from analytics.portfolio import get_wallets as get_wallets_list
+        wallets_list = get_wallets_list()
+        starting = sum(float(w.get("paper_balance") or 0) for w in wallets_list)
         
         # If no starting balance, use a default seed amount for display
         if starting == 0:
@@ -1463,7 +1465,7 @@ def training_session_feed(
         open_count = len(open_trades_list)
         total_pl = realized + unrealized
         
-        logging.info(f"[SESSION_FEED] Portfolio: starting=${starting}, realized=${realized:.2f}, unrealized=${unrealized:.2f}, open={open_count}")
+        logging.info(f"[SESSION_FEED] Portfolio: starting=${starting}, realized=${realized:.2f}, unrealized=${unrealized:.2f}, open={open_count}, current=${starting + total_pl:.2f}")
         
         portfolio = {
             "starting": round(starting, 2),
