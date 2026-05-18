@@ -178,11 +178,6 @@ class AdaptiveRecommendation:
     matched_patterns: list[PatternSignature]
     pattern_confidence_boost: float
     
-    # Trade Learning Engine insights
-    ml_prediction: Optional[Dict[str, Any]] = None  # From trade_learning_engine
-    ml_confidence_adjustment: float = 0.0
-    ml_reasoning: List[str] = field(default_factory=list)
-    
     # Timing
     entry_timing: str  # "immediate", "wait_pullback", "scale_in"
     suggested_hold_time: float  # minutes
@@ -195,13 +190,19 @@ class AdaptiveRecommendation:
     similar_past_trades: int
     historical_success_rate: float
     
-    # Advanced regime analysis
-    regime_analysis: Optional[Dict[str, Any]] = None
-    regime_recommended_strategy: Optional[str] = None
-    
     # Explanations for Claude
     reasoning: list[str]
     warnings: list[str]
+    
+    # --- Fields with defaults must come after fields without defaults ---
+    # Trade Learning Engine insights
+    ml_prediction: Optional[Dict[str, Any]] = None  # From trade_learning_engine
+    ml_confidence_adjustment: float = 0.0
+    ml_reasoning: List[str] = field(default_factory=list)
+    
+    # Advanced regime analysis
+    regime_analysis: Optional[Dict[str, Any]] = None
+    regime_recommended_strategy: Optional[str] = None
     
     def to_dict(self) -> dict:
         return {
