@@ -1097,10 +1097,15 @@ def training_session_start(
             wallets = s.query(Wallet).all()
             for w in wallets:
                 # Save original values so we can restore on stop
-                if not w.meta:
-                    w.meta = {}
-                w.meta["_session_prev_max_open"] = w.max_open_positions
-                w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                # Use getattr with a fallback since meta column may not exist yet
+                try:
+                    if not w.meta:
+                        w.meta = {}
+                    w.meta["_session_prev_max_open"] = w.max_open_positions
+                    w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                except Exception:
+                    # meta column may not exist in older schema - skip the backup
+                    pass
                 # Apply session settings to wallet
                 w.max_open_positions = max_open
                 w.max_position_usd = pos_usd
@@ -1230,12 +1235,16 @@ def training_session_stop() -> JSONResponse:
         with session_scope() as s:
             wallets = s.query(Wallet).all()
             for w in wallets:
-                if w.meta and "_session_prev_max_open" in w.meta:
-                    w.max_open_positions = w.meta.get("_session_prev_max_open")
-                    w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
-                    # Clean up the temporary keys
-                    w.meta.pop("_session_prev_max_open", None)
-                    w.meta.pop("_session_prev_max_position_usd", None)
+                try:
+                    if w.meta and "_session_prev_max_open" in w.meta:
+                        w.max_open_positions = w.meta.get("_session_prev_max_open")
+                        w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
+                        # Clean up the temporary keys
+                        w.meta.pop("_session_prev_max_open", None)
+                        w.meta.pop("_session_prev_max_position_usd", None)
+                except Exception:
+                    # meta column may not exist in older schema - skip the restore
+                    pass
             logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
 
         with session_scope() as s:
