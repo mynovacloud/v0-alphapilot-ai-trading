@@ -1087,6 +1087,22 @@ def training_session_start(
         }
     )
 
+    # CRITICAL: Also update the actual Wallet objects so the risk manager sees the new limits.
+    # The risk manager checks wallet.max_open_positions, NOT the config setting.
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        for w in wallets:
+            # Save original values so we can restore on stop
+            if not w.meta:
+                w.meta = {}
+            w.meta["_session_prev_max_open"] = w.max_open_positions
+            w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+            # Apply session settings to wallet
+            w.max_open_positions = max_open
+            w.max_position_usd = pos_usd
+            w.bot_paused = False  # Unpause all wallets for training
+        logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}")
+
     bot_scheduler.reload()  # pick up the new tick interval
 
     # Fire one tick immediately so the user sees activity within seconds
@@ -1198,6 +1214,18 @@ def training_session_stop() -> JSONResponse:
         }
     )
     bot_scheduler.reload()
+
+    # Restore original wallet settings
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        for w in wallets:
+            if w.meta and "_session_prev_max_open" in w.meta:
+                w.max_open_positions = w.meta.get("_session_prev_max_open")
+                w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
+                # Clean up the temporary keys
+                w.meta.pop("_session_prev_max_open", None)
+                w.meta.pop("_session_prev_max_position_usd", None)
+        logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
 
     with session_scope() as s:
         s.add(
