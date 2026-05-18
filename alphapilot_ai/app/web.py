@@ -1056,6 +1056,9 @@ def training_session_start(
         from trading.risk_manager import RiskManager
         if RiskManager.kill_switch_status():
             RiskManager.set_kill_switch(False, reason="training session start")
+        
+        # Enable training mode to bypass cooldown restrictions
+        RiskManager.set_training_mode(True)
 
         # Snapshot the values we're about to overwrite so Stop can restore.
         prev = {
@@ -1230,6 +1233,10 @@ def training_session_stop() -> JSONResponse:
             }
         )
         bot_scheduler.reload()
+
+        # Disable training mode bypass
+        from trading.risk_manager import RiskManager
+        RiskManager.set_training_mode(False)
 
         # Restore original wallet settings
         with session_scope() as s:
@@ -2434,12 +2441,13 @@ def api_close_position(trade_id: int) -> JSONResponse:
 def api_close_all_positions() -> JSONResponse:
     """
     Close all open positions at current market prices.
+    Uses batch price fetching for speed.
     """
     import logging
     import traceback
     
     try:
-        from connectors.live_prices import get_price
+        from connectors.live_prices import get_prices_batch
         from trading.paper_trading_engine import PaperTradingEngine
     except ImportError as ie:
         logging.exception("[CLOSE_ALL] Import error")
@@ -2461,25 +2469,23 @@ def api_close_all_positions() -> JSONResponse:
 
         logging.info(f"[CLOSE_ALL] Closing {len(trade_info)} positions")
 
+        # Batch fetch all prices at once - MUCH faster than one by one
+        symbols = list(set(symbol for _, symbol in trade_info))
+        prices = get_prices_batch(symbols)
+        logging.info(f"[CLOSE_ALL] Fetched {len(prices)} prices for {len(symbols)} symbols")
+
         for trade_id, symbol in trade_info:
             try:
-                p = get_price(symbol)
-                if not p.get("ok"):
+                price = prices.get(symbol)
+                if price is None:
                     errors += 1
                     error_details.append(f"{symbol}: no price")
                     continue
 
-                result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
+                result = engine.close_trade(trade_id, float(price), notes="close-all via API")
                 if result.get("ok"):
                     closed += 1
                     total_pnl += float(result.get("pnl", 0))
-                    try:
-                        with session_scope() as s:
-                            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                            if trade:
-                                trade.exit_reason = "manual"
-                    except Exception as db_err:
-                        logging.error(f"[CLOSE_ALL] Error setting exit_reason: {db_err}")
                 else:
                     errors += 1
                     error_details.append(f"{symbol}: {result.get('reason', 'unknown')}")
@@ -2487,6 +2493,17 @@ def api_close_all_positions() -> JSONResponse:
                 logging.error(f"[CLOSE_ALL] Error closing {symbol}: {e}")
                 errors += 1
                 error_details.append(f"{symbol}: {str(e)}")
+
+        # Batch update exit_reason for all closed trades
+        try:
+            with session_scope() as s:
+                closed_ids = [tid for tid, _ in trade_info]
+                s.query(PaperTrade).filter(
+                    PaperTrade.id.in_(closed_ids),
+                    PaperTrade.status == "closed"
+                ).update({"exit_reason": "manual"}, synchronize_session=False)
+        except Exception as db_err:
+            logging.error(f"[CLOSE_ALL] Error setting exit_reason: {db_err}")
 
         try:
             with session_scope() as s:
