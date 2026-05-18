@@ -1414,10 +1414,14 @@ def training_session_feed(
     
     with session_scope() as s:
         # ---- Live portfolio mark-to-market ----
-        # Get wallets using the same function as the dashboard for consistency
-        from analytics.portfolio import get_wallets as get_wallets_list
-        wallets_list = get_wallets_list()
-        starting = sum(float(w.get("paper_balance") or 0) for w in wallets_list)
+        # Query wallets directly from database to ensure we get fresh data
+        wallets_db = s.query(Wallet).all()
+        starting = sum(float(w.paper_balance or 0) for w in wallets_db)
+        wallet_count = len(wallets_db)
+        
+        logging.info(f"[SESSION_FEED] Wallets: {wallet_count} found, starting balance=${starting}")
+        for w in wallets_db:
+            logging.info(f"[SESSION_FEED]   - {w.name}: paper_balance=${w.paper_balance}")
         
         # If no starting balance, use a default seed amount for display
         if starting == 0:
