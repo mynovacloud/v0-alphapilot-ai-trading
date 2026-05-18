@@ -42,6 +42,8 @@ class PaperTradingEngine:
         notes: str = "",
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
+        trailing_stop_pct: float | None = None,
+        enable_breakeven_stop: bool = True,
     ) -> dict[str, Any]:
         side = side.upper()
         if side not in {"BUY", "SELL"}:
@@ -67,12 +69,18 @@ class PaperTradingEngine:
         sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.02
         tp_pct = take_profit_pct if take_profit_pct is not None else 0.04
         
+        # Default trailing stop: 1.5% - this is the KEY to locking in profits
+        # As price rises, the trailing stop rises with it (but never falls back down)
+        trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.015
+        
         if side == "BUY":
             stop_loss_price = entry_price * (1 - sl_pct)
             take_profit_price = entry_price * (1 + tp_pct)
+            trailing_stop_price = entry_price * (1 - trail_pct)
         else:  # SELL
             stop_loss_price = entry_price * (1 + sl_pct)
             take_profit_price = entry_price * (1 - tp_pct)
+            trailing_stop_price = entry_price * (1 + trail_pct)
 
         with session_scope() as s:
             wallet = s.get(Wallet, wallet_id)
@@ -99,6 +107,13 @@ class PaperTradingEngine:
                 notes=notes,
                 stop_loss_price=stop_loss_price,
                 take_profit_price=take_profit_price,
+                # Trailing stop fields - these enable automatic profit protection
+                trailing_stop_pct=trail_pct,
+                trailing_stop_price=trailing_stop_price,
+                high_water_price=entry_price,  # Track the best price we've seen
+                # Breakeven stop: once we're up 1%, move stop to entry + 0.2%
+                breakeven_trigger_pct=0.01 if enable_breakeven_stop else None,
+                breakeven_stop_pct=0.002 if enable_breakeven_stop else None,
             )
             s.add(trade)
             s.flush()

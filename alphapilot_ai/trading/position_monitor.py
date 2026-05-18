@@ -338,45 +338,113 @@ class PositionMonitor:
     ) -> None:
         """
         Update the trailing stop price if price has moved favorably.
+        Also handles breakeven stop activation.
 
         For BUY: trailing stop rises when price rises (lock in gains)
         For SELL: trailing stop falls when price falls (lock in gains)
+        
+        The trailing stop uses an ADAPTIVE algorithm:
+        - At small profits: use the configured trailing_stop_pct
+        - As profits grow: tighten the trailing stop to lock in more gains
         """
+        import logging
+        
+        side = trade.side.upper()
+        entry = float(trade.entry_price)
+        
+        # Calculate current profit percentage
+        if side == "BUY":
+            profit_pct = (current_price - entry) / entry if entry > 0 else 0
+        else:
+            profit_pct = (entry - current_price) / entry if entry > 0 else 0
+        
+        # =====================================================================
+        # BREAKEVEN STOP: Once profit hits trigger, move stop to lock in small gain
+        # =====================================================================
+        breakeven_trigger = float(trade.breakeven_trigger_pct or 0)
+        breakeven_stop = float(trade.breakeven_stop_pct or 0)
+        
+        if breakeven_trigger > 0 and not trade.breakeven_activated and profit_pct >= breakeven_trigger:
+            # Activate breakeven stop!
+            if side == "BUY":
+                new_stop = entry * (1 + breakeven_stop)  # Stop above entry
+            else:
+                new_stop = entry * (1 - breakeven_stop)  # Stop below entry for shorts
+            
+            # Update stop loss to breakeven level
+            current_sl = float(trade.stop_loss_price or 0)
+            if side == "BUY" and new_stop > current_sl:
+                trade.stop_loss_price = new_stop
+                trade.breakeven_activated = True
+                logging.info(f"[BREAKEVEN] {trade.symbol}: Activated! Stop moved from ${current_sl:.4f} to ${new_stop:.4f} (entry=${entry:.4f})")
+            elif side == "SELL" and (current_sl == 0 or new_stop < current_sl):
+                trade.stop_loss_price = new_stop
+                trade.breakeven_activated = True
+                logging.info(f"[BREAKEVEN] {trade.symbol}: Activated! Stop moved to ${new_stop:.4f}")
+        
+        # =====================================================================
+        # TRAILING STOP: Ratchet stop up as price rises
+        # =====================================================================
         if not trade.trailing_stop_pct:
             return
 
-        side = trade.side.upper()
         trail_pct = float(trade.trailing_stop_pct)
-        high_water = float(trade.high_water_price or trade.entry_price)
+        high_water = float(trade.high_water_price or entry)
+        
+        # ADAPTIVE TRAILING: Tighten the trailing % as profits grow
+        # - At 1% profit: use base trailing %
+        # - At 2% profit: tighten by 20%
+        # - At 3% profit: tighten by 35%
+        # - At 5%+ profit: tighten by 50%
+        adaptive_multiplier = 1.0
+        if profit_pct >= 0.05:
+            adaptive_multiplier = 0.50  # 50% tighter trailing stop
+        elif profit_pct >= 0.03:
+            adaptive_multiplier = 0.65
+        elif profit_pct >= 0.02:
+            adaptive_multiplier = 0.80
+        elif profit_pct >= 0.01:
+            adaptive_multiplier = 0.90
+        
+        effective_trail_pct = trail_pct * adaptive_multiplier
 
         if side == "BUY":
             # Update high water mark if price is higher
             if current_price > high_water:
                 trade.high_water_price = current_price
                 high_water = current_price
+                logging.debug(f"[TRAILING] {trade.symbol}: New high water ${high_water:.4f}")
 
             # Trailing stop is X% below high water mark
-            new_trailing = high_water * (1 - trail_pct)
+            new_trailing = high_water * (1 - effective_trail_pct)
 
             # Only ratchet UP the trailing stop (never lower it)
             current_trailing = float(trade.trailing_stop_price or 0)
             if new_trailing > current_trailing:
                 trade.trailing_stop_price = new_trailing
+                logging.info(
+                    f"[TRAILING] {trade.symbol}: Stop raised ${current_trailing:.4f} -> ${new_trailing:.4f} "
+                    f"(high=${high_water:.4f}, trail={effective_trail_pct:.2%}, profit={profit_pct:.2%})"
+                )
 
         else:  # SELL / SHORT
             # Update low water mark if price is lower
-            low_water = float(trade.high_water_price or trade.entry_price)
+            low_water = float(trade.high_water_price or entry)
             if current_price < low_water:
                 trade.high_water_price = current_price
                 low_water = current_price
 
             # Trailing stop is X% above low water mark
-            new_trailing = low_water * (1 + trail_pct)
+            new_trailing = low_water * (1 + effective_trail_pct)
 
             # Only ratchet DOWN the trailing stop (never raise it)
             current_trailing = float(trade.trailing_stop_price or float("inf"))
             if new_trailing < current_trailing:
                 trade.trailing_stop_price = new_trailing
+                logging.info(
+                    f"[TRAILING] {trade.symbol} (SHORT): Stop lowered to ${new_trailing:.4f} "
+                    f"(low=${low_water:.4f}, profit={profit_pct:.2%})"
+                )
 
     def _log_exit(
         self,
