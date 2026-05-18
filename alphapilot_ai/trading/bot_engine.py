@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import Any
 
 from ai.ai_engine import AIEngine
@@ -72,6 +73,42 @@ class BotEngine:
         # In-memory ring buffer of recent tick results so the UI can show "what the bot did".
         self._recent_ticks: list[TickResult] = []
         self._max_recent = 50
+        
+        # LOSING STREAK CIRCUIT BREAKER
+        # Prevents the bot from opening new positions after consecutive losses
+        self._consecutive_losses = 0
+        self._max_consecutive_losses = 3  # Pause after 3 losses in a row
+        self._cooldown_until: datetime | None = None
+        self._cooldown_minutes = 5  # Wait 5 minutes after hitting streak limit
+
+    def record_trade_result(self, pnl: float) -> None:
+        """Call this when a trade closes to update the losing streak tracker."""
+        if pnl < 0:
+            self._consecutive_losses += 1
+            if self._consecutive_losses >= self._max_consecutive_losses:
+                self._cooldown_until = utcnow() + timedelta(minutes=self._cooldown_minutes)
+                self._log(
+                    "bot",
+                    f"CIRCUIT BREAKER: {self._consecutive_losses} consecutive losses. "
+                    f"Pausing new entries for {self._cooldown_minutes} minutes.",
+                    level="warn",
+                )
+        else:
+            # Reset on a win
+            self._consecutive_losses = 0
+            self._cooldown_until = None
+
+    def is_in_cooldown(self) -> bool:
+        """Check if we're in a cooldown period from losing streak."""
+        if self._cooldown_until is None:
+            return False
+        if utcnow() >= self._cooldown_until:
+            # Cooldown expired, reset
+            self._cooldown_until = None
+            self._consecutive_losses = 0
+            self._log("bot", "Circuit breaker cooldown expired. Resuming trading.", level="info")
+            return False
+        return True
 
     # ------------------------------------------------------------------ #
     # Public
@@ -293,6 +330,18 @@ class BotEngine:
                 level="info",
             )
             # Note: We continue so portfolio intelligence can still act on existing positions
+
+        # CIRCUIT BREAKER CHECK: Don't open new positions if we're in cooldown
+        if self.is_in_cooldown():
+            self._log(
+                "bot",
+                f"{wallet['name']}: Circuit breaker active ({self._consecutive_losses} losses, "
+                f"cooldown until {self._cooldown_until}). Skipping new entries.",
+                wallet_id=wallet["id"],
+                level="warn",
+            )
+            result.notes.append("circuit_breaker_active")
+            return
 
         # Track best per-tick candidate so we always log a useful summary
         # even when nothing crosses the confidence threshold.
@@ -666,6 +715,9 @@ class BotEngine:
                     if outcome.get("ok"):
                         closed_count += 1
                         result.actions += 1
+                        # Update circuit breaker with trade result
+                        pnl = outcome.get("realized_pnl", 0) or 0
+                        self.record_trade_result(pnl)
                         # Update the exit_reason on the trade record
                         with session_scope() as s:
                             trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()
@@ -676,7 +728,7 @@ class BotEngine:
                             "bot",
                             f"AUTO-EXIT ({exit_signal.reason}): {exit_signal.symbol} "
                             f"closed at ${exit_signal.current_price:.4f} "
-                            f"(P&L: {exit_signal.pnl_pct:+.2%})",
+                            f"(P&L: {exit_signal.pnl_pct:+.2%}, streak: {self._consecutive_losses}L)",
                             level="info",
                         )
                         # Notify
