@@ -592,15 +592,24 @@ loadPnlStats('today');
 let positionsData = [];
 
 async function refreshPositions() {
+  console.log('[v0] refreshPositions called');
   try {
     const res = await fetch('/v1/positions');
+    console.log('[v0] refreshPositions response status:', res.status);
     const data = await res.json();
+    console.log('[v0] refreshPositions data:', data);
     if (data.ok) {
       positionsData = data.positions;
       renderPositions(data.positions);
+    } else {
+      console.error('[v0] refreshPositions error:', data.error);
+      document.getElementById('positions-body').innerHTML = 
+        `<tr><td colspan="9" class="empty">Error: ${data.error || 'Failed to load'}</td></tr>`;
     }
   } catch (err) {
-    console.error('Failed to refresh positions:', err);
+    console.error('[v0] Failed to refresh positions:', err);
+    document.getElementById('positions-body').innerHTML = 
+      `<tr><td colspan="9" class="empty">Error: ${err.message}</td></tr>`;
   }
 }
 
@@ -680,10 +689,13 @@ async function closePosition(tradeId) {
 }
 
 async function closeAllPositions() {
+  console.log('[v0] closeAllPositions called');
   if (!confirm('Close ALL open positions? This cannot be undone.')) return;
   try {
     const res = await fetch('/v1/positions/close-all', { method: 'POST' });
+    console.log('[v0] closeAllPositions response:', res.status);
     const data = await res.json();
+    console.log('[v0] closeAllPositions data:', data);
     if (data.ok) {
       alert(`Closed ${data.closed} positions. Total P&L: $${data.total_pnl.toFixed(2)}`);
       refreshPositions();
@@ -691,15 +703,19 @@ async function closeAllPositions() {
       alert('Error: ' + (data.error || 'Unknown error'));
     }
   } catch (err) {
+    console.error('[v0] closeAllPositions error:', err);
     alert('Failed to close positions: ' + err.message);
   }
 }
 
 async function emergencyExit() {
+  console.log('[v0] emergencyExit called');
   if (!confirm('EMERGENCY EXIT: This will close ALL positions AND engage the kill switch. Continue?')) return;
   try {
     const res = await fetch('/v1/positions/emergency-exit', { method: 'POST' });
+    console.log('[v0] emergencyExit response:', res.status);
     const data = await res.json();
+    console.log('[v0] emergencyExit data:', data);
     if (data.ok) {
       alert(`Emergency exit complete.\n- Positions closed: ${data.positions_closed}\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Kill switch: ENGAGED`);
       refreshPositions();
@@ -707,31 +723,38 @@ async function emergencyExit() {
       alert('Error: ' + (data.error || 'Unknown error'));
     }
   } catch (err) {
+    console.error('[v0] emergencyExit error:', err);
     alert('Emergency exit failed: ' + err.message);
   }
 }
 
 async function takeProfits() {
+  console.log('[v0] takeProfits called');
   if (!confirm('Close ALL profitable positions? This will lock in gains on all winning trades.')) return;
   try {
     const res = await fetch('/v1/positions/take-profits', { method: 'POST' });
+    console.log('[v0] takeProfits response:', res.status);
     const data = await res.json();
+    console.log('[v0] takeProfits data:', data);
     if (data.ok) {
       alert(`Profits taken!\n- Closed: ${data.closed} winners\n- Total P&L: $${data.total_pnl.toFixed(2)}\n- Held: ${data.skipped} positions`);
       refreshPositions();
     } else {
       alert('Error: ' + (data.error || 'Unknown error') + '\n\n' + (data.traceback || ''));
     }
-    }
   } catch (err) {
+    console.error('[v0] takeProfits error:', err);
     alert('Failed to take profits: ' + err.message);
   }
 }
 
 async function forceCheckPositions() {
+  console.log('[v0] forceCheckPositions called');
   try {
     const res = await fetch('/v1/positions/force-check', { method: 'POST' });
+    console.log('[v0] forceCheckPositions response:', res.status);
     const data = await res.json();
+    console.log('[v0] forceCheckPositions data:', data);
     if (data.ok) {
       let msg = `Position Check Results:\n\n`;
       msg += `Total positions: ${data.total_positions}\n`;
@@ -752,18 +775,24 @@ async function forceCheckPositions() {
       alert('Error: ' + (data.error || 'Unknown') + '\n\n' + (data.traceback || ''));
     }
   } catch (err) {
+    console.error('[v0] forceCheckPositions error:', err);
     alert('Force check failed: ' + err.message);
   }
 }
 
 async function openTradingStyleModal() {
+  console.log('[v0] openTradingStyleModal called');
   // Fetch current settings
   let settings = { trading_style: 'hybrid', micro_profit_target_usd: 0.25, min_profit_pct: 0.003, auto_reinvest: true, max_daily_trades: 100 };
   try {
     const res = await fetch('/v1/wallet/trading-style');
+    console.log('[v0] trading-style response:', res.status);
     const data = await res.json();
+    console.log('[v0] trading-style data:', data);
     if (data.ok) settings = data;
-  } catch (err) {}
+  } catch (err) {
+    console.error('[v0] openTradingStyleModal fetch error:', err);
+  }
 
   document.getElementById('modal-title').textContent = 'Trading Style Settings';
   document.getElementById('modal-content').innerHTML = `
