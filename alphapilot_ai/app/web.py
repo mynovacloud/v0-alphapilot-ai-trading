@@ -105,10 +105,44 @@ def _fmt_dt(value: Any) -> str:
         return str(value)
 
 
+def _fmt_timeago(value: Any) -> str:
+    """Format a datetime as a human-readable 'time ago' string."""
+    if not value:
+        return "-"
+    try:
+        from utils.helpers import utcnow
+        now = utcnow()
+        # Handle timezone-naive datetimes
+        if hasattr(value, 'tzinfo') and value.tzinfo is not None:
+            value = value.replace(tzinfo=None)
+        if hasattr(now, 'tzinfo') and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        
+        delta = now - value
+        seconds = delta.total_seconds()
+        
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            mins = int(seconds / 60)
+            return f"{mins}m ago"
+        elif seconds < 86400:
+            hours = int(seconds / 3600)
+            return f"{hours}h ago"
+        elif seconds < 604800:
+            days = int(seconds / 86400)
+            return f"{days}d ago"
+        else:
+            return value.strftime("%Y-%m-%d")
+    except Exception:
+        return str(value) if value else "-"
+
+
 templates.env.filters["money"] = _fmt_money
 templates.env.filters["pct"] = _fmt_pct
 templates.env.filters["signed"] = _fmt_signed
 templates.env.filters["dt"] = _fmt_dt
+templates.env.filters["timeago"] = _fmt_timeago
 
 router = APIRouter()
 
