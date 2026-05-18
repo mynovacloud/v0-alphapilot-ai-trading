@@ -275,6 +275,14 @@ class BotEngine:
         
         slots_left = max(0, cap - open_count)
         
+        # Log detailed slot info for debugging
+        self._log(
+            "bot",
+            f"[SLOT_CHECK] {wallet['name']}: open={open_count}, cap={cap}, slots_left={slots_left}, held={len(held_symbols)}, cfg.max_open={cfg.max_open_per_wallet}, wallet.max_open={wallet['max_open_positions']}",
+            wallet_id=wallet["id"],
+            level="info",
+        )
+        
         # Even if slots are full, log but DON'T return - Portfolio Intelligence
         # can still DCA into existing positions below.
         if slots_left <= 0:
@@ -293,9 +301,14 @@ class BotEngine:
         below_conf = 0
         claude_calls = 0  # Track how many times we call Claude
 
+        # Shuffle universe for better diversification - don't always evaluate same symbols first
+        import random
+        shuffled_universe = list(universe)
+        random.shuffle(shuffled_universe)
+
         # Sweep the universe. DON'T break when slots are full - we still want to
         # call Claude for existing positions (re-evaluate, DCA opportunities, etc.)
-        for product in universe:
+        for product in shuffled_universe:
             symbol = product["product_id"]
             
             # For NEW entries, skip if we already hold AND have no slots

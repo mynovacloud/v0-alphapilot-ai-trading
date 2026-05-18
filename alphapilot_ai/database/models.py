@@ -10,6 +10,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    JSON,
     String,
     Text,
 )
@@ -70,6 +71,8 @@ class Wallet(Base):
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
     created_at = Column(DateTime, default=utcnow)
+    # Metadata for session settings backup/restore
+    meta = Column(JSON, default=dict)
 
     trades = relationship("PaperTrade", back_populates="wallet", cascade="all,delete")
     positions = relationship("Position", back_populates="wallet", cascade="all,delete")

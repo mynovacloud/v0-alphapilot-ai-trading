@@ -1020,123 +1020,130 @@ def training_session_start(
     universe_limit: int = Form(40),
     aggressive: str = Form("false"),
 ) -> JSONResponse:
-    from config.bot_config import get as cfg_get
-    from config.bot_config import set_many as cfg_set
-    from services.claude_client import is_configured as claude_is_configured
-    from services.scheduler import bot_scheduler
-
-    if _truthy(cfg_get("training_session_active")):
-        return JSONResponse({"ok": True, "already_running": True})
-
-    # Aggressive preset: drop confidence floor and shrink position size so the
-    # bot fires often enough during a short training session for the user to
-    # actually see executions stream in.
-    if _truthy(aggressive):
-        min_confidence = min(min_confidence, 0.35)
-        max_open_per_wallet = max(max_open_per_wallet, 8)
-
-    tick = max(2, min(120, int(tick_seconds if tick_seconds is not None else 15)))
-    # Preserve 0.0 explicitly — `or 0.55` would silently bump the user's
-    # "I want trades on every signal" floor of 0.0 up to 0.55, which is the
-    # exact bug that kept Claude vetoing every borderline decision.
-    min_conf = max(0.0, min(0.95, float(min_confidence if min_confidence is not None else 0.50)))
-    pos_usd = max(5.0, min(100_000.0, float(position_size_usd if position_size_usd is not None else 80.0)))
-    max_open = max(1, min(100, int(max_open_per_wallet if max_open_per_wallet is not None else 25)))
-    # Universe floor: 10. Ceiling: 200. Default to 100 for good diversity.
-    uni_limit = max(10, min(200, int(universe_limit if universe_limit is not None else 100)))
-
-    # The bot's kill switch is the #1 reason "nothing happens" during a session.
-    # Auto-release it when the user explicitly starts a training session — they
-    # are saying "go trade", and a stale kill switch from a prior daily-loss
-    # event would silently nullify everything else they configured.
-    from trading.risk_manager import RiskManager
-    if RiskManager.kill_switch_status():
-        RiskManager.set_kill_switch(False, reason="training session start")
-
-    # Snapshot the values we're about to overwrite so Stop can restore.
-    prev = {
-        "bot_enabled":         cfg_get("bot_enabled") or "",
-        "bot_dry_run":         cfg_get("bot_dry_run") or "",
-        "bot_tick_seconds":    cfg_get("bot_tick_seconds") or "",
-        "bot_min_confidence":  cfg_get("bot_min_confidence") or "",
-        "bot_position_size_usd": cfg_get("bot_position_size_usd") or "",
-        "bot_max_open_per_wallet": cfg_get("bot_max_open_per_wallet") or "",
-        "bot_universe_limit":  cfg_get("bot_universe_limit") or "",
-    }
-
-    cfg_set(
-        {
-            "training_session_active": "true",
-            "training_session_started_at": utcnow().isoformat(),
-            "training_session_tick_seconds": str(tick),
-            "training_session_prev_bot_enabled": prev["bot_enabled"],
-            "training_session_prev_dry_run": prev["bot_dry_run"],
-            "training_session_prev_tick_seconds": prev["bot_tick_seconds"],
-            "training_session_prev_min_confidence": prev["bot_min_confidence"],
-            "training_session_prev_position_size_usd": prev["bot_position_size_usd"],
-            "training_session_prev_max_open_per_wallet": prev["bot_max_open_per_wallet"],
-            "training_session_prev_universe_limit": prev["bot_universe_limit"],
-            # Force the autonomous loop ON in paper-live mode with the chosen knobs.
-            "bot_enabled": "true",
-            "bot_dry_run": "false",
-            "bot_tick_seconds": str(tick),
-            "bot_min_confidence": str(min_conf),
-            "bot_position_size_usd": str(pos_usd),
-            "bot_max_open_per_wallet": str(max_open),
-            "bot_universe_limit": str(uni_limit),
-        }
-    )
-
-    # CRITICAL: Also update the actual Wallet objects so the risk manager sees the new limits.
-    # The risk manager checks wallet.max_open_positions, NOT the config setting.
-    with session_scope() as s:
-        wallets = s.query(Wallet).all()
-        for w in wallets:
-            # Save original values so we can restore on stop
-            if not w.meta:
-                w.meta = {}
-            w.meta["_session_prev_max_open"] = w.max_open_positions
-            w.meta["_session_prev_max_position_usd"] = w.max_position_usd
-            # Apply session settings to wallet
-            w.max_open_positions = max_open
-            w.max_position_usd = pos_usd
-            w.bot_paused = False  # Unpause all wallets for training
-        logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}")
-
-    bot_scheduler.reload()  # pick up the new tick interval
-
-    # Fire one tick immediately so the user sees activity within seconds
-    # instead of waiting for the next scheduler beat.
+    import logging
+    import traceback
+    
     try:
-        from trading.bot_engine import bot_engine
-        bot_engine.tick(manual=True)
-    except Exception as e:
-        logger.warning("Initial training tick failed: %s", e)
+        from config.bot_config import get as cfg_get
+        from config.bot_config import set_many as cfg_set
+        from services.claude_client import is_configured as claude_is_configured
+        from services.scheduler import bot_scheduler
 
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="bot",
-                level="info",
-                message=(
-                    f"Live training session started — tick={tick}s, "
-                    f"min_conf={min_conf:.2f}, size=${pos_usd:.0f}, "
-                    f"max_open={max_open}, universe={uni_limit}, "
-                    f"claude={'on' if claude_is_configured() else 'off (technical fallback)'}"
-                ),
-            )
-        )
-    return JSONResponse(
-        {
-            "ok": True,
-            "tick_seconds": tick,
-            "min_confidence": min_conf,
-            "position_size_usd": pos_usd,
-            "max_open_per_wallet": max_open,
-            "universe_limit": uni_limit,
-            "claude_configured": claude_is_configured(),
+        if _truthy(cfg_get("training_session_active")):
+            return JSONResponse({"ok": True, "already_running": True})
+
+        # Aggressive preset: drop confidence floor and shrink position size so the
+        # bot fires often enough during a short training session for the user to
+        # actually see executions stream in.
+        if _truthy(aggressive):
+            min_confidence = min(min_confidence, 0.35)
+            max_open_per_wallet = max(max_open_per_wallet, 8)
+
+        tick = max(2, min(120, int(tick_seconds if tick_seconds is not None else 15)))
+        # Preserve 0.0 explicitly — `or 0.55` would silently bump the user's
+        # "I want trades on every signal" floor of 0.0 up to 0.55, which is the
+        # exact bug that kept Claude vetoing every borderline decision.
+        min_conf = max(0.0, min(0.95, float(min_confidence if min_confidence is not None else 0.50)))
+        pos_usd = max(5.0, min(100_000.0, float(position_size_usd if position_size_usd is not None else 80.0)))
+        max_open = max(1, min(100, int(max_open_per_wallet if max_open_per_wallet is not None else 25)))
+        # Universe floor: 10. Ceiling: 200. Default to 100 for good diversity.
+        uni_limit = max(10, min(200, int(universe_limit if universe_limit is not None else 100)))
+
+        # The bot's kill switch is the #1 reason "nothing happens" during a session.
+        # Auto-release it when the user explicitly starts a training session — they
+        # are saying "go trade", and a stale kill switch from a prior daily-loss
+        # event would silently nullify everything else they configured.
+        from trading.risk_manager import RiskManager
+        if RiskManager.kill_switch_status():
+            RiskManager.set_kill_switch(False, reason="training session start")
+
+        # Snapshot the values we're about to overwrite so Stop can restore.
+        prev = {
+            "bot_enabled":         cfg_get("bot_enabled") or "",
+            "bot_dry_run":         cfg_get("bot_dry_run") or "",
+            "bot_tick_seconds":    cfg_get("bot_tick_seconds") or "",
+            "bot_min_confidence":  cfg_get("bot_min_confidence") or "",
+            "bot_position_size_usd": cfg_get("bot_position_size_usd") or "",
+            "bot_max_open_per_wallet": cfg_get("bot_max_open_per_wallet") or "",
+            "bot_universe_limit":  cfg_get("bot_universe_limit") or "",
         }
-    )
+
+        cfg_set(
+            {
+                "training_session_active": "true",
+                "training_session_started_at": utcnow().isoformat(),
+                "training_session_tick_seconds": str(tick),
+                "training_session_prev_bot_enabled": prev["bot_enabled"],
+                "training_session_prev_dry_run": prev["bot_dry_run"],
+                "training_session_prev_tick_seconds": prev["bot_tick_seconds"],
+                "training_session_prev_min_confidence": prev["bot_min_confidence"],
+                "training_session_prev_position_size_usd": prev["bot_position_size_usd"],
+                "training_session_prev_max_open_per_wallet": prev["bot_max_open_per_wallet"],
+                "training_session_prev_universe_limit": prev["bot_universe_limit"],
+                # Force the autonomous loop ON in paper-live mode with the chosen knobs.
+                "bot_enabled": "true",
+                "bot_dry_run": "false",
+                "bot_tick_seconds": str(tick),
+                "bot_min_confidence": str(min_conf),
+                "bot_position_size_usd": str(pos_usd),
+                "bot_max_open_per_wallet": str(max_open),
+                "bot_universe_limit": str(uni_limit),
+            }
+        )
+
+        # CRITICAL: Also update the actual Wallet objects so the risk manager sees the new limits.
+        # The risk manager checks wallet.max_open_positions, NOT the config setting.
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            for w in wallets:
+                # Save original values so we can restore on stop
+                if not w.meta:
+                    w.meta = {}
+                w.meta["_session_prev_max_open"] = w.max_open_positions
+                w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                # Apply session settings to wallet
+                w.max_open_positions = max_open
+                w.max_position_usd = pos_usd
+                w.bot_paused = False  # Unpause all wallets for training
+            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}")
+
+        bot_scheduler.reload()  # pick up the new tick interval
+
+        # Fire one tick immediately so the user sees activity within seconds
+        # instead of waiting for the next scheduler beat.
+        try:
+            from trading.bot_engine import bot_engine
+            bot_engine.tick(manual=True)
+        except Exception as e:
+            logger.warning("Initial training tick failed: %s", e)
+
+        with session_scope() as s:
+            s.add(
+                ActivityLog(
+                    category="bot",
+                    level="info",
+                    message=(
+                        f"Live training session started — tick={tick}s, "
+                        f"min_conf={min_conf:.2f}, size=${pos_usd:.0f}, "
+                        f"max_open={max_open}, universe={uni_limit}, "
+                        f"claude={'on' if claude_is_configured() else 'off (technical fallback)'}"
+                    ),
+                )
+            )
+        return JSONResponse(
+            {
+                "ok": True,
+                "tick_seconds": tick,
+                "min_confidence": min_conf,
+                "position_size_usd": pos_usd,
+                "max_open_per_wallet": max_open,
+                "universe_limit": uni_limit,
+                "claude_configured": claude_is_configured(),
+            }
+        )
+    except Exception as e:
+        logging.exception("[SESSION_START] Error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
 @router.post("/training/session/release-kill-switch")
@@ -1177,89 +1184,103 @@ def training_session_config() -> JSONResponse:
 
 @router.post("/training/session/stop")
 def training_session_stop() -> JSONResponse:
-    from config.bot_config import get as cfg_get
-    from config.bot_config import set_many as cfg_set
-    from services.scheduler import bot_scheduler
+    import logging
+    import traceback
+    
+    try:
+        from config.bot_config import get as cfg_get
+        from config.bot_config import set_many as cfg_set
+        from services.scheduler import bot_scheduler
 
-    if not _truthy(cfg_get("training_session_active")):
-        return JSONResponse({"ok": True, "already_stopped": True})
+        if not _truthy(cfg_get("training_session_active")):
+            return JSONResponse({"ok": True, "already_stopped": True})
 
-    prev_enabled = cfg_get("training_session_prev_bot_enabled") or "false"
-    prev_dry = cfg_get("training_session_prev_dry_run") or "true"
-    prev_tick = cfg_get("training_session_prev_tick_seconds") or "60"
-    prev_min_conf = cfg_get("training_session_prev_min_confidence") or "0.65"
-    prev_pos = cfg_get("training_session_prev_position_size_usd") or "100"
-    prev_max_open = cfg_get("training_session_prev_max_open_per_wallet") or "5"
-    prev_uni = cfg_get("training_session_prev_universe_limit") or "40"
+        prev_enabled = cfg_get("training_session_prev_bot_enabled") or "false"
+        prev_dry = cfg_get("training_session_prev_dry_run") or "true"
+        prev_tick = cfg_get("training_session_prev_tick_seconds") or "60"
+        prev_min_conf = cfg_get("training_session_prev_min_confidence") or "0.65"
+        prev_pos = cfg_get("training_session_prev_position_size_usd") or "100"
+        prev_max_open = cfg_get("training_session_prev_max_open_per_wallet") or "5"
+        prev_uni = cfg_get("training_session_prev_universe_limit") or "40"
 
-    cfg_set(
-        {
-            "training_session_active": "false",
-            "training_session_started_at": "",
-            "training_session_prev_bot_enabled": "",
-            "training_session_prev_dry_run": "",
-            "training_session_prev_tick_seconds": "",
-            "training_session_prev_min_confidence": "",
-            "training_session_prev_position_size_usd": "",
-            "training_session_prev_max_open_per_wallet": "",
-            "training_session_prev_universe_limit": "",
-            # Restore the user's prior config.
-            "bot_enabled": prev_enabled,
-            "bot_dry_run": prev_dry,
-            "bot_tick_seconds": prev_tick,
-            "bot_min_confidence": prev_min_conf,
-            "bot_position_size_usd": prev_pos,
-            "bot_max_open_per_wallet": prev_max_open,
-            "bot_universe_limit": prev_uni,
-        }
-    )
-    bot_scheduler.reload()
-
-    # Restore original wallet settings
-    with session_scope() as s:
-        wallets = s.query(Wallet).all()
-        for w in wallets:
-            if w.meta and "_session_prev_max_open" in w.meta:
-                w.max_open_positions = w.meta.get("_session_prev_max_open")
-                w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
-                # Clean up the temporary keys
-                w.meta.pop("_session_prev_max_open", None)
-                w.meta.pop("_session_prev_max_position_usd", None)
-        logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
-
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="bot",
-                level="info",
-                message="Live training session stopped — bot config restored.",
-            )
+        cfg_set(
+            {
+                "training_session_active": "false",
+                "training_session_started_at": "",
+                "training_session_prev_bot_enabled": "",
+                "training_session_prev_dry_run": "",
+                "training_session_prev_tick_seconds": "",
+                "training_session_prev_min_confidence": "",
+                "training_session_prev_position_size_usd": "",
+                "training_session_prev_max_open_per_wallet": "",
+                "training_session_prev_universe_limit": "",
+                # Restore the user's prior config.
+                "bot_enabled": prev_enabled,
+                "bot_dry_run": prev_dry,
+                "bot_tick_seconds": prev_tick,
+                "bot_min_confidence": prev_min_conf,
+                "bot_position_size_usd": prev_pos,
+                "bot_max_open_per_wallet": prev_max_open,
+                "bot_universe_limit": prev_uni,
+            }
         )
-    return JSONResponse({"ok": True})
+        bot_scheduler.reload()
+
+        # Restore original wallet settings
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            for w in wallets:
+                if w.meta and "_session_prev_max_open" in w.meta:
+                    w.max_open_positions = w.meta.get("_session_prev_max_open")
+                    w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
+                    # Clean up the temporary keys
+                    w.meta.pop("_session_prev_max_open", None)
+                    w.meta.pop("_session_prev_max_position_usd", None)
+            logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
+
+        with session_scope() as s:
+            s.add(
+                ActivityLog(
+                    category="bot",
+                    level="info",
+                    message="Live training session stopped — bot config restored.",
+                )
+            )
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logging.exception("[SESSION_STOP] Error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
 @router.post("/training/session/tick")
 def training_session_tick_now() -> JSONResponse:
     """Force a tick immediately so the user doesn't have to wait. Returns the result."""
-    from trading.bot_engine import bot_engine
+    import logging
+    import traceback
+    
+    try:
+        from trading.bot_engine import bot_engine
 
-    res = bot_engine.tick(manual=True)
-    return JSONResponse(
-        {
-            "ok": True,
-            "result": {
-                "started_at": res.started_at,
-                "ended_at": res.ended_at,
-                "universe_size": res.universe_size,
-                "wallets_evaluated": res.wallets_evaluated,
-                "decisions": res.decisions,
-                "actions": res.actions,
-                "skipped": res.skipped,
-                "errors": res.errors,
-                "notes": res.notes,
-            },
-        }
-    )
+        res = bot_engine.tick(manual=True)
+        return JSONResponse(
+            {
+                "ok": True,
+                "result": {
+                    "started_at": res.started_at,
+                    "ended_at": res.ended_at,
+                    "universe_size": res.universe_size,
+                    "wallets_evaluated": res.wallets_evaluated,
+                    "decisions": res.decisions,
+                    "actions": res.actions,
+                    "skipped": res.skipped,
+                    "errors": res.errors,
+                    "notes": res.notes,
+                },
+            }
+        )
+    except Exception as e:
+        logging.exception("[SESSION_TICK] Error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
 @router.post("/training/session/apply-settings-to-wallets")
