@@ -473,6 +473,14 @@ class BotEngine:
             if qty <= 0:
                 continue
 
+            # Log the dry_run status to help debug
+            self._log(
+                "bot",
+                f"[TRADE CHECK] {symbol} {side}: dry_run={cfg.dry_run}, qty={qty:.6f}, price={price:.4f}",
+                wallet_id=wallet["id"],
+                level="debug",
+            )
+
             if cfg.dry_run:
                 self._log(
                     "bot",
@@ -489,6 +497,12 @@ class BotEngine:
                 continue
 
             # Real path: open a paper trade through the existing engine.
+            self._log(
+                "bot",
+                f"[OPENING TRADE] {wallet['name']}: {side} {qty} {symbol} @ {price:.4f}",
+                wallet_id=wallet["id"],
+                level="info",
+            )
             outcome = self.paper.open_trade(
                 wallet_id=wallet["id"],
                 symbol=symbol,

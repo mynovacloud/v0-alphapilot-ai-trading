@@ -106,20 +106,21 @@ class RiskManager:
             if not wallet:
                 return RiskDecision(False, "Wallet not found", "wallet_missing")
 
-            # 2. Per-wallet pause flag
-            if wallet.bot_paused:
+            # 2. Per-wallet pause flag (bypass in training mode)
+            if wallet.bot_paused and not self._training_mode_bypass:
                 return RiskDecision(False, "Wallet bot is paused.", "wallet_paused")
 
-            # 3. Daily-loss circuit breaker. If breached, auto-pause the wallet
-            #    so the bot stops poking it on every tick.
-            tripped, day_loss = self._daily_loss_tripped(s, wallet, is_paper=is_paper)
-            if tripped:
-                self._auto_pause(s, wallet, reason=f"daily loss ${day_loss:,.2f} hit cap")
-                return RiskDecision(
-                    False,
-                    f"Daily loss cap hit (${day_loss:,.2f}). Wallet auto-paused.",
-                    "daily_loss_breaker",
-                )
+            # 3. Daily-loss circuit breaker (bypass in training mode)
+            #    If breached outside training, auto-pause the wallet.
+            if not self._training_mode_bypass:
+                tripped, day_loss = self._daily_loss_tripped(s, wallet, is_paper=is_paper)
+                if tripped:
+                    self._auto_pause(s, wallet, reason=f"daily loss ${day_loss:,.2f} hit cap")
+                    return RiskDecision(
+                        False,
+                        f"Daily loss cap hit (${day_loss:,.2f}). Wallet auto-paused.",
+                        "daily_loss_breaker",
+                    )
 
             # 4. Cooldown after consecutive losses (bypass in training mode)
             if not self._training_mode_bypass:

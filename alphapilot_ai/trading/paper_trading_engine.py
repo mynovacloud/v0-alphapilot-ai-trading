@@ -57,8 +57,10 @@ class PaperTradingEngine:
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
         if not decision:
             logger.warning(f"[OPEN_TRADE] REJECTED by risk manager: {decision.reason} (code={decision.code})")
-            self._log("risk", f"Trade rejected: {decision.reason}", wallet_id=wallet_id, level="warn")
+            self._log("risk", f"Trade BLOCKED: {decision.reason} (code={decision.code})", wallet_id=wallet_id, level="warn")
             return {"ok": False, "reason": decision.reason, "code": decision.code}
+        
+        logger.info(f"[OPEN_TRADE] APPROVED by risk manager, proceeding to open trade")
 
         notional = qty * entry_price
         fees = self._estimate_fees(notional)
