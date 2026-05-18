@@ -2253,6 +2253,84 @@ def settings_unpause_all() -> RedirectResponse:
     return RedirectResponse(url="/settings", status_code=303)
 
 
+@router.post("/settings/reset-paper-balance")
+def settings_reset_paper_balance(
+    new_balance: float = Form(10000.0),
+    close_positions: str = Form("true"),
+    clear_history: str = Form("false"),
+) -> RedirectResponse:
+    """
+    Reset paper trading balance for all wallets.
+    
+    Optionally closes all open positions first and/or clears trade history.
+    This is a non-destructive way to start fresh without losing AI learning data.
+    """
+    import logging
+    
+    should_close = close_positions.lower() == "true"
+    should_clear = clear_history.lower() == "true"
+    
+    logging.info(f"[RESET_PAPER] Resetting to ${new_balance}, close_positions={should_close}, clear_history={should_clear}")
+    
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        wallet_count = len(wallets)
+        
+        # Step 1: Close all open positions if requested
+        closed_count = 0
+        if should_close:
+            from connectors.live_prices import get_prices_batch
+            
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+            if open_trades:
+                # Get all prices at once
+                symbols = list(set(t.symbol for t in open_trades))
+                prices = get_prices_batch(symbols)
+                
+                for trade in open_trades:
+                    price = prices.get(trade.symbol, trade.entry_price)
+                    trade.status = "closed"
+                    trade.exit_price = price
+                    trade.closed_at = utcnow()
+                    trade.exit_reason = "reset"
+                    
+                    # Calculate realized P&L
+                    entry = float(trade.entry_price or 0)
+                    qty = float(trade.qty or 0)
+                    if trade.side.upper() == "BUY":
+                        trade.realized_pnl = (price - entry) * qty
+                    else:
+                        trade.realized_pnl = (entry - price) * qty
+                    
+                    closed_count += 1
+            
+            logging.info(f"[RESET_PAPER] Closed {closed_count} open positions")
+        
+        # Step 2: Clear trade history if requested
+        deleted_count = 0
+        if should_clear:
+            deleted_count = s.query(PaperTrade).delete()
+            logging.info(f"[RESET_PAPER] Deleted {deleted_count} trade records")
+        
+        # Step 3: Reset all wallet balances
+        for w in wallets:
+            w.paper_balance = new_balance
+        
+        # Log the action
+        s.add(
+            ActivityLog(
+                category="settings",
+                level="info",
+                message=f"Paper balance reset to ${new_balance:,.2f} for {wallet_count} wallet(s). "
+                        f"Closed {closed_count} positions. "
+                        f"{'Cleared trade history.' if should_clear else 'Trade history preserved.'}",
+            )
+        )
+    
+    logging.info(f"[RESET_PAPER] Complete - {wallet_count} wallets reset to ${new_balance}")
+    return RedirectResponse(url="/settings?paper_reset=success", status_code=303)
+
+
 @router.post("/settings/reset-data")
 def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
     """
