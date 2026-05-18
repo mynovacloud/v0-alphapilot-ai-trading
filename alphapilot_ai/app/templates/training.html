@@ -1832,8 +1832,8 @@ document.getElementById('diagnostics-panel')?.addEventListener('toggle', (e) => 
   const realizedSubEl = document.getElementById('live-realized-sub');
   const unrealizedEl = document.getElementById('live-unrealized');
   const unrealizedSubEl = document.getElementById('live-unrealized-sub');
-  const winRateEl = document.getElementById('live-win-rate');
-  const winRateSubEl = document.getElementById('live-win-rate-sub');
+  const winRateEl = document.getElementById('live-winrate');
+  const winRateSubEl = document.getElementById('live-winrate-sub');
   
   // Lists
   const decisionsBox = document.getElementById('live-decision-feed');
@@ -1982,7 +1982,7 @@ document.getElementById('diagnostics-panel')?.addEventListener('toggle', (e) => 
       const url = `/training/session/feed?since_decision_id=${lastDecisionId}&since_log_id=${lastLogId}&since_trade_id=${lastTradeId}`;
       const res = await fetch(url);
       const data = await res.json();
-      console.log('[v0] Session feed:', data);
+      console.log('[v0] Session feed response:', JSON.stringify(data, null, 2));
       
       // Update session status
       if (data.session) {
@@ -1993,27 +1993,51 @@ document.getElementById('diagnostics-panel')?.addEventListener('toggle', (e) => 
       // Update portfolio KPIs
       if (data.portfolio) {
         const p = data.portfolio;
+        console.log('[v0] Portfolio data:', p);
+        console.log('[v0] Elements:', { equityEl, totalPlEl, realizedEl, unrealizedEl, winRateEl });
         
-        equityEl.textContent = fmtUsd(p.current);
-        equityEl.style.color = colorVal(p.total_pl);
-        equitySubEl.textContent = `— vs. $${(p.starting || 0).toFixed(2)} seeded —`;
+        if (equityEl) {
+          equityEl.textContent = fmtUsd(p.current);
+          equityEl.style.color = colorVal(p.total_pl);
+        }
+        if (equitySubEl) {
+          equitySubEl.textContent = `— vs. $${(p.starting || 0).toFixed(2)} seeded —`;
+        }
         
-        totalPlEl.textContent = fmtUsd(p.total_pl);
-        totalPlEl.style.color = colorVal(p.total_pl);
-        totalPlPctEl.textContent = fmtPct(p.total_pl_pct);
+        if (totalPlEl) {
+          totalPlEl.textContent = fmtUsd(p.total_pl);
+          totalPlEl.style.color = colorVal(p.total_pl);
+        }
+        if (totalPlPctEl) {
+          totalPlPctEl.textContent = fmtPct(p.total_pl_pct);
+        }
         
-        realizedEl.textContent = fmtUsd(p.realized);
-        realizedEl.style.color = colorVal(p.realized);
-        realizedSubEl.textContent = `${p.closed_trades || 0} closed`;
+        if (realizedEl) {
+          realizedEl.textContent = fmtUsd(p.realized);
+          realizedEl.style.color = colorVal(p.realized);
+        }
+        if (realizedSubEl) {
+          realizedSubEl.textContent = `${p.closed_trades || 0} closed`;
+        }
         
-        unrealizedEl.textContent = fmtUsd(p.unrealized);
-        unrealizedEl.style.color = colorVal(p.unrealized);
-        unrealizedSubEl.textContent = `${p.open_trades || 0} open · marked live`;
+        if (unrealizedEl) {
+          unrealizedEl.textContent = fmtUsd(p.unrealized);
+          unrealizedEl.style.color = colorVal(p.unrealized);
+        }
+        if (unrealizedSubEl) {
+          unrealizedSubEl.textContent = `${p.open_trades || 0} open · marked live`;
+        }
         
-        const wr = ((p.win_rate || 0) * 100).toFixed(0);
-        winRateEl.textContent = wr + '%';
-        winRateEl.style.color = parseFloat(wr) >= 50 ? 'var(--good)' : 'var(--bad)';
-        winRateSubEl.textContent = `${p.wins || 0}W / ${p.losses || 0}L`;
+        if (winRateEl) {
+          const wr = ((p.win_rate || 0) * 100).toFixed(0);
+          winRateEl.textContent = wr + '%';
+          winRateEl.style.color = parseFloat(wr) >= 50 ? 'var(--good)' : 'var(--bad)';
+        }
+        if (winRateSubEl) {
+          winRateSubEl.textContent = `${p.wins || 0}W / ${p.losses || 0}L`;
+        }
+      } else {
+        console.warn('[v0] No portfolio data in response');
       }
       
       // Update decisions list
@@ -2184,6 +2208,17 @@ document.getElementById('diagnostics-panel')?.addEventListener('toggle', (e) => 
   
   // On page load, check session status and start polling data regardless
   document.addEventListener('DOMContentLoaded', () => {
+    console.log('[v0] Live Trading Session JS initialized');
+    console.log('[v0] Element check:', {
+      equityEl: !!equityEl,
+      totalPlEl: !!totalPlEl,
+      realizedEl: !!realizedEl,
+      unrealizedEl: !!unrealizedEl,
+      winRateEl: !!winRateEl,
+      decisionsBox: !!decisionsBox,
+      fillsBox: !!fillsBox,
+      consoleBox: !!consoleBox,
+    });
     // Always poll to show current portfolio state
     pollFeed();
     startPolling();
