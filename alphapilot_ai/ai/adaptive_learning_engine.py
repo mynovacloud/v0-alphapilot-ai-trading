@@ -7,12 +7,15 @@ This is the advanced machine learning core of AlphaPilot that learns from:
 2. Market patterns - Recognizes repeating setups across different conditions
 3. Strategy performance - Dynamically adjusts strategy weights
 4. Entry/exit timing - Learns optimal holding periods and exit conditions
+5. Trade feature similarity - kNN-based pattern matching from past trades
+6. Market regime transitions - Adapts to changing market conditions
 
 The engine maintains several "memory banks":
 - Pattern Memory: Stores recognized market patterns with success rates
 - Strategy Memory: Performance metrics per strategy per market regime
 - Timing Memory: Optimal entry/exit patterns
 - Mistake Memory: Common errors to avoid
+- Trade Memory: Feature vectors from historical trades for similarity matching
 
 All learning is incremental and persisted to the database so knowledge
 accumulates over time without requiring retraining.
@@ -24,7 +27,7 @@ import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Optional, Literal
+from typing import Any, Optional, Literal, List, Dict, Tuple
 
 from database.db import session_scope
 from database.models import (
@@ -38,6 +41,19 @@ from utils.helpers import utcnow
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Lazy imports to avoid circular dependencies
+def _get_trade_learning_engine():
+    from ai.trade_learning_engine import get_learning_engine
+    return get_learning_engine()
+
+def _get_advanced_regime_detector():
+    from trading.market_regime import get_advanced_detector
+    return get_advanced_detector()
+
+def _get_strategy_selector():
+    from trading.adaptive_strategy_selector import get_strategy_selector
+    return get_strategy_selector()
 
 
 # ============================================================================
@@ -162,6 +178,11 @@ class AdaptiveRecommendation:
     matched_patterns: list[PatternSignature]
     pattern_confidence_boost: float
     
+    # Trade Learning Engine insights
+    ml_prediction: Optional[Dict[str, Any]] = None  # From trade_learning_engine
+    ml_confidence_adjustment: float = 0.0
+    ml_reasoning: List[str] = field(default_factory=list)
+    
     # Timing
     entry_timing: str  # "immediate", "wait_pullback", "scale_in"
     suggested_hold_time: float  # minutes
@@ -173,6 +194,10 @@ class AdaptiveRecommendation:
     # Learning context
     similar_past_trades: int
     historical_success_rate: float
+    
+    # Advanced regime analysis
+    regime_analysis: Optional[Dict[str, Any]] = None
+    regime_recommended_strategy: Optional[str] = None
     
     # Explanations for Claude
     reasoning: list[str]
@@ -187,12 +212,17 @@ class AdaptiveRecommendation:
             "strategy_weight": self.strategy_weight,
             "matched_patterns": [p.to_dict() for p in self.matched_patterns],
             "pattern_confidence_boost": self.pattern_confidence_boost,
+            "ml_prediction": self.ml_prediction,
+            "ml_confidence_adjustment": self.ml_confidence_adjustment,
+            "ml_reasoning": self.ml_reasoning,
             "entry_timing": self.entry_timing,
             "suggested_hold_time": self.suggested_hold_time,
             "stop_loss_multiplier": self.stop_loss_multiplier,
             "take_profit_multiplier": self.take_profit_multiplier,
             "similar_past_trades": self.similar_past_trades,
             "historical_success_rate": self.historical_success_rate,
+            "regime_analysis": self.regime_analysis,
+            "regime_recommended_strategy": self.regime_recommended_strategy,
             "reasoning": self.reasoning,
             "warnings": self.warnings,
         }
@@ -665,14 +695,52 @@ class StrategyPerformanceTracker:
 class AdaptiveLearningEngine:
     """
     The main learning engine that combines pattern recognition, strategy
-    tracking, and historical analysis to provide adaptive trading recommendations.
+    tracking, historical analysis, and ML-based predictions to provide 
+    adaptive trading recommendations.
+    
+    Now integrates:
+    - Trade Learning Engine: kNN-based similarity matching
+    - Advanced Regime Detector: Multi-method regime classification  
+    - Adaptive Strategy Selector: UCB-based strategy selection
     """
     
     def __init__(self):
         self.pattern_recognizer = PatternRecognizer()
         self.strategy_tracker = StrategyPerformanceTracker()
         self._mistake_patterns: list[dict] = []
+        self._trade_learning_engine = None
+        self._regime_detector = None
+        self._strategy_selector = None
         self._load_mistakes()
+    
+    def _get_trade_learner(self):
+        """Lazy load trade learning engine."""
+        if self._trade_learning_engine is None:
+            try:
+                self._trade_learning_engine = _get_trade_learning_engine()
+                self._trade_learning_engine.load_patterns_from_db()
+            except Exception as e:
+                logger.warning(f"Could not load trade learning engine: {e}")
+        return self._trade_learning_engine
+    
+    def _get_regime_detector(self):
+        """Lazy load regime detector."""
+        if self._regime_detector is None:
+            try:
+                self._regime_detector = _get_advanced_regime_detector()
+            except Exception as e:
+                logger.warning(f"Could not load regime detector: {e}")
+        return self._regime_detector
+    
+    def _get_strat_selector(self):
+        """Lazy load strategy selector."""
+        if self._strategy_selector is None:
+            try:
+                self._strategy_selector = _get_strategy_selector()
+                self._strategy_selector.load_performance_data()
+            except Exception as e:
+                logger.warning(f"Could not load strategy selector: {e}")
+        return self._strategy_selector
     
     def _load_mistakes(self):
         """Load common mistake patterns from the database."""
@@ -772,7 +840,110 @@ class AdaptiveLearningEngine:
             if self._matches_mistake(market_state, signal_direction, mistake):
                 warnings.append(f"Potential mistake pattern: {mistake.get('content', 'Unknown pattern')}")
         
-        # 5. Calculate Final Adjustments
+        # =====================================================================
+        # 5. ML-BASED INSIGHTS FROM TRADE LEARNING ENGINE
+        # =====================================================================
+        ml_prediction = None
+        ml_confidence_adj = 0.0
+        ml_reasoning = []
+        
+        try:
+            trade_learner = self._get_trade_learner()
+            if trade_learner:
+                # Build features from market state
+                from ai.trade_learning_engine import TradeFeatures
+                
+                features = TradeFeatures(
+                    rsi=float(market_state.get("rsi", 50)),
+                    macd_histogram=float(market_state.get("macd_histogram", 0)),
+                    bollinger_percent_b=float(market_state.get("bb_percent_b", 0.5)),
+                    adx=float(market_state.get("adx", 20)),
+                    relative_volume=float(market_state.get("volume_ratio", 1)),
+                    volatility_percentile=float(market_state.get("volatility_percentile", 50)),
+                    regime=regime,
+                    trend_strength=float(market_state.get("trend_strength", 0)),
+                    hour_of_day=datetime.utcnow().hour,
+                    day_of_week=datetime.utcnow().weekday(),
+                    signal_confidence=signal_confidence,
+                    strategy_type=strategy_name,
+                    side=signal_direction,
+                    recent_win_rate=historical_success,
+                )
+                
+                # Get ML prediction
+                ml_prediction = trade_learner.predict_outcome(features)
+                
+                if ml_prediction.get("similar_patterns", 0) >= 5:
+                    win_prob = ml_prediction.get("win_probability", 0.5)
+                    predicted_outcome = ml_prediction.get("predicted_outcome", "UNCERTAIN")
+                    confidence = ml_prediction.get("confidence", 0)
+                    
+                    # Apply ML confidence adjustment
+                    if predicted_outcome == "WIN" and confidence > 0.3:
+                        ml_adj = min(0.12, confidence * 0.15)
+                        ml_confidence_adj += ml_adj
+                        ml_reasoning.append(
+                            f"ML predicts WIN ({win_prob:.0%} probability) based on "
+                            f"{ml_prediction['similar_patterns']} similar patterns"
+                        )
+                    elif predicted_outcome == "LOSS" and confidence > 0.3:
+                        ml_adj = min(0.12, confidence * 0.15)
+                        ml_confidence_adj -= ml_adj
+                        ml_reasoning.append(
+                            f"ML predicts LOSS ({1-win_prob:.0%} probability) - caution advised"
+                        )
+                        warnings.append(f"ML model predicts unfavorable outcome")
+                    
+                    expected_pnl = ml_prediction.get("expected_pnl_pct", 0)
+                    if expected_pnl != 0:
+                        ml_reasoning.append(f"Expected PnL: {expected_pnl:+.2f}%")
+                
+                # Get confidence adjustment from learning engine
+                adjusted_conf, adj_reasons = trade_learner.get_confidence_adjustment(
+                    features, signal_confidence
+                )
+                for reason in adj_reasons:
+                    ml_reasoning.append(reason)
+                
+                # Add additional ML adjustment
+                if adj_reasons:
+                    extra_adj = adjusted_conf - signal_confidence
+                    ml_confidence_adj += extra_adj * 0.5  # Partial weight
+        except Exception as e:
+            logger.debug(f"ML prediction unavailable: {e}")
+        
+        # =====================================================================
+        # 6. ADAPTIVE STRATEGY SELECTION
+        # =====================================================================
+        regime_recommended_strategy = None
+        regime_analysis_dict = None
+        
+        try:
+            strat_selector = self._get_strat_selector()
+            if strat_selector:
+                # Get strategy selection based on current regime
+                selection = strat_selector.select_strategy(symbol=symbol)
+                
+                if selection.confidence > 0.6:
+                    regime_recommended_strategy = selection.selected_strategy.value
+                    
+                    if regime_recommended_strategy != strategy_name:
+                        if selection.confidence > 0.75:
+                            warnings.append(
+                                f"Strategy selector recommends '{regime_recommended_strategy}' "
+                                f"over '{strategy_name}' with {selection.confidence:.0%} confidence"
+                            )
+                        else:
+                            reasoning.append(
+                                f"Alternative strategy '{regime_recommended_strategy}' "
+                                f"may perform better in current conditions"
+                            )
+        except Exception as e:
+            logger.debug(f"Strategy selector unavailable: {e}")
+        
+        # =====================================================================
+        # 7. Calculate Final Adjustments
+        # =====================================================================
         # Base confidence adjustment from patterns
         confidence_adj = pattern_boost
         
@@ -784,16 +955,28 @@ class AdaptiveLearningEngine:
         if similar_trades["count"] >= 10:
             confidence_adj += (historical_success - 0.5) * 0.15
         
-        # Clamp adjustment
-        confidence_adj = max(-0.3, min(0.3, confidence_adj))
+        # Add ML-based adjustment
+        confidence_adj += ml_confidence_adj
         
-        # 6. Size and Timing Recommendations
+        # Clamp total adjustment
+        confidence_adj = max(-0.35, min(0.35, confidence_adj))
+        
+        # =====================================================================
+        # 8. Size and Timing Recommendations
+        # =====================================================================
         size_mult = 1.0
+        
+        # ML prediction affects sizing
+        if ml_prediction and ml_prediction.get("predicted_outcome") == "WIN":
+            size_mult *= 1.1
+        elif ml_prediction and ml_prediction.get("predicted_outcome") == "LOSS":
+            size_mult *= 0.8
+        
         if strategy_weight > 1.2 and len(matched_patterns) > 0:
-            size_mult = min(1.3, strategy_weight)
+            size_mult = min(1.3, size_mult * strategy_weight)
             reasoning.append(f"Increased position size to {size_mult:.1f}x due to favorable conditions")
         elif strategy_weight < 0.8 or len(warnings) >= 2:
-            size_mult = max(0.5, strategy_weight)
+            size_mult = max(0.5, size_mult * strategy_weight)
             reasoning.append(f"Reduced position size to {size_mult:.1f}x due to caution signals")
         
         # Determine entry timing based on patterns
@@ -824,27 +1007,52 @@ class AdaptiveLearningEngine:
         elif historical_success > 0.6:
             tp_mult = 1.2  # Let winners run more
         
-        # 7. Final Recommendation
+        # ML prediction can adjust take profit expectations
+        if ml_prediction:
+            expected_pnl = ml_prediction.get("expected_pnl_pct", 0)
+            if expected_pnl > 2.0:
+                tp_mult *= 1.1
+            elif expected_pnl < -1.0:
+                stop_mult *= 0.9  # Tighter stop on predicted losers
+        
+        # =====================================================================
+        # 9. Final Recommendation
+        # =====================================================================
         recommended_action = signal_direction
+        
+        # ML strongly predicts loss
+        if ml_prediction and ml_prediction.get("predicted_outcome") == "LOSS":
+            if ml_prediction.get("confidence", 0) > 0.6:
+                recommended_action = "WAIT"
+                ml_reasoning.append("Strong ML prediction of loss - recommending WAIT")
+        
         if signal_direction in ("BUY", "SELL") and len(warnings) >= 3:
             recommended_action = "WAIT"
             reasoning.append("Multiple warnings suggest waiting for better setup")
+        
+        # Combine all reasoning
+        all_reasoning = reasoning + ml_reasoning
         
         return AdaptiveRecommendation(
             recommended_action=recommended_action,
             confidence_adjustment=confidence_adj,
             size_multiplier=size_mult,
-            preferred_strategy=best_strategy if best_weight > strategy_weight + 0.3 else strategy_name,
+            preferred_strategy=regime_recommended_strategy or (best_strategy if best_weight > strategy_weight + 0.3 else strategy_name),
             strategy_weight=strategy_weight,
             matched_patterns=matched_patterns,
             pattern_confidence_boost=pattern_boost,
+            ml_prediction=ml_prediction,
+            ml_confidence_adjustment=ml_confidence_adj,
+            ml_reasoning=ml_reasoning,
             entry_timing=entry_timing,
             suggested_hold_time=suggested_hold,
             stop_loss_multiplier=stop_mult,
             take_profit_multiplier=tp_mult,
             similar_past_trades=similar_trades["count"],
             historical_success_rate=historical_success,
-            reasoning=reasoning,
+            regime_analysis=regime_analysis_dict,
+            regime_recommended_strategy=regime_recommended_strategy,
+            reasoning=all_reasoning,
             warnings=warnings,
         )
     
