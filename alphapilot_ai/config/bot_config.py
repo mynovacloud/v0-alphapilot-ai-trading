@@ -88,7 +88,7 @@ class BotConfig:
             default_strategy_type=raw.get("bot_default_strategy_type") or "Momentum",
             position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 80)),
             max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 25))),
-            dry_run=_b(raw.get("bot_dry_run"), default=True),
+            dry_run=_b(raw.get("bot_dry_run"), default=False),
             # Aggressive trading
             auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
             auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),
