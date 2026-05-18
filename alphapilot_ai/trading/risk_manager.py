@@ -64,6 +64,20 @@ class RiskDecision:
 class RiskManager:
     """Central trade-gate. Both paper and live engines call `evaluate_trade()`."""
 
+    # Class-level flag to bypass cooldown during training sessions
+    _training_mode_bypass = False
+
+    @classmethod
+    def set_training_mode(cls, enabled: bool) -> None:
+        """Enable/disable training mode which bypasses cooldown checks."""
+        cls._training_mode_bypass = enabled
+        logger.info(f"[RISK] Training mode bypass: {enabled}")
+
+    @classmethod
+    def is_training_mode(cls) -> bool:
+        """Check if training mode bypass is active."""
+        return cls._training_mode_bypass
+
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
@@ -107,14 +121,15 @@ class RiskManager:
                     "daily_loss_breaker",
                 )
 
-            # 4. Cooldown after consecutive losses
-            cooldown_until = self._cooldown_until(s, wallet, is_paper=is_paper)
-            if cooldown_until is not None:
-                return RiskDecision(
-                    False,
-                    f"Wallet in post-loss cooldown until {cooldown_until.isoformat()}",
-                    "cooldown",
-                )
+            # 4. Cooldown after consecutive losses (bypass in training mode)
+            if not self._training_mode_bypass:
+                cooldown_until = self._cooldown_until(s, wallet, is_paper=is_paper)
+                if cooldown_until is not None:
+                    return RiskDecision(
+                        False,
+                        f"Wallet in post-loss cooldown until {cooldown_until.isoformat()}",
+                        "cooldown",
+                    )
 
             # 5. Wallet caps
             if wallet.max_position_usd and notional > wallet.max_position_usd:
