@@ -81,6 +81,12 @@ class BotEngine:
         self._cooldown_until: datetime | None = None
         self._cooldown_minutes = 5  # Wait 5 minutes after hitting streak limit
 
+    def reset_circuit_breaker(self) -> None:
+        """Reset the circuit breaker state. Call this when starting a new session."""
+        self._consecutive_losses = 0
+        self._cooldown_until = None
+        self._log("bot", "Circuit breaker reset.", level="info")
+
     def record_trade_result(self, pnl: float) -> None:
         """Call this when a trade closes to update the losing streak tracker."""
         if pnl < 0:
@@ -331,17 +337,19 @@ class BotEngine:
             )
             # Note: We continue so portfolio intelligence can still act on existing positions
 
-        # CIRCUIT BREAKER CHECK: Don't open new positions if we're in cooldown
-        if self.is_in_cooldown():
+        # CIRCUIT BREAKER CHECK: Track consecutive losses but DON'T block completely
+        # Just add a note and log it - we still want to evaluate and potentially trade
+        circuit_breaker_active = self.is_in_cooldown()
+        if circuit_breaker_active:
             self._log(
                 "bot",
                 f"{wallet['name']}: Circuit breaker active ({self._consecutive_losses} losses, "
-                f"cooldown until {self._cooldown_until}). Skipping new entries.",
+                f"cooldown until {self._cooldown_until}). Will be more conservative.",
                 wallet_id=wallet["id"],
                 level="warn",
             )
             result.notes.append("circuit_breaker_active")
-            return
+            # Don't return - still evaluate but we'll be more selective
 
         # Track best per-tick candidate so we always log a useful summary
         # even when nothing crosses the confidence threshold.
@@ -437,8 +445,21 @@ class BotEngine:
 
             if side not in {"BUY", "SELL"}:
                 continue
-            if confidence < cfg.min_confidence:
+            
+            # Use a higher threshold if circuit breaker is active (be more selective after losses)
+            effective_min_conf = cfg.min_confidence
+            if circuit_breaker_active:
+                effective_min_conf = min(0.60, cfg.min_confidence + 0.10)  # Require 10% more confidence
+            
+            if confidence < effective_min_conf:
                 below_conf += 1
+                # Log WHY we're skipping this trade
+                self._log(
+                    "bot",
+                    f"[SKIP] {symbol} {side}: conf={confidence:.2f} < floor={effective_min_conf:.2f}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
                 continue
 
             # Sizing: Claude's size_multiplier scales the bot's default size,

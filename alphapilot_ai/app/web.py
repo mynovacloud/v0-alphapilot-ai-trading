@@ -1132,6 +1132,13 @@ def training_session_start(
 
         bot_scheduler.reload()  # pick up the new tick interval
 
+        # Reset the circuit breaker so we start fresh
+        try:
+            from trading.bot_engine import bot_engine
+            bot_engine.reset_circuit_breaker()
+        except Exception as e:
+            logger.warning("Could not reset circuit breaker: %s", e)
+
         # Fire one tick immediately so the user sees activity within seconds
         # instead of waiting for the next scheduler beat.
         try:
