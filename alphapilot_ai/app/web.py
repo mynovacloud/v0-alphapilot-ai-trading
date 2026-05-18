@@ -2941,3 +2941,272 @@ def api_pnl_stats(period: str = "today") -> JSONResponse:
         "daily_avg": round(daily_avg, 2),
         "total_volume": round(total_volume, 2),
     })
+
+
+# ======================================================================
+# DIAGNOSTIC ENDPOINT - Why Trades Aren't Executing
+# ======================================================================
+
+@router.get("/v1/diagnostics/trade-blockers")
+def api_trade_blockers() -> JSONResponse:
+    """
+    Comprehensive diagnostic endpoint that shows EXACTLY why trades may not be executing.
+    This checks every possible blocker in the system.
+    """
+    import logging
+    from config.bot_config import BotConfig, get as cfg_get
+    from trading.risk_manager import RiskManager
+    from datetime import timedelta
+    
+    blockers: list[dict] = []
+    warnings: list[dict] = []
+    info: list[dict] = []
+    
+    # Load bot configuration
+    cfg = BotConfig.load()
+    
+    # =================================================================
+    # CHECK 1: Bot Enabled
+    # =================================================================
+    if not cfg.bot_enabled:
+        blockers.append({
+            "blocker": "BOT_DISABLED",
+            "message": "Bot is DISABLED. Enable it in Settings > Bot Settings.",
+            "setting": "bot_enabled",
+            "current_value": "false",
+            "fix": "Set bot_enabled to true in Settings"
+        })
+    else:
+        info.append({"check": "bot_enabled", "status": "OK", "value": True})
+    
+    # =================================================================
+    # CHECK 2: Dry Run Mode (MOST COMMON ISSUE!)
+    # =================================================================
+    if cfg.dry_run:
+        blockers.append({
+            "blocker": "DRY_RUN_MODE",
+            "message": "DRY RUN is ON! The bot logs what it WOULD do but NEVER actually opens trades!",
+            "setting": "bot_dry_run",
+            "current_value": "true",
+            "fix": "Disable 'Dry Run' in Settings to actually execute trades"
+        })
+    else:
+        info.append({"check": "dry_run", "status": "OK", "value": False})
+    
+    # =================================================================
+    # CHECK 3: Kill Switch
+    # =================================================================
+    if RiskManager.kill_switch_status():
+        blockers.append({
+            "blocker": "KILL_SWITCH_ENGAGED",
+            "message": "The global KILL SWITCH is engaged. All trading is halted.",
+            "setting": "kill_switch",
+            "fix": "Release the kill switch in Settings or via the dashboard"
+        })
+    else:
+        info.append({"check": "kill_switch", "status": "OK", "value": False})
+    
+    # =================================================================
+    # CHECK 4: Wallets
+    # =================================================================
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        if not wallets:
+            blockers.append({
+                "blocker": "NO_WALLETS",
+                "message": "No wallets configured. Create a wallet first.",
+                "fix": "Go to Wallets page and create a paper trading wallet"
+            })
+        else:
+            active_wallets = 0
+            for w in wallets:
+                wallet_issues = []
+                
+                if w.bot_paused:
+                    wallet_issues.append("bot_paused=true")
+                
+                balance = float(w.paper_balance or 0)
+                if balance < cfg.position_size_usd:
+                    wallet_issues.append(f"balance=${balance:.2f} < position_size=${cfg.position_size_usd:.2f}")
+                
+                # Check max_open_positions
+                open_count = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "open"
+                ).count()
+                max_open = w.max_open_positions or cfg.max_open_per_wallet
+                if max_open and open_count >= max_open:
+                    wallet_issues.append(f"positions={open_count}/{max_open} (FULL)")
+                
+                # Check daily loss
+                today = utcnow().date()
+                day_trades = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "closed"
+                ).all()
+                day_pnl = sum(
+                    float(t.realized_pnl or 0) for t in day_trades
+                    if t.closed_at and t.closed_at.date() == today
+                )
+                if w.max_daily_loss_usd and day_pnl <= -float(w.max_daily_loss_usd):
+                    wallet_issues.append(f"daily_loss=${day_pnl:.2f} hit cap=${w.max_daily_loss_usd}")
+                
+                # Check cooldown
+                recent = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "closed"
+                ).order_by(PaperTrade.closed_at.desc()).limit(3).all()
+                if len(recent) >= 3 and all((t.realized_pnl or 0) < 0 for t in recent):
+                    if recent[0].closed_at:
+                        cooldown_until = recent[0].closed_at + timedelta(minutes=15)
+                        if utcnow() < cooldown_until:
+                            wallet_issues.append(f"cooldown until {cooldown_until.isoformat()}")
+                
+                if wallet_issues:
+                    warnings.append({
+                        "wallet": w.name,
+                        "wallet_id": w.id,
+                        "issues": wallet_issues,
+                        "can_trade": len(wallet_issues) == 0
+                    })
+                else:
+                    active_wallets += 1
+                    info.append({
+                        "wallet": w.name,
+                        "wallet_id": w.id,
+                        "balance": float(w.paper_balance or 0),
+                        "open_positions": open_count,
+                        "max_positions": max_open,
+                        "status": "OK"
+                    })
+            
+            if active_wallets == 0:
+                blockers.append({
+                    "blocker": "ALL_WALLETS_BLOCKED",
+                    "message": "All wallets are either paused, over-extended, or out of balance",
+                    "fix": "Check wallet settings, add paper balance, or unpause wallets"
+                })
+    
+    # =================================================================
+    # CHECK 5: Confidence Floor
+    # =================================================================
+    if cfg.min_confidence >= 0.70:
+        warnings.append({
+            "warning": "HIGH_CONFIDENCE_FLOOR",
+            "message": f"Confidence floor is {cfg.min_confidence:.2f} - very few signals will pass",
+            "setting": "bot_min_confidence",
+            "current_value": cfg.min_confidence,
+            "suggestion": "Lower to 0.55 or 0.50 to see more trades"
+        })
+    info.append({"check": "min_confidence", "value": cfg.min_confidence})
+    
+    # =================================================================
+    # CHECK 6: Claude API Key
+    # =================================================================
+    from services.claude_client import is_configured as claude_is_configured
+    if not claude_is_configured():
+        warnings.append({
+            "warning": "CLAUDE_NOT_CONFIGURED",
+            "message": "Claude API key not set. Bot will use technical signals only (no AI enhancement).",
+            "setting": "anthropic_api_key",
+            "fix": "Add Anthropic API key in Settings"
+        })
+    else:
+        info.append({"check": "claude_api", "status": "configured"})
+    
+    # =================================================================
+    # CHECK 7: Scheduler Status
+    # =================================================================
+    from services.scheduler import bot_scheduler
+    scheduler_status = bot_scheduler.status()
+    if not scheduler_status.get("scheduler_running"):
+        blockers.append({
+            "blocker": "SCHEDULER_NOT_RUNNING",
+            "message": "The bot scheduler is not running. Trades won't auto-execute.",
+            "fix": "Start the scheduler via the Bot Control panel"
+        })
+    else:
+        info.append({
+            "check": "scheduler",
+            "status": "running",
+            "next_tick": scheduler_status.get("next_tick"),
+            "tick_seconds": scheduler_status.get("tick_seconds")
+        })
+    
+    # =================================================================
+    # CHECK 8: Recent Activity (any trades in last 24h?)
+    # =================================================================
+    with session_scope() as s:
+        yesterday = utcnow() - timedelta(hours=24)
+        recent_opens = s.query(PaperTrade).filter(PaperTrade.opened_at >= yesterday).count()
+        recent_closes = s.query(PaperTrade).filter(
+            PaperTrade.closed_at >= yesterday,
+            PaperTrade.status == "closed"
+        ).count()
+        
+        if recent_opens == 0 and cfg.bot_enabled and not cfg.dry_run:
+            warnings.append({
+                "warning": "NO_RECENT_TRADES",
+                "message": "No trades opened in the last 24 hours despite bot being enabled",
+                "possible_causes": [
+                    "Confidence threshold too high",
+                    "All wallets paused or over-extended",
+                    "No strong signals in the market"
+                ]
+            })
+        
+        info.append({
+            "check": "recent_activity",
+            "trades_opened_24h": recent_opens,
+            "trades_closed_24h": recent_closes
+        })
+    
+    # =================================================================
+    # CHECK 9: Training Mode
+    # =================================================================
+    is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if is_training:
+        info.append({
+            "check": "training_mode",
+            "status": "ACTIVE",
+            "note": "Training session is active - bot should be trading more aggressively"
+        })
+    
+    # =================================================================
+    # Summary
+    # =================================================================
+    can_trade = len(blockers) == 0
+    summary = {
+        "can_trade": can_trade,
+        "blocker_count": len(blockers),
+        "warning_count": len(warnings),
+        "status": "BLOCKED" if blockers else ("WARNINGS" if warnings else "OK")
+    }
+    
+    # Quick fix suggestions
+    quick_fixes = []
+    if cfg.dry_run:
+        quick_fixes.append("Disable 'Dry Run' mode in Settings")
+    if not cfg.bot_enabled:
+        quick_fixes.append("Enable the bot in Settings")
+    if cfg.min_confidence > 0.60:
+        quick_fixes.append(f"Lower min_confidence from {cfg.min_confidence} to 0.50-0.55")
+    
+    return JSONResponse({
+        "ok": True,
+        "summary": summary,
+        "blockers": blockers,
+        "warnings": warnings,
+        "info": info,
+        "quick_fixes": quick_fixes,
+        "config": {
+            "bot_enabled": cfg.bot_enabled,
+            "dry_run": cfg.dry_run,
+            "tick_seconds": cfg.tick_seconds,
+            "min_confidence": cfg.min_confidence,
+            "position_size_usd": cfg.position_size_usd,
+            "max_open_per_wallet": cfg.max_open_per_wallet,
+            "universe": cfg.universe,
+            "universe_limit": cfg.universe_limit
+        }
+    })
