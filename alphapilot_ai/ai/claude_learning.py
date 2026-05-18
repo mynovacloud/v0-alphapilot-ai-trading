@@ -42,46 +42,131 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-REFLECTION_SYSTEM_PROMPT = """You are AlphaPilot's reflection coach. Your job is to extract
-durable, generalizable trading lessons from a single paper-trade outcome.
+REFLECTION_SYSTEM_PROMPT = """You are AlphaPilot's reflection coach and trading mentor. Your job is to extract
+DEEP, DURABLE, and ACTIONABLE trading lessons from every paper-trade outcome.
 
 You will receive: the original decision (action, rationale, key factors, risk flags),
 the live market context, and the realized P&L. You must return a JSON object:
 
 {
   "verdict": "good_call" | "bad_call" | "lucky" | "unlucky" | "neutral",
-  "score": -1.0 .. 1.0,             # negative = mistake, positive = skill
+  "score": -1.0 .. 1.0,
+  "process_analysis": {
+    "entry_quality": -1.0 .. 1.0,
+    "exit_quality": -1.0 .. 1.0,
+    "sizing_quality": -1.0 .. 1.0,
+    "timing_quality": -1.0 .. 1.0,
+    "risk_management_quality": -1.0 .. 1.0
+  },
+  "pattern_recognition": {
+    "patterns_present": ["list of market patterns at entry"],
+    "patterns_missed": ["patterns that should have been recognized"],
+    "false_patterns": ["patterns that were noise, not signal"]
+  },
   "lessons": [
-    {"category": "lesson"|"mistake"|"rule", "content": "...", "weight": 0.1 .. 2.0}
+    {"category": "lesson"|"mistake"|"rule"|"edge"|"anti_pattern", "content": "...", "weight": 0.1 .. 2.0, "applies_to": "entry|exit|sizing|timing|risk"}
   ],
+  "meta_learning": {
+    "strategy_fitness": "how well did the chosen strategy fit the market regime?",
+    "confidence_calibration": "was confidence too high, too low, or well-calibrated?",
+    "indicator_reliability": "which indicators were reliable vs misleading?",
+    "time_of_day_factor": "did time of day impact the outcome?",
+    "correlation_with_btc": "did BTC movement affect this altcoin trade?"
+  },
+  "improvement_suggestions": [
+    "specific actionable improvement for next similar trade"
+  ],
+  "similar_past_mistakes": "brief note if this repeats a past error pattern",
   "summary": "two-sentence postmortem"
 }
 
+=== DEEP REFLECTION GUIDELINES ===
+
+1. ENTRY ANALYSIS:
+   - Was the entry triggered by genuine edge or noise?
+   - Did multiple indicators confirm, or was it a single-indicator gamble?
+   - Was there adequate separation between buy/sell signals?
+   - Did volume confirm the move?
+
+2. EXIT ANALYSIS:
+   - Did we exit too early (left money on table)?
+   - Did we exit too late (gave back profits)?
+   - Was the stop-loss placed correctly?
+   - Should we have trailed the stop differently?
+
+3. TIMING ANALYSIS:
+   - Did we enter at a good price within the move?
+   - Did momentum support immediate entry or should we have waited?
+   - How long did we hold vs optimal hold time for this setup?
+
+4. PATTERN RECOGNITION:
+   - What recurring market patterns were present?
+   - Are there patterns we keep missing?
+   - Are there patterns that consistently fail?
+
+5. META-LEARNING:
+   - Is this the 2nd, 3rd, or Nth time we made this mistake?
+   - What conditions keep leading to the same error?
+   - What rule would have prevented this loss?
+
 Rules:
-  - Up to 3 lessons. Quality over quantity.
+  - Generate 2-5 lessons. Prioritize ACTIONABLE, SPECIFIC rules.
   - "lucky" = positive PnL but the decision was unjustified by evidence.
   - "unlucky" = negative PnL but the decision was sound.
-  - "score" must reflect process quality, not outcome alone.
+  - "score" must reflect PROCESS quality, not outcome alone.
   - Lessons must be ACTIONABLE generalizations ("when X, do Y"), not narration.
+  - Flag if this is a REPEAT of a past mistake pattern.
   - No prose outside the JSON.
 """
 
 
-CONSOLIDATION_SYSTEM_PROMPT = """You are AlphaPilot's playbook editor. You will receive the
-current list of learned rules with weights. Your job is to:
+CONSOLIDATION_SYSTEM_PROMPT = """You are AlphaPilot's playbook editor and trading rule optimizer. You will receive the
+current list of learned rules with weights. Your job is to create a SHARP, HIGH-SIGNAL playbook.
 
-  1. Merge near-duplicates into a single, sharper rule.
-  2. Strengthen weights of rules that are confirmed by multiple recent trades.
-  3. Demote (or remove) rules that contradict newer, higher-weight rules.
+=== CONSOLIDATION PRINCIPLES ===
+
+1. MERGE SIMILAR RULES:
+   - Combine rules that say the same thing differently
+   - Create sharper, more specific rules from vague ones
+   - Preserve the BEST phrasing, not the first one
+
+2. STRENGTHEN PROVEN RULES:
+   - Rules confirmed by 3+ trades should get weight boost
+   - Rules that prevented losses should get HIGH weight (1.5+)
+   - Rules that generated profits consistently should be canonical
+
+3. DEMOTE/DELETE WEAK RULES:
+   - Remove rules contradicted by recent outcomes
+   - Demote rules that are too vague to be actionable
+   - Delete rules that are subsets of better rules
+
+4. CREATE SYNTHESIS RULES:
+   - When multiple rules point to the same insight, create ONE master rule
+   - Look for patterns across rules and extract meta-rules
+   - Create "killer rules" that capture the most important insights
+
+5. CATEGORY MANAGEMENT:
+   - "rule": General trading principles (weight 1.0-2.0)
+   - "mistake": Errors to avoid (weight 1.5-2.5) - these are CRITICAL
+   - "edge": Proven profitable patterns (weight 1.5-2.0)
+   - "anti_pattern": Patterns that look good but fail (weight 1.5-2.0)
+   - "lesson": Learning from specific trades (weight 0.5-1.5)
 
 Return JSON:
 {
-  "keep": [{"id": <int>, "new_weight": float, "new_content": "rewritten"|null}],
-  "delete": [<id>, <id>, ...],
-  "create": [{"category": "rule", "content": "...", "weight": float}]
+  "keep": [{"id": <int>, "new_weight": float, "new_content": "rewritten"|null, "reason": "why keep/modify"}],
+  "delete": [{"id": <int>, "reason": "why delete"}],
+  "create": [{"category": "rule"|"mistake"|"edge"|"anti_pattern", "content": "...", "weight": float, "source": "merged from X,Y,Z"|"synthesized from pattern"}],
+  "playbook_health": {
+    "total_rules": int,
+    "high_confidence_rules": int,
+    "needs_more_data": ["areas where we need more trades to learn"],
+    "strongest_edges": ["our best 3 edges"],
+    "biggest_leaks": ["our worst 3 recurring mistakes"]
+  }
 }
 
-No prose outside the JSON.
+No prose outside the JSON. Be aggressive about consolidation - a playbook with 30 sharp rules beats 100 fuzzy ones.
 """
 
 
@@ -767,7 +852,7 @@ def _clean_lessons(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
     out: list[dict[str, Any]] = []
-    for item in raw[:3]:
+    for item in raw[:5]:  # Allow up to 5 lessons now
         if not isinstance(item, dict):
             continue
         content = str(item.get("content", "")).strip()
@@ -777,6 +862,7 @@ def _clean_lessons(raw: Any) -> list[dict[str, Any]]:
             "category": str(item.get("category", "lesson"))[:60],
             "content": content[:2000],
             "weight": _float(item.get("weight"), 1.0, lo=0.05, hi=5.0),
+            "applies_to": str(item.get("applies_to", "general"))[:30],
         })
     return out
 
@@ -819,3 +905,266 @@ def _minutes_between(a: Any, b: Any) -> int:
         return int((b - a).total_seconds() // 60)
     except Exception:
         return 0
+
+
+# ============================================================================
+# Advanced Meta-Learning Functions
+# ============================================================================
+
+META_ANALYSIS_SYSTEM_PROMPT = """You are AlphaPilot's meta-learning analyst. You analyze patterns ACROSS multiple trades
+to discover higher-order insights that aren't visible from single trade reflections.
+
+You will receive a batch of recent trades with their outcomes and reflections.
+Your job is to find PATTERNS, CORRELATIONS, and SYSTEMATIC ISSUES.
+
+Return JSON:
+{
+  "recurring_mistakes": [
+    {"pattern": "description of recurring error", "frequency": int, "avg_loss": float, "fix_rule": "rule to prevent this"}
+  ],
+  "winning_patterns": [
+    {"pattern": "description of winning setup", "frequency": int, "avg_profit": float, "conditions": "when this works best"}
+  ],
+  "strategy_performance": {
+    "best_performing": {"strategy": "name", "win_rate": float, "avg_return": float},
+    "worst_performing": {"strategy": "name", "win_rate": float, "avg_return": float},
+    "recommendation": "which strategy to favor/avoid"
+  },
+  "timing_insights": {
+    "optimal_hold_time": "X-Y minutes for this trading style",
+    "early_exits": {"count": int, "avg_missed_profit": float},
+    "late_exits": {"count": int, "avg_given_back": float}
+  },
+  "indicator_reliability": [
+    {"indicator": "name", "reliability": float, "notes": "when it works/fails"}
+  ],
+  "market_condition_insights": {
+    "trending_performance": {"win_rate": float, "best_strategy": "name"},
+    "ranging_performance": {"win_rate": float, "best_strategy": "name"},
+    "volatile_performance": {"win_rate": float, "notes": "observations"}
+  },
+  "new_rules_to_add": [
+    {"category": "rule"|"mistake"|"edge", "content": "...", "weight": float, "rationale": "why this rule"}
+  ],
+  "rules_to_strengthen": [
+    {"rule_id": int, "new_weight": float, "reason": "why strengthen"}
+  ],
+  "confidence_calibration": {
+    "overconfident_trades": int,
+    "underconfident_trades": int,
+    "calibration_adjustment": "recommendation for future confidence"
+  },
+  "summary": "3-sentence meta-analysis summary"
+}
+
+Focus on ACTIONABLE insights that will improve future trading decisions.
+No prose outside the JSON.
+"""
+
+
+def analyze_trade_patterns(lookback_trades: int = 50) -> dict[str, Any]:
+    """
+    Perform meta-analysis across recent trades to discover patterns.
+    
+    This is a higher-order learning function that looks at GROUPS of trades
+    to find systematic issues and opportunities.
+    """
+    if not claude_is_configured():
+        return {"ok": False, "error": "claude_not_configured"}
+    
+    with session_scope() as s:
+        # Get recent closed trades with their reflections
+        trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.status == "closed")
+            .order_by(PaperTrade.closed_at.desc())
+            .limit(lookback_trades)
+            .all()
+        )
+        
+        if len(trades) < 10:
+            return {"ok": False, "error": "insufficient_trades", "count": len(trades)}
+        
+        # Build trade data with reflections
+        trade_data = []
+        for t in trades:
+            reflection = (
+                s.query(TradeReflection)
+                .filter(TradeReflection.trade_id == t.id)
+                .first()
+            )
+            
+            trade_info = {
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "entry_price": float(t.entry_price or 0),
+                "exit_price": float(t.exit_price or 0),
+                "realized_pnl": float(t.realized_pnl or 0),
+                "pnl_pct": round((float(t.realized_pnl or 0) / (float(t.entry_price or 1) * float(t.qty or 1))) * 100, 2),
+                "held_minutes": _minutes_between(t.opened_at, t.closed_at),
+                "confidence": float(t.confidence or 0),
+                "exit_reason": t.exit_reason,
+                "notes": t.notes,
+            }
+            
+            if reflection:
+                trade_info["verdict"] = reflection.verdict
+                trade_info["score"] = float(reflection.score or 0)
+                trade_info["summary"] = reflection.summary
+            
+            trade_data.append(trade_info)
+        
+        # Get current playbook rules for context
+        rules = get_playbook_with_metadata(limit=50)
+    
+    # Call Claude for meta-analysis
+    payload = {
+        "trades": trade_data,
+        "current_rules_count": len(rules),
+        "top_rules": [r["content"][:200] for r in rules[:10]],  # Truncate for context
+    }
+    
+    result = claude_chat(
+        prompt=(
+            "Perform meta-analysis on these recent trades to find patterns and systematic issues.\n\n"
+            f"{json.dumps(payload, default=str)}"
+        ),
+        system=META_ANALYSIS_SYSTEM_PROMPT,
+        max_tokens=2000,
+        temperature=0.3,
+    )
+    
+    if not result.get("ok"):
+        return {"ok": False, "error": result.get("error")}
+    
+    parsed = _parse_json_loose(result.get("text", ""))
+    if not parsed:
+        return {"ok": False, "error": "parse_failed", "raw": result.get("text", "")[:500]}
+    
+    # Apply any recommended rule changes
+    applied = {"rules_added": 0, "rules_strengthened": 0}
+    
+    with session_scope() as s:
+        # Add new rules from meta-analysis
+        new_rules = parsed.get("new_rules_to_add", [])
+        for rule in new_rules[:5]:  # Limit to 5 new rules per analysis
+            content = rule.get("content", "").strip()
+            if content:
+                s.add(AILearningMemory(
+                    category=str(rule.get("category", "rule"))[:60],
+                    content=content[:2000],
+                    weight=_float(rule.get("weight"), 1.5, lo=0.5, hi=3.0),
+                ))
+                applied["rules_added"] += 1
+        
+        # Strengthen existing rules
+        strengthen = parsed.get("rules_to_strengthen", [])
+        for item in strengthen[:10]:
+            try:
+                rule_id = int(item.get("rule_id", 0))
+                new_weight = _float(item.get("new_weight"), 1.5, lo=0.5, hi=3.0)
+                row = s.get(AILearningMemory, rule_id)
+                if row:
+                    row.weight = new_weight
+                    applied["rules_strengthened"] += 1
+            except Exception:
+                continue
+        
+        # Log the analysis
+        s.add(ActivityLog(
+            category="ai",
+            level="info",
+            message=f"Meta-analysis complete: {applied}. Summary: {parsed.get('summary', 'N/A')[:200]}",
+        ))
+    
+    return {
+        "ok": True,
+        "analysis": parsed,
+        "applied": applied,
+        "trades_analyzed": len(trade_data),
+    }
+
+
+def get_learning_stats() -> dict[str, Any]:
+    """
+    Get comprehensive learning statistics for the Training UI.
+    """
+    with session_scope() as s:
+        # Count rules by category
+        rules = s.query(AILearningMemory).all()
+        rule_stats = {
+            "total": len(rules),
+            "by_category": {},
+            "avg_weight": 0,
+            "high_weight_count": 0,  # weight > 1.5
+        }
+        
+        weight_sum = 0
+        for r in rules:
+            cat = r.category or "unknown"
+            rule_stats["by_category"][cat] = rule_stats["by_category"].get(cat, 0) + 1
+            weight_sum += float(r.weight or 0)
+            if (r.weight or 0) > 1.5:
+                rule_stats["high_weight_count"] += 1
+        
+        if rules:
+            rule_stats["avg_weight"] = round(weight_sum / len(rules), 2)
+        
+        # Reflection stats
+        reflections = s.query(TradeReflection).all()
+        reflection_stats = {
+            "total": len(reflections),
+            "by_verdict": {},
+            "avg_score": 0,
+        }
+        
+        score_sum = 0
+        for r in reflections:
+            verdict = r.verdict or "unknown"
+            reflection_stats["by_verdict"][verdict] = reflection_stats["by_verdict"].get(verdict, 0) + 1
+            score_sum += float(r.score or 0)
+        
+        if reflections:
+            reflection_stats["avg_score"] = round(score_sum / len(reflections), 3)
+        
+        # Trade outcome stats (last 100)
+        recent_trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.status == "closed")
+            .order_by(PaperTrade.closed_at.desc())
+            .limit(100)
+            .all()
+        )
+        
+        trade_stats = {
+            "count": len(recent_trades),
+            "wins": 0,
+            "losses": 0,
+            "total_pnl": 0,
+            "avg_hold_minutes": 0,
+        }
+        
+        hold_minutes_sum = 0
+        for t in recent_trades:
+            pnl = float(t.realized_pnl or 0)
+            trade_stats["total_pnl"] += pnl
+            if pnl > 0:
+                trade_stats["wins"] += 1
+            elif pnl < 0:
+                trade_stats["losses"] += 1
+            hold_minutes_sum += _minutes_between(t.opened_at, t.closed_at)
+        
+        if recent_trades:
+            trade_stats["avg_hold_minutes"] = round(hold_minutes_sum / len(recent_trades), 1)
+            trade_stats["win_rate"] = round(trade_stats["wins"] / len(recent_trades), 3)
+        else:
+            trade_stats["win_rate"] = 0
+        
+        trade_stats["total_pnl"] = round(trade_stats["total_pnl"], 2)
+    
+    return {
+        "rules": rule_stats,
+        "reflections": reflection_stats,
+        "recent_trades": trade_stats,
+    }

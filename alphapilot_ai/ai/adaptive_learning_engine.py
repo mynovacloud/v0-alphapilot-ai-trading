@@ -1248,3 +1248,471 @@ def learn_from_trade(
         strategy_name=strategy_name,
         regime=regime,
     )
+
+
+# ============================================================================
+# Advanced Learning Algorithms
+# ============================================================================
+
+class MistakeClusterer:
+    """
+    Clusters similar mistakes to identify recurring error patterns.
+    
+    Uses feature extraction from trade context to find trades that failed
+    for similar reasons, helping Claude avoid repeat mistakes.
+    """
+    
+    def __init__(self):
+        self.mistake_clusters: Dict[str, List[Dict]] = {}
+        self.cluster_rules: Dict[str, str] = {}  # cluster_id -> prevention rule
+    
+    def extract_mistake_features(self, trade: Dict, reflection: Dict) -> Dict[str, Any]:
+        """Extract features that characterize a mistake."""
+        features = {
+            # Trade characteristics
+            "side": trade.get("side", "").upper(),
+            "pnl_category": self._categorize_pnl(trade.get("realized_pnl", 0)),
+            "hold_time_category": self._categorize_hold_time(trade.get("held_minutes", 0)),
+            "confidence_category": self._categorize_confidence(trade.get("confidence", 0)),
+            
+            # Market conditions at entry (if available from notes)
+            "entry_rsi_zone": self._extract_rsi_zone(trade.get("notes", "")),
+            "entry_trend": self._extract_trend(trade.get("notes", "")),
+            "entry_volume": self._extract_volume(trade.get("notes", "")),
+            
+            # Reflection analysis
+            "verdict": reflection.get("verdict", "unknown"),
+            "score": reflection.get("score", 0),
+            "exit_reason": trade.get("exit_reason", "unknown"),
+        }
+        return features
+    
+    def _categorize_pnl(self, pnl: float) -> str:
+        if pnl > 5: return "big_win"
+        if pnl > 1: return "small_win"
+        if pnl > -1: return "breakeven"
+        if pnl > -5: return "small_loss"
+        return "big_loss"
+    
+    def _categorize_hold_time(self, minutes: int) -> str:
+        if minutes < 5: return "scalp"
+        if minutes < 30: return "short"
+        if minutes < 120: return "medium"
+        return "long"
+    
+    def _categorize_confidence(self, conf: float) -> str:
+        if conf > 0.8: return "high"
+        if conf > 0.6: return "medium"
+        return "low"
+    
+    def _extract_rsi_zone(self, notes: str) -> str:
+        notes_lower = notes.lower()
+        if "oversold" in notes_lower or "rsi<30" in notes_lower:
+            return "oversold"
+        if "overbought" in notes_lower or "rsi>70" in notes_lower:
+            return "overbought"
+        return "neutral"
+    
+    def _extract_trend(self, notes: str) -> str:
+        notes_lower = notes.lower()
+        if "uptrend" in notes_lower or "bullish" in notes_lower:
+            return "bullish"
+        if "downtrend" in notes_lower or "bearish" in notes_lower:
+            return "bearish"
+        return "neutral"
+    
+    def _extract_volume(self, notes: str) -> str:
+        notes_lower = notes.lower()
+        if "high volume" in notes_lower or "volume spike" in notes_lower:
+            return "high"
+        if "low volume" in notes_lower:
+            return "low"
+        return "normal"
+    
+    def cluster_mistakes(self, losing_trades: List[Dict]) -> Dict[str, List[Dict]]:
+        """
+        Cluster losing trades by their feature similarity.
+        Returns clusters of similar mistakes.
+        """
+        clusters: Dict[str, List[Dict]] = {}
+        
+        for trade in losing_trades:
+            # Create a cluster key from the most important features
+            features = self.extract_mistake_features(
+                trade,
+                trade.get("reflection", {})
+            )
+            
+            # Build cluster key from significant features
+            key_parts = []
+            
+            # Cluster by confidence + outcome
+            if features["confidence_category"] == "high" and features["pnl_category"] in ["small_loss", "big_loss"]:
+                key_parts.append("overconfident")
+            
+            # Cluster by hold time pattern
+            if features["hold_time_category"] == "scalp" and features["pnl_category"] == "small_loss":
+                key_parts.append("premature_exit")
+            elif features["hold_time_category"] == "long" and features["pnl_category"] == "big_loss":
+                key_parts.append("held_too_long")
+            
+            # Cluster by RSI zone
+            if features["entry_rsi_zone"] == "overbought" and features["side"] == "BUY":
+                key_parts.append("bought_overbought")
+            elif features["entry_rsi_zone"] == "oversold" and features["side"] == "SELL":
+                key_parts.append("sold_oversold")
+            
+            # Cluster by exit reason
+            exit_reason = features.get("exit_reason", "")
+            if "stop_loss" in str(exit_reason).lower():
+                key_parts.append("stopped_out")
+            elif "time" in str(exit_reason).lower():
+                key_parts.append("time_decay")
+            
+            # Default cluster if no specific pattern
+            if not key_parts:
+                key_parts.append(f"{features['side'].lower()}_{features['pnl_category']}")
+            
+            cluster_key = "_".join(sorted(key_parts))
+            
+            if cluster_key not in clusters:
+                clusters[cluster_key] = []
+            clusters[cluster_key].append({
+                "trade": trade,
+                "features": features,
+            })
+        
+        self.mistake_clusters = clusters
+        return clusters
+    
+    def generate_prevention_rules(self) -> List[Dict[str, Any]]:
+        """
+        Generate prevention rules from mistake clusters.
+        Only generates rules for clusters with 3+ similar mistakes.
+        """
+        rules = []
+        
+        for cluster_key, mistakes in self.mistake_clusters.items():
+            if len(mistakes) < 3:
+                continue  # Need enough samples to form a rule
+            
+            # Analyze the cluster to generate a rule
+            rule = self._generate_rule_for_cluster(cluster_key, mistakes)
+            if rule:
+                rules.append(rule)
+                self.cluster_rules[cluster_key] = rule["content"]
+        
+        return rules
+    
+    def _generate_rule_for_cluster(
+        self, 
+        cluster_key: str, 
+        mistakes: List[Dict]
+    ) -> Optional[Dict[str, Any]]:
+        """Generate a specific rule for a mistake cluster."""
+        
+        # Calculate cluster statistics
+        total_loss = sum(
+            m["trade"].get("realized_pnl", 0) 
+            for m in mistakes
+        )
+        avg_loss = total_loss / len(mistakes)
+        
+        # Generate rules based on cluster type
+        rule_templates = {
+            "overconfident": (
+                f"High-confidence trades that lose money indicate overconfidence. "
+                f"Reduce position size when confidence >80% OR require additional confirmation. "
+                f"(Based on {len(mistakes)} similar losses totaling ${abs(total_loss):.2f})"
+            ),
+            "premature_exit": (
+                f"Exiting too early (scalp trades) often locks in small losses. "
+                f"Consider wider stops or longer hold times for momentum setups. "
+                f"(Based on {len(mistakes)} premature exits)"
+            ),
+            "held_too_long": (
+                f"Holding losing positions too long compounds losses. "
+                f"Implement strict time-based exits: cut after 30min if losing >0.5%. "
+                f"(Based on {len(mistakes)} trades held too long, avg loss ${abs(avg_loss):.2f})"
+            ),
+            "bought_overbought": (
+                f"Do NOT buy when RSI is overbought (>70). "
+                f"This pattern has failed {len(mistakes)} times with total loss ${abs(total_loss):.2f}. "
+                f"Wait for RSI pullback below 60 before considering long entries."
+            ),
+            "sold_oversold": (
+                f"Do NOT sell/short when RSI is oversold (<30). "
+                f"This pattern has failed {len(mistakes)} times. "
+                f"Wait for RSI bounce above 40 before considering short entries."
+            ),
+            "stopped_out": (
+                f"Stop-losses are triggering frequently ({len(mistakes)} times). "
+                f"Consider: (1) wider stops with smaller size, (2) better entry timing, "
+                f"(3) waiting for pullbacks instead of chasing."
+            ),
+            "time_decay": (
+                f"Trades expiring without reaching targets suggest weak setups. "
+                f"Require stronger entry signals with more indicator alignment. "
+                f"({len(mistakes)} trades expired without profit)"
+            ),
+        }
+        
+        # Find matching template
+        for key, template in rule_templates.items():
+            if key in cluster_key:
+                return {
+                    "category": "mistake",
+                    "content": template,
+                    "weight": min(2.5, 1.5 + (len(mistakes) * 0.1)),  # Higher weight for more samples
+                    "cluster_key": cluster_key,
+                    "sample_count": len(mistakes),
+                    "total_loss": total_loss,
+                }
+        
+        # Generic rule for unmatched clusters
+        return {
+            "category": "mistake",
+            "content": (
+                f"Recurring loss pattern '{cluster_key}': {len(mistakes)} similar failures "
+                f"with total loss ${abs(total_loss):.2f}. Avoid this setup or reduce size significantly."
+            ),
+            "weight": 1.5,
+            "cluster_key": cluster_key,
+            "sample_count": len(mistakes),
+            "total_loss": total_loss,
+        }
+
+
+class EdgeDiscoverer:
+    """
+    Discovers profitable trading edges from winning trade patterns.
+    
+    Analyzes winning trades to find repeatable setups that can be
+    exploited in future trading.
+    """
+    
+    def __init__(self):
+        self.discovered_edges: List[Dict] = []
+    
+    def analyze_winners(self, winning_trades: List[Dict]) -> List[Dict[str, Any]]:
+        """
+        Analyze winning trades to discover edges.
+        Returns a list of discovered edges with their characteristics.
+        """
+        if len(winning_trades) < 5:
+            return []  # Need enough samples
+        
+        edges = []
+        
+        # Group by common characteristics
+        by_side = {"BUY": [], "SELL": []}
+        by_hold_time = {"scalp": [], "short": [], "medium": [], "long": []}
+        by_confidence = {"high": [], "medium": [], "low": []}
+        
+        for trade in winning_trades:
+            side = trade.get("side", "").upper()
+            pnl = trade.get("realized_pnl", 0)
+            hold_mins = trade.get("held_minutes", 0)
+            conf = trade.get("confidence", 0)
+            
+            if side in by_side:
+                by_side[side].append(trade)
+            
+            if hold_mins < 5:
+                by_hold_time["scalp"].append(trade)
+            elif hold_mins < 30:
+                by_hold_time["short"].append(trade)
+            elif hold_mins < 120:
+                by_hold_time["medium"].append(trade)
+            else:
+                by_hold_time["long"].append(trade)
+            
+            if conf > 0.8:
+                by_confidence["high"].append(trade)
+            elif conf > 0.6:
+                by_confidence["medium"].append(trade)
+            else:
+                by_confidence["low"].append(trade)
+        
+        # Discover edges from groupings
+        
+        # Edge: Side bias
+        for side, trades in by_side.items():
+            if len(trades) >= 5:
+                total_pnl = sum(t.get("realized_pnl", 0) for t in trades)
+                avg_pnl = total_pnl / len(trades)
+                if avg_pnl > 0.5:  # Significant average profit
+                    edges.append({
+                        "name": f"{side.lower()}_bias_edge",
+                        "category": "edge",
+                        "content": (
+                            f"{side} trades have been consistently profitable: "
+                            f"{len(trades)} winners with avg profit ${avg_pnl:.2f}. "
+                            f"Favor {side} positions when signals are borderline."
+                        ),
+                        "weight": min(2.0, 1.3 + (len(trades) * 0.05)),
+                        "sample_count": len(trades),
+                        "total_profit": total_pnl,
+                        "avg_profit": avg_pnl,
+                    })
+        
+        # Edge: Hold time sweet spot
+        best_hold_category = None
+        best_avg_pnl = 0
+        for category, trades in by_hold_time.items():
+            if len(trades) >= 3:
+                avg = sum(t.get("realized_pnl", 0) for t in trades) / len(trades)
+                if avg > best_avg_pnl:
+                    best_avg_pnl = avg
+                    best_hold_category = category
+        
+        if best_hold_category and best_avg_pnl > 0.3:
+            time_ranges = {
+                "scalp": "under 5 minutes",
+                "short": "5-30 minutes", 
+                "medium": "30-120 minutes",
+                "long": "over 2 hours"
+            }
+            edges.append({
+                "name": f"{best_hold_category}_hold_edge",
+                "category": "edge",
+                "content": (
+                    f"Optimal hold time is {time_ranges.get(best_hold_category, best_hold_category)}: "
+                    f"avg profit ${best_avg_pnl:.2f}. "
+                    f"Adjust take-profit timing and position sizing to match this window."
+                ),
+                "weight": 1.5,
+                "hold_category": best_hold_category,
+                "avg_profit": best_avg_pnl,
+            })
+        
+        # Edge: Confidence calibration
+        for conf_level, trades in by_confidence.items():
+            if len(trades) >= 3:
+                avg_pnl = sum(t.get("realized_pnl", 0) for t in trades) / len(trades)
+                if conf_level == "high" and avg_pnl > 1.0:
+                    edges.append({
+                        "name": "high_confidence_edge",
+                        "category": "edge",
+                        "content": (
+                            f"High-confidence trades (>80%) are delivering: "
+                            f"avg ${avg_pnl:.2f} profit over {len(trades)} trades. "
+                            f"Increase position size on high-confidence setups."
+                        ),
+                        "weight": 1.8,
+                        "confidence_level": conf_level,
+                        "avg_profit": avg_pnl,
+                    })
+                elif conf_level == "low" and avg_pnl > 0.5:
+                    edges.append({
+                        "name": "low_confidence_surprise_edge",
+                        "category": "edge", 
+                        "content": (
+                            f"Even low-confidence trades (<60%) are profitable: "
+                            f"avg ${avg_pnl:.2f}. Consider trading more signals "
+                            f"with tighter risk management."
+                        ),
+                        "weight": 1.4,
+                        "confidence_level": conf_level,
+                        "avg_profit": avg_pnl,
+                    })
+        
+        self.discovered_edges = edges
+        return edges
+
+
+def run_advanced_learning_analysis() -> Dict[str, Any]:
+    """
+    Run comprehensive learning analysis including mistake clustering
+    and edge discovery. Called from the Training UI.
+    """
+    results = {
+        "mistake_clusters": {},
+        "prevention_rules": [],
+        "discovered_edges": [],
+        "rules_added": 0,
+    }
+    
+    with session_scope() as s:
+        # Get recent closed trades
+        trades = (
+            s.query(PaperTrade)
+            .filter(PaperTrade.status == "closed")
+            .order_by(PaperTrade.closed_at.desc())
+            .limit(100)
+            .all()
+        )
+        
+        trade_data = []
+        for t in trades:
+            reflection = (
+                s.query(TradeReflection)
+                .filter(TradeReflection.trade_id == t.id)
+                .first()
+            )
+            
+            trade_info = {
+                "id": t.id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "realized_pnl": float(t.realized_pnl or 0),
+                "held_minutes": int(((t.closed_at - t.opened_at).total_seconds() / 60) if t.closed_at and t.opened_at else 0),
+                "confidence": float(t.confidence or 0),
+                "exit_reason": t.exit_reason,
+                "notes": t.notes or "",
+                "reflection": {
+                    "verdict": reflection.verdict if reflection else "unknown",
+                    "score": float(reflection.score or 0) if reflection else 0,
+                    "summary": reflection.summary if reflection else "",
+                } if reflection else {},
+            }
+            trade_data.append(trade_info)
+    
+    # Split into winners and losers
+    winners = [t for t in trade_data if t["realized_pnl"] > 0]
+    losers = [t for t in trade_data if t["realized_pnl"] < 0]
+    
+    # Run mistake clustering
+    clusterer = MistakeClusterer()
+    clusters = clusterer.cluster_mistakes(losers)
+    prevention_rules = clusterer.generate_prevention_rules()
+    
+    results["mistake_clusters"] = {k: len(v) for k, v in clusters.items()}
+    results["prevention_rules"] = prevention_rules
+    
+    # Run edge discovery
+    discoverer = EdgeDiscoverer()
+    edges = discoverer.analyze_winners(winners)
+    results["discovered_edges"] = edges
+    
+    # Save new rules to the database
+    with session_scope() as s:
+        # Add prevention rules
+        for rule in prevention_rules:
+            s.add(AILearningMemory(
+                category=rule["category"],
+                content=rule["content"],
+                weight=rule["weight"],
+            ))
+            results["rules_added"] += 1
+        
+        # Add edge rules
+        for edge in edges:
+            s.add(AILearningMemory(
+                category=edge["category"],
+                content=edge["content"],
+                weight=edge["weight"],
+            ))
+            results["rules_added"] += 1
+        
+        # Log the analysis
+        s.add(ActivityLog(
+            category="ai",
+            level="info",
+            message=(
+                f"Advanced learning analysis: {len(prevention_rules)} prevention rules, "
+                f"{len(edges)} edges discovered from {len(trade_data)} trades"
+            ),
+        ))
+    
+    return results

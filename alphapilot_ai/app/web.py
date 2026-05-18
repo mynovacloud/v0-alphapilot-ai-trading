@@ -1654,6 +1654,30 @@ def training_memory_consolidate() -> RedirectResponse:
     return RedirectResponse(url="/training", status_code=303)
 
 
+@router.post("/training/memory/meta-analyze")
+def training_memory_meta_analyze() -> RedirectResponse:
+    """
+    Perform deep meta-analysis across recent trades to discover patterns,
+    recurring mistakes, winning setups, and higher-order insights.
+    """
+    from ai.claude_learning import analyze_trade_patterns
+    result = analyze_trade_patterns(lookback_trades=50)
+    # Result is logged in the function, just redirect back
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/discover-edges")
+def training_memory_discover_edges() -> RedirectResponse:
+    """
+    Run advanced learning analysis: cluster mistakes and discover
+    profitable edges from trade history. Does NOT require Claude.
+    """
+    from ai.adaptive_learning_engine import run_advanced_learning_analysis
+    result = run_advanced_learning_analysis()
+    # Result is logged in the function, just redirect back
+    return RedirectResponse(url="/training", status_code=303)
+
+
 @router.post("/training/memory/delete/{rule_id}")
 def training_memory_delete(rule_id: int) -> RedirectResponse:
     from database.models import AILearningMemory
