@@ -11,18 +11,13 @@
  */
 (function () {
   "use strict";
-  console.log("[v0] live_session.js loaded");
 
-  const POLL_MS = 3000;  // Poll every 3 seconds (was 1.5s - too aggressive)
+  const POLL_MS = 3000;  // Poll every 3 seconds
   const MAX_FEED_ITEMS = 120;
 
   // --- DOM ---
   const root = document.getElementById("live-session");
-  if (!root) {
-    console.warn("[v0] live_session.js: #live-session not found, aborting");
-    return;
-  }
-  console.log("[v0] live_session.js: #live-session found, initializing");
+  if (!root) return;
 
   const startBtn = document.getElementById("live-start-btn");
   const stopBtn = document.getElementById("live-stop-btn");
@@ -138,12 +133,7 @@
 
   // --- Equity strip ---
   function renderPortfolio(p) {
-    console.log("[v0] renderPortfolio called with:", p);
-    if (!p) {
-      console.warn("[v0] renderPortfolio: no portfolio data");
-      return;
-    }
-    console.log("[v0] DOM elements:", { equityEl, equitySub, totalPlEl, realizedEl, unrealEl, winrateEl });
+    if (!p) return;
     equityEl.textContent = fmtMoney(p.current);
     equitySub.textContent = signedMoney(p.total_pl) + " (" +
       (p.total_pl_pct >= 0 ? "+" : "") + p.total_pl_pct.toFixed(2) + "%) vs. " +
@@ -160,7 +150,6 @@
     unrealSub.textContent = p.open_trades + " open · marked live";
     winrateEl.textContent = (p.win_rate * 100).toFixed(1) + "%";
     winrateSub.textContent = p.wins + "W / " + p.losses + "L";
-    console.log("[v0] renderPortfolio completed");
   }
 
   // --- Decision feed ---
@@ -249,24 +238,15 @@
 
   // --- Polling ---
   async function pollOnce() {
-    console.log("[v0] pollOnce started");
     try {
       const url =
         "/training/session/feed?since_decision_id=" + state.cursors.decision_id +
         "&since_log_id=" + state.cursors.log_id +
         "&since_trade_id=" + state.cursors.trade_id;
-      console.log("[v0] Fetching:", url);
       const res = await fetch(url, { headers: { Accept: "application/json" } });
-      if (!res.ok) {
-        console.error("[v0] pollOnce: fetch not ok", res.status);
-        return;
-      }
+      if (!res.ok) return;
       const data = await res.json();
-      console.log("[v0] pollOnce response:", data);
-      if (!data.ok) {
-        console.error("[v0] pollOnce: data.ok is false");
-        return;
-      }
+      if (!data.ok) return;
       
       setStatus(!!data.session.active, data.session);
       renderPortfolio(data.portfolio);

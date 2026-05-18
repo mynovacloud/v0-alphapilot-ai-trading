@@ -18,7 +18,7 @@ DEFAULTS: dict[str, str] = {
     "bot_tick_seconds": "60",              # how often the loop wakes up
     "bot_universe": "coinbase_usd",        # which universe to trade
     "bot_universe_limit": "100",           # max symbols per tick (increased for diversity)
-    "bot_min_confidence": "0.55",          # minimum AI confidence to act (lowered to trade more)
+    "bot_min_confidence": "0.40",          # minimum AI confidence to act (lowered for more activity)
     "bot_default_strategy_type": "Momentum",
     "bot_position_size_usd": "80",         # default per-trade notional in USD
     "bot_max_open_per_wallet": "25",       # max concurrent positions (increased for scalping)
@@ -84,7 +84,7 @@ class BotConfig:
             tick_seconds=max(2, int(float(raw.get("bot_tick_seconds") or 60))),
             universe=raw.get("bot_universe") or "coinbase_usd",
             universe_limit=max(1, int(float(raw.get("bot_universe_limit") or 100))),
-            min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.55))),
+            min_confidence=max(0.0, min(1.0, float(raw.get("bot_min_confidence") or 0.40))),
             default_strategy_type=raw.get("bot_default_strategy_type") or "Momentum",
             position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 80)),
             max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 25))),
