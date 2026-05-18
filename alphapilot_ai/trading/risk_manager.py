@@ -152,10 +152,24 @@ class RiskManager:
             open_count = open_count_paper + open_count_live
             todays_count = todays_count_paper + todays_count_live
 
-            if wallet.max_open_positions and open_count >= wallet.max_open_positions:
+            # Use the HIGHER of wallet limit and config limit to allow session overrides.
+            # During training sessions, the config setting should take precedence.
+            config_max_open = self._get_config_max_open()
+            effective_max_open = max(
+                wallet.max_open_positions or 3,
+                config_max_open or 3
+            )
+            
+            logger.debug(
+                f"[RISK_CHECK] wallet_id={wallet_id}: open={open_count}, "
+                f"wallet_limit={wallet.max_open_positions}, config_limit={config_max_open}, "
+                f"effective_limit={effective_max_open}"
+            )
+            
+            if open_count >= effective_max_open:
                 return RiskDecision(
                     False,
-                    f"Wallet already has {open_count} open positions (cap {wallet.max_open_positions}).",
+                    f"Wallet already has {open_count} open positions (cap {effective_max_open}).",
                     "wallet_open_cap",
                 )
 
@@ -280,6 +294,20 @@ class RiskManager:
                 return float(raw)
             except ValueError:
                 return None
+
+    @classmethod
+    def _get_config_max_open(cls) -> int:
+        """Get the config setting for max_open_per_wallet.
+        This allows training sessions to override wallet-level caps.
+        """
+        with session_scope() as s:
+            row = s.query(AppSetting).filter(AppSetting.key == "bot_max_open_per_wallet").first()
+            if row and row.value:
+                try:
+                    return int(float(row.value))
+                except ValueError:
+                    pass
+            return 3  # Default fallback
 
     @classmethod
     def set_kill_switch(cls, on: bool, *, reason: str = "") -> None:

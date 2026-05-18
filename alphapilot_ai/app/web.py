@@ -2200,6 +2200,43 @@ def settings_reset_data(confirm: str = Form("")) -> RedirectResponse:
 # ============================================================================ #
 
 
+@router.get("/api/v1/wallets")
+def api_wallets() -> JSONResponse:
+    """Get all wallets with their current limits and status."""
+    try:
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            result = []
+            for w in wallets:
+                # Count open positions
+                open_count = (
+                    s.query(PaperTrade)
+                    .filter(PaperTrade.wallet_id == w.id, PaperTrade.status == "open")
+                    .count()
+                )
+                result.append({
+                    "id": w.id,
+                    "name": w.name,
+                    "platform": w.platform,
+                    "paper_balance": float(w.paper_balance or 0),
+                    "max_open_positions": w.max_open_positions,
+                    "max_position_usd": float(w.max_position_usd or 0),
+                    "max_daily_trades": w.max_daily_trades,
+                    "max_daily_loss_usd": float(w.max_daily_loss_usd or 0),
+                    "bot_paused": w.bot_paused,
+                    "trading_mode": w.trading_mode,
+                    "trading_style": getattr(w, 'trading_style', 'hybrid'),
+                    "open_positions": open_count,
+                    "slots_used": f"{open_count}/{w.max_open_positions}",
+                })
+            return JSONResponse(result)
+    except Exception as e:
+        import logging
+        import traceback
+        logging.exception("[API_WALLETS] Error")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 @router.get("/v1/positions")
 def api_positions() -> JSONResponse:
     """

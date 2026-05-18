@@ -44,10 +44,16 @@ class PaperTradingEngine:
         if side not in {"BUY", "SELL"}:
             raise ValueError("side must be BUY or SELL")
 
+        logger.info(
+            f"[OPEN_TRADE] Attempting: wallet={wallet_id}, symbol={symbol}, "
+            f"side={side}, qty={qty}, price={entry_price}, conf={confidence}"
+        )
+
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
         if not decision:
+            logger.warning(f"[OPEN_TRADE] REJECTED by risk manager: {decision.reason} (code={decision.code})")
             self._log("risk", f"Trade rejected: {decision.reason}", wallet_id=wallet_id, level="warn")
-            return {"ok": False, "reason": decision.reason}
+            return {"ok": False, "reason": decision.reason, "code": decision.code}
 
         notional = qty * entry_price
         fees = self._estimate_fees(notional)
@@ -56,6 +62,7 @@ class PaperTradingEngine:
         with session_scope() as s:
             wallet = s.get(Wallet, wallet_id)
             if not wallet:
+                logger.error(f"[OPEN_TRADE] Wallet {wallet_id} not found")
                 return {"ok": False, "reason": "Wallet not found"}
 
             # Reserve cash from paper balance
@@ -88,6 +95,8 @@ class PaperTradingEngine:
                     message=f"Opened {side} {qty} {symbol} @ {entry_price:.2f} (conf={confidence:.2f})",
                 )
             )
+            
+            logger.info(f"[OPEN_TRADE] SUCCESS: trade_id={trade_id}, symbol={symbol}, notional=${notional:.2f}")
 
         return {"ok": True, "trade_id": trade_id, "fees": fees, "slippage": slippage}
 
