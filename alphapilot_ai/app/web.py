@@ -105,10 +105,44 @@ def _fmt_dt(value: Any) -> str:
         return str(value)
 
 
+def _fmt_timeago(value: Any) -> str:
+    """Format a datetime as a human-readable 'time ago' string."""
+    if not value:
+        return "-"
+    try:
+        from utils.helpers import utcnow
+        now = utcnow()
+        # Handle timezone-naive datetimes
+        if hasattr(value, 'tzinfo') and value.tzinfo is not None:
+            value = value.replace(tzinfo=None)
+        if hasattr(now, 'tzinfo') and now.tzinfo is not None:
+            now = now.replace(tzinfo=None)
+        
+        delta = now - value
+        seconds = delta.total_seconds()
+        
+        if seconds < 60:
+            return "just now"
+        elif seconds < 3600:
+            mins = int(seconds / 60)
+            return f"{mins}m ago"
+        elif seconds < 86400:
+            hours = int(seconds / 3600)
+            return f"{hours}h ago"
+        elif seconds < 604800:
+            days = int(seconds / 86400)
+            return f"{days}d ago"
+        else:
+            return value.strftime("%Y-%m-%d")
+    except Exception:
+        return str(value) if value else "-"
+
+
 templates.env.filters["money"] = _fmt_money
 templates.env.filters["pct"] = _fmt_pct
 templates.env.filters["signed"] = _fmt_signed
 templates.env.filters["dt"] = _fmt_dt
+templates.env.filters["timeago"] = _fmt_timeago
 
 router = APIRouter()
 
@@ -1053,6 +1087,22 @@ def training_session_start(
         }
     )
 
+    # CRITICAL: Also update the actual Wallet objects so the risk manager sees the new limits.
+    # The risk manager checks wallet.max_open_positions, NOT the config setting.
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        for w in wallets:
+            # Save original values so we can restore on stop
+            if not w.meta:
+                w.meta = {}
+            w.meta["_session_prev_max_open"] = w.max_open_positions
+            w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+            # Apply session settings to wallet
+            w.max_open_positions = max_open
+            w.max_position_usd = pos_usd
+            w.bot_paused = False  # Unpause all wallets for training
+        logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}")
+
     bot_scheduler.reload()  # pick up the new tick interval
 
     # Fire one tick immediately so the user sees activity within seconds
@@ -1164,6 +1214,18 @@ def training_session_stop() -> JSONResponse:
         }
     )
     bot_scheduler.reload()
+
+    # Restore original wallet settings
+    with session_scope() as s:
+        wallets = s.query(Wallet).all()
+        for w in wallets:
+            if w.meta and "_session_prev_max_open" in w.meta:
+                w.max_open_positions = w.meta.get("_session_prev_max_open")
+                w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
+                # Clean up the temporary keys
+                w.meta.pop("_session_prev_max_open", None)
+                w.meta.pop("_session_prev_max_position_usd", None)
+        logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
 
     with session_scope() as s:
         s.add(
@@ -2239,48 +2301,79 @@ def api_close_all_positions() -> JSONResponse:
     """
     Close all open positions at current market prices.
     """
-    from connectors.live_prices import get_price
-    from trading.paper_trading_engine import PaperTradingEngine
+    import logging
+    import traceback
+    
+    try:
+        from connectors.live_prices import get_price
+        from trading.paper_trading_engine import PaperTradingEngine
+    except ImportError as ie:
+        logging.exception("[CLOSE_ALL] Import error")
+        return JSONResponse({"ok": False, "error": f"Import error: {ie}", "traceback": traceback.format_exc()})
 
-    engine = PaperTradingEngine()
     closed = 0
     errors = 0
+    error_details = []
     total_pnl = 0.0
 
-    with session_scope() as s:
-        open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-        trade_info = [(t.id, t.symbol) for t in open_trades]
+    try:
+        engine = PaperTradingEngine()
 
-    for trade_id, symbol in trade_info:
-        p = get_price(symbol)
-        if not p.get("ok"):
-            errors += 1
-            continue
+        with session_scope() as s:
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+            if not open_trades:
+                return JSONResponse({"ok": True, "closed": 0, "errors": 0, "total_pnl": 0.0, "message": "No open positions"})
+            trade_info = [(t.id, t.symbol) for t in open_trades]
 
-        result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
-        if result.get("ok"):
-            closed += 1
-            total_pnl += float(result.get("pnl", 0))
+        logging.info(f"[CLOSE_ALL] Closing {len(trade_info)} positions")
+
+        for trade_id, symbol in trade_info:
+            try:
+                p = get_price(symbol)
+                if not p.get("ok"):
+                    errors += 1
+                    error_details.append(f"{symbol}: no price")
+                    continue
+
+                result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
+                if result.get("ok"):
+                    closed += 1
+                    total_pnl += float(result.get("pnl", 0))
+                    try:
+                        with session_scope() as s:
+                            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                            if trade:
+                                trade.exit_reason = "manual"
+                    except Exception as db_err:
+                        logging.error(f"[CLOSE_ALL] Error setting exit_reason: {db_err}")
+                else:
+                    errors += 1
+                    error_details.append(f"{symbol}: {result.get('reason', 'unknown')}")
+            except Exception as e:
+                logging.error(f"[CLOSE_ALL] Error closing {symbol}: {e}")
+                errors += 1
+                error_details.append(f"{symbol}: {str(e)}")
+
+        try:
             with session_scope() as s:
-                trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                if trade:
-                    trade.exit_reason = "manual"
-        else:
-            errors += 1
-
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="positions",
-                level="info",
-                message=f"Close-all: {closed} positions closed, {errors} errors, total P&L: ${total_pnl:+.2f}",
-            )
-        )
+                s.add(
+                    ActivityLog(
+                        category="positions",
+                        level="info",
+                        message=f"Close-all: {closed} positions closed, {errors} errors, total P&L: ${total_pnl:+.2f}",
+                    )
+                )
+        except Exception as log_err:
+            logging.error(f"[CLOSE_ALL] Error logging activity: {log_err}")
+    except Exception as e:
+        logging.exception("[CLOSE_ALL] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
     return JSONResponse({
         "ok": True,
         "closed": closed,
         "errors": errors,
+        "error_details": error_details,
         "total_pnl": round(total_pnl, 2),
     })
 
@@ -2294,27 +2387,39 @@ def api_take_all_profits() -> JSONResponse:
     import logging
     import traceback
     
+    try:
+        from connectors.live_prices import get_price
+        from trading.paper_trading_engine import PaperTradingEngine
+    except ImportError as ie:
+        logging.exception("[TAKE_PROFITS] Import error")
+        return JSONResponse({"ok": False, "error": f"Import error: {ie}", "traceback": traceback.format_exc()})
+    
     closed = 0
     skipped = 0
     errors = []
     total_pnl = 0.0
 
     try:
-        from connectors.live_prices import get_price
-        from trading.paper_trading_engine import PaperTradingEngine
         engine = PaperTradingEngine()
         
         with session_scope() as s:
             open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-            trade_info = [(t.id, t.symbol, t.side, float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
+            if not open_trades:
+                return JSONResponse({"ok": True, "closed": 0, "skipped": 0, "errors": [], "total_pnl": 0.0, "message": "No open positions"})
+            trade_info = [(t.id, t.symbol, t.side or "BUY", float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
         logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
 
         for trade_id, symbol, side, entry_price, qty in trade_info:
             try:
+                if entry_price <= 0 or qty <= 0:
+                    logging.warning(f"[TAKE_PROFITS] Invalid trade data for {symbol}: entry={entry_price}, qty={qty}")
+                    skipped += 1
+                    continue
+                    
                 p = get_price(symbol)
                 if not p.get("ok"):
-                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}")
+                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}: {p.get('error', 'unknown')}")
                     skipped += 1
                     continue
                 
@@ -2339,10 +2444,13 @@ def api_take_all_profits() -> JSONResponse:
                 if result.get("ok"):
                     closed += 1
                     total_pnl += float(result.get("pnl", 0))
-                    with session_scope() as s:
-                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                        if trade:
-                            trade.exit_reason = "take_profit_manual"
+                    try:
+                        with session_scope() as s:
+                            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                            if trade:
+                                trade.exit_reason = "take_profit_manual"
+                    except Exception as db_err:
+                        logging.error(f"[TAKE_PROFITS] Error updating exit_reason: {db_err}")
                 else:
                     errors.append(f"{symbol}: {result.get('reason', 'unknown')}")
                     skipped += 1
@@ -2351,17 +2459,21 @@ def api_take_all_profits() -> JSONResponse:
                 errors.append(f"{symbol}: {str(e)}")
                 skipped += 1
 
-        with session_scope() as s:
-            s.add(
-                ActivityLog(
-                    category="positions",
-                    level="info",
-                    message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+        try:
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="positions",
+                        level="info",
+                        message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+                    )
                 )
-            )
+        except Exception as log_err:
+            logging.error(f"[TAKE_PROFITS] Error logging activity: {log_err}")
+            
     except Exception as e:
         logging.exception("[TAKE_PROFITS] Fatal error")
-        return JSONResponse({"ok": False, "error": str(e), "traceback": traceback.format_exc()}, status_code=200)
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
     return JSONResponse({
         "ok": True,
@@ -2448,81 +2560,104 @@ def api_force_check_positions() -> JSONResponse:
     This is a debug endpoint to test if scalper settings are working.
     """
     import logging
+    import traceback
     from connectors.live_prices import get_price
-    from trading.position_monitor import PositionMonitor
     
     results = []
     exit_signals = []
     
     try:
-        monitor = PositionMonitor()
-        
         with session_scope() as s:
             # Get all open trades
             open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
             
+            if not open_trades:
+                return JSONResponse({
+                    "ok": True,
+                    "total_positions": 0,
+                    "would_exit": 0,
+                    "positions": [],
+                    "exit_signals": [],
+                    "message": "No open positions to check"
+                })
+            
             for trade in open_trades:
-                # Get wallet settings
-                wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
-                
-                trading_style = wallet.trading_style if wallet else 'hybrid'
-                micro_target = float(wallet.micro_profit_target_usd or 0.25) if wallet else 0.25
-                min_pct = float(wallet.min_profit_pct or 0.003) if wallet else 0.003
-                
-                # Get current price
-                p = get_price(trade.symbol)
-                if not p.get("ok"):
-                    results.append({
+                try:
+                    # Get wallet settings
+                    wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+                    
+                    trading_style = wallet.trading_style if wallet else 'hybrid'
+                    micro_target = float(wallet.micro_profit_target_usd or 0.25) if wallet else 0.25
+                    min_pct = float(wallet.min_profit_pct or 0.003) if wallet else 0.003
+                    
+                    # Get current price
+                    p = get_price(trade.symbol)
+                    if not p.get("ok"):
+                        results.append({
+                            "symbol": trade.symbol,
+                            "error": f"Could not fetch price: {p.get('error', 'unknown')}"
+                        })
+                        continue
+                    
+                    current_price = float(p["price"])
+                    entry = float(trade.entry_price or 0)
+                    qty = float(trade.qty or 0)
+                    side = (trade.side or "BUY").upper()
+                    
+                    if entry <= 0:
+                        results.append({
+                            "symbol": trade.symbol,
+                            "error": "Invalid entry price"
+                        })
+                        continue
+                    
+                    # Calculate P&L
+                    if side == "BUY":
+                        pnl_pct = (current_price - entry) / entry
+                    else:
+                        pnl_pct = (entry - current_price) / entry
+                    
+                    pnl_usd = pnl_pct * entry * qty
+                    
+                    # Check if should exit
+                    should_exit = False
+                    exit_reason = None
+                    
+                    if pnl_usd > 0:
+                        if trading_style == "scalper" and pnl_usd >= micro_target:
+                            should_exit = True
+                            exit_reason = f"SCALPER: pnl_usd ${pnl_usd:.4f} >= target ${micro_target}"
+                        elif trading_style == "hybrid" and (pnl_usd >= micro_target or pnl_pct >= min_pct):
+                            should_exit = True
+                            exit_reason = f"HYBRID: pnl_usd ${pnl_usd:.4f} or pnl_pct {pnl_pct:.4%}"
+                    
+                    result = {
+                        "trade_id": trade.id,
                         "symbol": trade.symbol,
-                        "error": "Could not fetch price"
+                        "side": side,
+                        "entry": entry,
+                        "current": current_price,
+                        "qty": qty,
+                        "pnl_usd": round(pnl_usd, 4),
+                        "pnl_pct": round(pnl_pct * 100, 4),
+                        "wallet_trading_style": trading_style,
+                        "wallet_micro_target": micro_target,
+                        "wallet_min_pct": min_pct,
+                        "should_exit": should_exit,
+                        "exit_reason": exit_reason,
+                    }
+                    results.append(result)
+                    
+                    if should_exit:
+                        exit_signals.append(result)
+                        logging.info(f"[FORCE_CHECK] Would exit {trade.symbol}: {exit_reason}")
+                except Exception as trade_err:
+                    logging.error(f"[FORCE_CHECK] Error processing trade {trade.id}: {trade_err}")
+                    results.append({
+                        "trade_id": trade.id,
+                        "symbol": trade.symbol if trade else "unknown",
+                        "error": str(trade_err)
                     })
-                    continue
-                
-                current_price = float(p["price"])
-                entry = float(trade.entry_price)
-                qty = float(trade.qty)
-                side = (trade.side or "BUY").upper()
-                
-                # Calculate P&L
-                if side == "BUY":
-                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-                else:
-                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
-                
-                pnl_usd = pnl_pct * entry * qty
-                
-                # Check if should exit
-                should_exit = False
-                exit_reason = None
-                
-                if pnl_usd > 0:
-                    if trading_style == "scalper" and pnl_usd >= micro_target:
-                        should_exit = True
-                        exit_reason = f"SCALPER: pnl_usd ${pnl_usd:.4f} >= target ${micro_target}"
-                    elif trading_style == "hybrid" and (pnl_usd >= micro_target or pnl_pct >= min_pct):
-                        should_exit = True
-                        exit_reason = f"HYBRID: pnl_usd ${pnl_usd:.4f} or pnl_pct {pnl_pct:.4%}"
-                
-                result = {
-                    "trade_id": trade.id,
-                    "symbol": trade.symbol,
-                    "side": side,
-                    "entry": entry,
-                    "current": current_price,
-                    "qty": qty,
-                    "pnl_usd": round(pnl_usd, 4),
-                    "pnl_pct": round(pnl_pct * 100, 4),
-                    "wallet_trading_style": trading_style,
-                    "wallet_micro_target": micro_target,
-                    "wallet_min_pct": min_pct,
-                    "should_exit": should_exit,
-                    "exit_reason": exit_reason,
-                }
-                results.append(result)
-                
-                if should_exit:
-                    exit_signals.append(result)
-                    logging.info(f"[FORCE_CHECK] Would exit {trade.symbol}: {exit_reason}")
         
         return JSONResponse({
             "ok": True,
@@ -2532,11 +2667,10 @@ def api_force_check_positions() -> JSONResponse:
             "exit_signals": exit_signals,
         })
     except Exception as e:
-        import traceback
         logging.exception("[FORCE_CHECK] Error")
         return JSONResponse({
             "ok": False,
-            "error": str(e),
+            "error": str(e) or "Unknown error occurred",
             "traceback": traceback.format_exc(),
         })
 
@@ -2754,30 +2888,41 @@ def api_emergency_exit() -> JSONResponse:
     """
     Emergency exit: Close all positions AND engage kill switch.
     """
-    # First engage kill switch
-    RiskManager.set_kill_switch(True, reason="emergency exit via API")
-
-    # Then close all positions
-    result = api_close_all_positions()
-    data = result.body.decode() if hasattr(result, "body") else "{}"
     import json
-    close_result = json.loads(data) if data else {}
+    import logging
+    import traceback
+    
+    try:
+        # First engage kill switch
+        RiskManager.set_kill_switch(True, reason="emergency exit via API")
+        logging.warning("[EMERGENCY_EXIT] Kill switch engaged")
 
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="risk",
-                level="warn",
-                message="EMERGENCY EXIT: Kill switch engaged and all positions closed.",
-            )
-        )
+        # Then close all positions
+        result = api_close_all_positions()
+        data = result.body.decode() if hasattr(result, "body") else "{}"
+        close_result = json.loads(data) if data else {}
 
-    return JSONResponse({
-        "ok": True,
-        "kill_switch_engaged": True,
-        "positions_closed": close_result.get("closed", 0),
-        "total_pnl": close_result.get("total_pnl", 0),
-    })
+        try:
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="risk",
+                        level="warn",
+                        message="EMERGENCY EXIT: Kill switch engaged and all positions closed.",
+                    )
+                )
+        except Exception as log_err:
+            logging.error(f"[EMERGENCY_EXIT] Error logging activity: {log_err}")
+
+        return JSONResponse({
+            "ok": True,
+            "kill_switch_engaged": True,
+            "positions_closed": close_result.get("closed", 0),
+            "total_pnl": close_result.get("total_pnl", 0),
+        })
+    except Exception as e:
+        logging.exception("[EMERGENCY_EXIT] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
 @router.get("/v1/portfolio-intel")
@@ -3210,3 +3355,192 @@ def api_trade_blockers() -> JSONResponse:
             "universe_limit": cfg.universe_limit
         }
     })
+
+
+# ======================================================================
+# DIAGNOSTIC: Test entire trade flow
+# ======================================================================
+
+@router.post("/v1/diagnostics/test-trade-flow")
+def api_test_trade_flow() -> JSONResponse:
+    """
+    Test the ENTIRE trade execution flow with detailed diagnostics.
+    This tests every step from config loading to trade opening.
+    """
+    import logging
+    import traceback
+    
+    steps = []
+    errors = []
+    
+    def log_step(name: str, status: str, details: dict = None):
+        steps.append({"step": name, "status": status, "details": details or {}})
+        logging.info(f"[TEST_FLOW] {name}: {status} - {details}")
+    
+    try:
+        # Step 1: Load config
+        from config.bot_config import BotConfig
+        cfg = BotConfig.load()
+        log_step("1_load_config", "OK", {
+            "bot_enabled": cfg.bot_enabled,
+            "dry_run": cfg.dry_run,
+            "position_size_usd": cfg.position_size_usd,
+            "universe_limit": cfg.universe_limit,
+            "min_confidence": cfg.min_confidence,
+            "max_open_per_wallet": cfg.max_open_per_wallet,
+        })
+        
+        # Step 2: Load universe
+        from connectors.universe import coinbase_usd_universe
+        universe = coinbase_usd_universe(limit=cfg.universe_limit)
+        log_step("2_load_universe", "OK" if universe else "FAIL", {
+            "count": len(universe),
+            "first_10": [u["product_id"] for u in universe[:10]],
+        })
+        
+        if not universe:
+            errors.append("Universe is empty - cannot trade")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        # Step 3: Get a test price
+        test_symbol = universe[0]["product_id"]
+        from connectors.live_prices import get_price
+        price_result = get_price(test_symbol)
+        if price_result.get("ok"):
+            test_price = float(price_result["price"])
+            log_step("3_get_price", "OK", {"symbol": test_symbol, "price": test_price})
+        else:
+            log_step("3_get_price", "FAIL", {"error": price_result.get("error")})
+            errors.append(f"Cannot get price for {test_symbol}")
+            test_price = 100.0  # fallback
+        
+        # Step 4: Find wallets
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            wallet_info = []
+            for w in wallets:
+                open_count = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "open"
+                ).count()
+                wallet_info.append({
+                    "id": w.id,
+                    "name": w.name,
+                    "paper_balance": float(w.paper_balance or 0),
+                    "bot_paused": w.bot_paused,
+                    "max_open_positions": w.max_open_positions,
+                    "open_positions": open_count,
+                })
+        
+        log_step("4_find_wallets", "OK" if wallet_info else "FAIL", {
+            "count": len(wallet_info),
+            "wallets": wallet_info,
+        })
+        
+        if not wallet_info:
+            errors.append("No wallets found - create a wallet first")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        # Step 5: Check risk manager for first active wallet
+        test_wallet = None
+        for w in wallet_info:
+            if not w["bot_paused"]:
+                test_wallet = w
+                break
+        
+        if not test_wallet:
+            log_step("5_risk_check", "FAIL", {"reason": "All wallets are paused"})
+            errors.append("All wallets are paused")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        from trading.risk_manager import RiskManager
+        rm = RiskManager()
+        
+        # Calculate position
+        position_usd = cfg.position_size_usd
+        qty = position_usd / test_price if test_price > 0 else 0
+        
+        risk_decision = rm.evaluate(
+            wallet_id=test_wallet["id"],
+            qty=qty,
+            entry_price=test_price,
+            confidence=0.70,
+            strategy_id=None,
+        )
+        
+        log_step("5_risk_check", "OK" if risk_decision.allowed else "BLOCKED", {
+            "wallet": test_wallet["name"],
+            "allowed": risk_decision.allowed,
+            "reason": risk_decision.reason,
+            "code": risk_decision.code,
+            "test_qty": qty,
+            "test_price": test_price,
+            "test_notional": qty * test_price,
+        })
+        
+        if not risk_decision.allowed:
+            errors.append(f"Risk check blocked: {risk_decision.reason}")
+        
+        # Step 6: Check if dry_run is blocking
+        if cfg.dry_run:
+            log_step("6_dry_run_check", "WARNING", {
+                "message": "DRY RUN is ON - trades will NOT actually execute",
+                "fix": "Disable 'Dry Run' in Settings to actually trade"
+            })
+            errors.append("DRY RUN is ON - trades are logged but not executed")
+        else:
+            log_step("6_dry_run_check", "OK", {"dry_run": False})
+        
+        # Step 7: Check Claude API
+        from services.claude_client import is_configured as claude_configured
+        claude_ok = claude_configured()
+        log_step("7_claude_api", "OK" if claude_ok else "WARNING", {
+            "configured": claude_ok,
+            "note": "Without Claude, bot uses technical signals only"
+        })
+        
+        # Step 8: Simulate what WOULD happen on a tick
+        simulation = {
+            "would_evaluate_symbols": min(len(universe), cfg.universe_limit),
+            "position_size_per_trade": cfg.position_size_usd,
+            "max_concurrent_positions": cfg.max_open_per_wallet,
+            "wallet_available_slots": max(0, (test_wallet.get("max_open_positions") or cfg.max_open_per_wallet) - test_wallet["open_positions"]),
+            "wallet_balance": test_wallet["paper_balance"],
+            "can_afford_trade": test_wallet["paper_balance"] >= cfg.position_size_usd,
+        }
+        log_step("8_simulation", "OK", simulation)
+        
+        if not simulation["can_afford_trade"]:
+            errors.append(f"Wallet balance (${test_wallet['paper_balance']:.2f}) is less than position size (${cfg.position_size_usd})")
+        
+        if simulation["wallet_available_slots"] <= 0:
+            errors.append("No available slots for new positions (max positions reached)")
+        
+        # Summary
+        can_trade = (
+            cfg.bot_enabled and
+            not cfg.dry_run and
+            risk_decision.allowed and
+            simulation["can_afford_trade"] and
+            simulation["wallet_available_slots"] > 0
+        )
+        
+        return JSONResponse({
+            "ok": True,
+            "can_actually_trade": can_trade,
+            "steps": steps,
+            "errors": errors,
+            "recommendation": (
+                "System is ready to trade!" if can_trade else
+                "Fix the errors above to enable trading"
+            ),
+        })
+        
+    except Exception as e:
+        logging.exception("[TEST_FLOW] Error")
+        return JSONResponse({
+            "ok": False,
+            "steps": steps,
+            "errors": errors + [str(e)],
+            "traceback": traceback.format_exc(),
+        })
