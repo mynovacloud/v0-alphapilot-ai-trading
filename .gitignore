@@ -22,6 +22,8 @@ __pycache__/
 *$py.class
 *.so
 .Python
+*.pyc
+**/*.pyc
 
 # Virtual environments
 .venv/
@@ -45,13 +47,19 @@ htmlcov/
 
 # Local databases / data
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 alphapilot_ai/data/
+alphapilot_ai/*.db*
 
 # Logs
 *.log
 logs/
+**/logs/
+alphapilot_ai/logs/
 
 # IDE
 .vscode/
