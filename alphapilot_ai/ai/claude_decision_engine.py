@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ai.claude_learning import build_playbook
+from ai.adaptive_learning_engine import get_adaptive_engine, analyze_signal
 from database.db import session_scope
 from database.models import ClaudeDecision, PaperTrade, Wallet
 from services.claude_client import chat as claude_chat
@@ -247,6 +248,60 @@ def decide(
     side = (technical_signal.side or "HOLD").upper()
     tech_conf = float(technical_signal.confidence or 0.0)
 
+    # ----- Adaptive Learning Enhancement -------------------------------------
+    # Query the adaptive learning engine for pattern matches and historical
+    # context. This provides confidence adjustments based on:
+    # 1. Recognized market patterns with historical success rates
+    # 2. Strategy performance in current market regime
+    # 3. Similar historical trades for this symbol
+    adaptive_rec = None
+    adaptive_context = {}
+    try:
+        market_state = _extract_market_state(extra_context or {})
+        adaptive_rec = analyze_signal(
+            signal_direction=side,
+            signal_confidence=tech_conf,
+            strategy_name=strategy_type,
+            market_state=market_state,
+            symbol=symbol,
+            wallet_id=wallet.get("id"),
+        )
+        
+        # Apply confidence adjustment from adaptive learning
+        if adaptive_rec:
+            adjusted_conf = tech_conf + adaptive_rec.confidence_adjustment
+            adjusted_conf = max(0.0, min(1.0, adjusted_conf))
+            
+            adaptive_context = {
+                "adaptive_learning": {
+                    "confidence_adjustment": adaptive_rec.confidence_adjustment,
+                    "adjusted_confidence": adjusted_conf,
+                    "pattern_matches": [p.name for p in adaptive_rec.matched_patterns],
+                    "pattern_boost": adaptive_rec.pattern_confidence_boost,
+                    "strategy_weight": adaptive_rec.strategy_weight,
+                    "preferred_strategy": adaptive_rec.preferred_strategy,
+                    "historical_success_rate": adaptive_rec.historical_success_rate,
+                    "similar_trades_count": adaptive_rec.similar_past_trades,
+                    "entry_timing": adaptive_rec.entry_timing,
+                    "size_multiplier": adaptive_rec.size_multiplier,
+                    "reasoning": adaptive_rec.reasoning[:3],  # Top 3 reasons
+                    "warnings": adaptive_rec.warnings[:2],  # Top 2 warnings
+                }
+            }
+            
+            # Use adjusted confidence for bypass check
+            tech_conf = adjusted_conf
+            
+            logger.info(
+                f"[ADAPTIVE] {symbol}: conf {technical_signal.confidence:.2f} -> {adjusted_conf:.2f} "
+                f"(adj={adaptive_rec.confidence_adjustment:+.2f}), "
+                f"patterns={[p.name for p in adaptive_rec.matched_patterns]}, "
+                f"strategy_weight={adaptive_rec.strategy_weight:.2f}"
+            )
+    except Exception as e:
+        logger.warning(f"[ADAPTIVE] Error in adaptive learning: {e}")
+    # -------------------------------------------------------------------------
+
     # ----- Strong-signal passthrough -------------------------------------
     # Path A: Always bypass Claude when the technical signal is very confident.
     # Path B: In training mode, bypass Claude whenever the technical signal is
@@ -255,20 +310,38 @@ def decide(
     #         operator picked floor=0.00 deliberately to see lots of trades.
     bypass_threshold = max(0.0, min(0.62, floor)) if is_training else 0.62
     if side in {"BUY", "SELL"} and tech_conf >= bypass_threshold:
+        # Use adaptive learning recommendations for sizing and risk parameters
+        size_mult = 1.0
+        stop_pct = 0.02
+        take_pct = 0.03
+        key_factors = [f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"]
+        
+        if adaptive_rec:
+            size_mult = adaptive_rec.size_multiplier
+            stop_pct = 0.02 * adaptive_rec.stop_loss_multiplier
+            take_pct = 0.03 * adaptive_rec.take_profit_multiplier
+            
+            # Add pattern matches to key factors
+            if adaptive_rec.matched_patterns:
+                key_factors.append(f"patterns={[p.name for p in adaptive_rec.matched_patterns[:3]]}")
+            key_factors.append(f"strategy_weight={adaptive_rec.strategy_weight:.2f}")
+            if adaptive_rec.historical_success_rate != 0.5:
+                key_factors.append(f"hist_success={adaptive_rec.historical_success_rate*100:.0f}%")
+        
         passthrough = TradeDecision(
             action=side,
             confidence=tech_conf,
-            size_multiplier=1.0,
-            stop_loss_pct=0.02,   # 2% stop loss
-            take_profit_pct=0.03, # 3% take profit
+            size_multiplier=size_mult,
+            stop_loss_pct=stop_pct,
+            take_profit_pct=take_pct,
             rationale=(
                 f"Training-mode passthrough (tech conf {tech_conf:.2f} >= floor {bypass_threshold:.2f}). "
                 f"{technical_signal.reasoning}"
                 if is_training
                 else f"Technical passthrough (conf {tech_conf:.2f} >= 0.62): {technical_signal.reasoning}"
-            ),
-            key_factors=[f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"],
-            risk_flags=[],
+            ) + (f" | Adaptive: {', '.join(adaptive_rec.reasoning[:2])}" if adaptive_rec and adaptive_rec.reasoning else ""),
+            key_factors=key_factors,
+            risk_flags=adaptive_rec.warnings if adaptive_rec else [],
             source="technical_strong" if not is_training else "training_passthrough",
         )
         _persist_decision(wallet, symbol, price, technical_signal, passthrough, prompt_used="")
@@ -280,13 +353,18 @@ def decide(
         return fallback
 
     try:
+        # Merge adaptive learning context into extra_context for Claude
+        enhanced_context = dict(extra_context or {})
+        if adaptive_context:
+            enhanced_context.update(adaptive_context)
+        
         prompt = _build_user_prompt(
             wallet=wallet,
             symbol=symbol,
             price=price,
             technical_signal=technical_signal,
             strategy_type=strategy_type,
-            extra_context=extra_context or {},
+            extra_context=enhanced_context,
         )
         system_prompt = _build_system_prompt(wallet)
 
@@ -653,6 +731,42 @@ def _wallet_recent_history(wallet_id: int) -> tuple[list[dict[str, Any]], list[d
             for t in closed
         ]
     return open_positions, recent_closed
+
+
+def _extract_market_state(extra_context: dict) -> dict:
+    """Extract market state indicators for adaptive learning analysis."""
+    state = {}
+    
+    # From advanced_indicators
+    indicators = extra_context.get("advanced_indicators", {})
+    state["rsi"] = indicators.get("rsi_14", 50)
+    state["macd_histogram"] = indicators.get("macd_histogram", 0)
+    state["bb_percent_b"] = indicators.get("bollinger_percent_b", 0.5)
+    state["adx"] = indicators.get("adx_trend_strength", 0)
+    state["volume_ratio"] = indicators.get("relative_volume", 1.0)
+    state["trend"] = indicators.get("trend_direction", "NEUTRAL")
+    state["momentum"] = indicators.get("momentum_signal", "NEUTRAL")
+    state["volatility_state"] = indicators.get("volatility_state", "NORMAL")
+    
+    # From market_regime
+    regime = extra_context.get("market_regime", {})
+    state["regime"] = regime.get("regime", "UNKNOWN")
+    
+    # From fear_greed_index
+    fg = extra_context.get("fear_greed_index", {})
+    state["fear_greed"] = fg.get("value", 50)
+    
+    # From multi_timeframe_analysis
+    mtf = extra_context.get("multi_timeframe_analysis", {})
+    state["mtf_alignment"] = mtf.get("alignment_score", 0.5)
+    state["mtf_bias"] = mtf.get("overall_bias", "NEUTRAL")
+    
+    # From derivatives_intelligence
+    deriv = extra_context.get("derivatives_intelligence", {})
+    state["funding_rate"] = deriv.get("funding_rate_pct", 0)
+    state["long_ratio"] = deriv.get("long_ratio", 50)
+    
+    return state
 
 
 # ---------------------------------------------------------------------------- #

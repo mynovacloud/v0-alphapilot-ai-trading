@@ -1292,6 +1292,27 @@ def training_session_tick_now() -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
+@router.get("/training/learning-stats")
+def api_get_learning_stats() -> JSONResponse:
+    """
+    Get comprehensive statistics about the adaptive learning engine.
+    Shows pattern recognition, strategy performance, and learning progress.
+    """
+    try:
+        from ai.adaptive_learning_engine import get_adaptive_engine
+        
+        engine = get_adaptive_engine()
+        stats = engine.get_learning_stats()
+        
+        return JSONResponse({
+            "ok": True,
+            "learning_stats": stats,
+        })
+    except Exception as e:
+        logging.exception("[LEARNING_STATS] Error")
+        return JSONResponse({"ok": False, "error": str(e)})
+
+
 @router.post("/training/session/apply-settings-to-wallets")
 def api_apply_session_settings_to_wallets() -> JSONResponse:
     """
