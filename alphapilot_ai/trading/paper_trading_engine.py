@@ -64,14 +64,30 @@ class PaperTradingEngine:
         fees = self._estimate_fees(notional)
         slippage = self._estimate_slippage(notional)
         
-        # Calculate stop-loss and take-profit prices
-        # Default: 2% stop-loss, 4% take-profit (2:1 risk/reward)
-        sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.02
-        tp_pct = take_profit_pct if take_profit_pct is not None else 0.04
+        # Get wallet's trading style to determine stop-loss/take-profit defaults
+        with session_scope() as s:
+            wallet = s.get(Wallet, wallet_id)
+            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
+            micro_target = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
         
-        # Default trailing stop: 1.5% - this is the KEY to locking in profits
-        # As price rises, the trailing stop rises with it (but never falls back down)
-        trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.015
+        # Calculate stop-loss and take-profit based on trading style
+        if trading_style == 'scalper':
+            # SCALPER: Tight stops, quick exits
+            # Target $0.25 profit = 0.05% on $500, so SL should be 0.03% (~$0.15)
+            # This gives us 1.67:1 reward:risk ratio
+            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.003  # 0.3% = $1.50 on $500
+            tp_pct = take_profit_pct if take_profit_pct is not None else 0.005  # 0.5% = $2.50 on $500
+            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.002  # 0.2% trailing
+        elif trading_style == 'swing':
+            # SWING: Wider stops, longer holds
+            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.03  # 3%
+            tp_pct = take_profit_pct if take_profit_pct is not None else 0.06  # 6%
+            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.02  # 2% trailing
+        else:
+            # HYBRID: Balance between scalping and swing
+            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.015  # 1.5%
+            tp_pct = take_profit_pct if take_profit_pct is not None else 0.03  # 3%
+            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.01  # 1% trailing
         
         if side == "BUY":
             stop_loss_price = entry_price * (1 - sl_pct)

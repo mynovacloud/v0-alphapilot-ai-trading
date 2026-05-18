@@ -364,13 +364,34 @@ class PositionMonitor:
             )
 
         # =====================================================================
-        # SCALPER MODE: Loss-cutting and time limits (profit-taking handled above)
+        # SCALPER MODE: AGGRESSIVE loss-cutting (profit-taking handled above)
+        # KEY INSIGHT: For scalping to work, max loss MUST be smaller than target profit
+        # Target: $0.25 profit, so max loss should be $0.15-$0.20
         # =====================================================================
         if trading_style == "scalper":
-            # CUT LOSSES FAST: Scalpers can't hold losers
-            # After 5 minutes with ANY loss, exit
-            if age_minutes >= 5 and pnl_usd < -0.10:
-                logging.info(f"[SCALPER] CUT LOSS (5m): {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
+            # Calculate max loss threshold: 60% of target profit
+            # If target is $0.25, max loss is $0.15
+            max_loss_usd = micro_target_usd * 0.6  # $0.15 for $0.25 target
+            
+            # IMMEDIATE CUT: If loss exceeds max_loss threshold, exit NOW
+            # Don't wait for time - cut the loss immediately
+            if pnl_usd <= -max_loss_usd:
+                logging.info(f"[SCALPER] IMMEDIATE CUT: {trade.symbol} ${pnl_usd:.2f} <= -${max_loss_usd:.2f} threshold")
+                self._log_exit(session, trade, "scalp_maxloss", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="scalp_maxloss",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                    urgency="high",
+                )
+            
+            # QUICK CUT: After 2 minutes with ANY loss, exit
+            # Scalping means quick in, quick out - don't let losers run
+            if age_minutes >= 2 and pnl_usd < 0:
+                logging.info(f"[SCALPER] QUICK CUT (2m): {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
                 self._log_exit(session, trade, "scalp_stoploss", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
@@ -381,22 +402,10 @@ class PositionMonitor:
                     pnl_pct=pnl_pct,
                 )
             
-            # After 10 minutes with significant loss (>$1), exit immediately
-            if age_minutes >= 10 and pnl_usd < -1.0:
-                logging.info(f"[SCALPER] CUT LOSS (10m,$1+): {trade.symbol} ${pnl_usd:.2f}")
-                self._log_exit(session, trade, "scalp_maxloss", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_maxloss",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # After 15 minutes, exit if not profitable
-            if age_minutes >= 15 and pnl_usd <= 0:
-                logging.info(f"[SCALPER] TIME EXIT (15m): {trade.symbol} ${pnl_usd:.2f}")
+            # TIME EXIT: After 5 minutes, exit if not at least 50% to target
+            # Don't hold scalp trades hoping they'll turn around
+            if age_minutes >= 5 and pnl_usd < (micro_target_usd * 0.5):
+                logging.info(f"[SCALPER] TIME EXIT (5m): {trade.symbol} ${pnl_usd:.2f} < 50% of target")
                 self._log_exit(session, trade, "scalp_timeout", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
