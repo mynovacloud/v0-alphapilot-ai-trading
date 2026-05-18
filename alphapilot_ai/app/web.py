@@ -2294,27 +2294,39 @@ def api_take_all_profits() -> JSONResponse:
     import logging
     import traceback
     
+    try:
+        from connectors.live_prices import get_price
+        from trading.paper_trading_engine import PaperTradingEngine
+    except ImportError as ie:
+        logging.exception("[TAKE_PROFITS] Import error")
+        return JSONResponse({"ok": False, "error": f"Import error: {ie}", "traceback": traceback.format_exc()})
+    
     closed = 0
     skipped = 0
     errors = []
     total_pnl = 0.0
 
     try:
-        from connectors.live_prices import get_price
-        from trading.paper_trading_engine import PaperTradingEngine
         engine = PaperTradingEngine()
         
         with session_scope() as s:
             open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-            trade_info = [(t.id, t.symbol, t.side, float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
+            if not open_trades:
+                return JSONResponse({"ok": True, "closed": 0, "skipped": 0, "errors": [], "total_pnl": 0.0, "message": "No open positions"})
+            trade_info = [(t.id, t.symbol, t.side or "BUY", float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
         logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
 
         for trade_id, symbol, side, entry_price, qty in trade_info:
             try:
+                if entry_price <= 0 or qty <= 0:
+                    logging.warning(f"[TAKE_PROFITS] Invalid trade data for {symbol}: entry={entry_price}, qty={qty}")
+                    skipped += 1
+                    continue
+                    
                 p = get_price(symbol)
                 if not p.get("ok"):
-                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}")
+                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}: {p.get('error', 'unknown')}")
                     skipped += 1
                     continue
                 
@@ -2339,10 +2351,13 @@ def api_take_all_profits() -> JSONResponse:
                 if result.get("ok"):
                     closed += 1
                     total_pnl += float(result.get("pnl", 0))
-                    with session_scope() as s:
-                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                        if trade:
-                            trade.exit_reason = "take_profit_manual"
+                    try:
+                        with session_scope() as s:
+                            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                            if trade:
+                                trade.exit_reason = "take_profit_manual"
+                    except Exception as db_err:
+                        logging.error(f"[TAKE_PROFITS] Error updating exit_reason: {db_err}")
                 else:
                     errors.append(f"{symbol}: {result.get('reason', 'unknown')}")
                     skipped += 1
@@ -2351,17 +2366,21 @@ def api_take_all_profits() -> JSONResponse:
                 errors.append(f"{symbol}: {str(e)}")
                 skipped += 1
 
-        with session_scope() as s:
-            s.add(
-                ActivityLog(
-                    category="positions",
-                    level="info",
-                    message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+        try:
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="positions",
+                        level="info",
+                        message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
+                    )
                 )
-            )
+        except Exception as log_err:
+            logging.error(f"[TAKE_PROFITS] Error logging activity: {log_err}")
+            
     except Exception as e:
         logging.exception("[TAKE_PROFITS] Fatal error")
-        return JSONResponse({"ok": False, "error": str(e), "traceback": traceback.format_exc()}, status_code=200)
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
     return JSONResponse({
         "ok": True,
