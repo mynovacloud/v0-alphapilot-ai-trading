@@ -84,6 +84,8 @@ def _migrate_schema() -> None:
             ("default_leverage", "FLOAT DEFAULT 1.0"),
             ("margin_mode", "VARCHAR(20) DEFAULT 'isolated'"),
             ("liquidation_buffer_pct", "FLOAT DEFAULT 0.10"),
+            # Metadata column for session settings backup/restore
+            ("meta", "JSON DEFAULT '{}'"),
         ],
         "paper_trades": [
             ("is_perp", "BOOLEAN DEFAULT 0"),
