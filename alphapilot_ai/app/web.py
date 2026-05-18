@@ -3327,3 +3327,192 @@ def api_trade_blockers() -> JSONResponse:
             "universe_limit": cfg.universe_limit
         }
     })
+
+
+# ======================================================================
+# DIAGNOSTIC: Test entire trade flow
+# ======================================================================
+
+@router.post("/v1/diagnostics/test-trade-flow")
+def api_test_trade_flow() -> JSONResponse:
+    """
+    Test the ENTIRE trade execution flow with detailed diagnostics.
+    This tests every step from config loading to trade opening.
+    """
+    import logging
+    import traceback
+    
+    steps = []
+    errors = []
+    
+    def log_step(name: str, status: str, details: dict = None):
+        steps.append({"step": name, "status": status, "details": details or {}})
+        logging.info(f"[TEST_FLOW] {name}: {status} - {details}")
+    
+    try:
+        # Step 1: Load config
+        from config.bot_config import BotConfig
+        cfg = BotConfig.load()
+        log_step("1_load_config", "OK", {
+            "bot_enabled": cfg.bot_enabled,
+            "dry_run": cfg.dry_run,
+            "position_size_usd": cfg.position_size_usd,
+            "universe_limit": cfg.universe_limit,
+            "min_confidence": cfg.min_confidence,
+            "max_open_per_wallet": cfg.max_open_per_wallet,
+        })
+        
+        # Step 2: Load universe
+        from connectors.universe import coinbase_usd_universe
+        universe = coinbase_usd_universe(limit=cfg.universe_limit)
+        log_step("2_load_universe", "OK" if universe else "FAIL", {
+            "count": len(universe),
+            "first_10": [u["product_id"] for u in universe[:10]],
+        })
+        
+        if not universe:
+            errors.append("Universe is empty - cannot trade")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        # Step 3: Get a test price
+        test_symbol = universe[0]["product_id"]
+        from connectors.live_prices import get_price
+        price_result = get_price(test_symbol)
+        if price_result.get("ok"):
+            test_price = float(price_result["price"])
+            log_step("3_get_price", "OK", {"symbol": test_symbol, "price": test_price})
+        else:
+            log_step("3_get_price", "FAIL", {"error": price_result.get("error")})
+            errors.append(f"Cannot get price for {test_symbol}")
+            test_price = 100.0  # fallback
+        
+        # Step 4: Find wallets
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            wallet_info = []
+            for w in wallets:
+                open_count = s.query(PaperTrade).filter(
+                    PaperTrade.wallet_id == w.id,
+                    PaperTrade.status == "open"
+                ).count()
+                wallet_info.append({
+                    "id": w.id,
+                    "name": w.name,
+                    "paper_balance": float(w.paper_balance or 0),
+                    "bot_paused": w.bot_paused,
+                    "max_open_positions": w.max_open_positions,
+                    "open_positions": open_count,
+                })
+        
+        log_step("4_find_wallets", "OK" if wallet_info else "FAIL", {
+            "count": len(wallet_info),
+            "wallets": wallet_info,
+        })
+        
+        if not wallet_info:
+            errors.append("No wallets found - create a wallet first")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        # Step 5: Check risk manager for first active wallet
+        test_wallet = None
+        for w in wallet_info:
+            if not w["bot_paused"]:
+                test_wallet = w
+                break
+        
+        if not test_wallet:
+            log_step("5_risk_check", "FAIL", {"reason": "All wallets are paused"})
+            errors.append("All wallets are paused")
+            return JSONResponse({"ok": False, "steps": steps, "errors": errors})
+        
+        from trading.risk_manager import RiskManager
+        rm = RiskManager()
+        
+        # Calculate position
+        position_usd = cfg.position_size_usd
+        qty = position_usd / test_price if test_price > 0 else 0
+        
+        risk_decision = rm.evaluate(
+            wallet_id=test_wallet["id"],
+            qty=qty,
+            entry_price=test_price,
+            confidence=0.70,
+            strategy_id=None,
+        )
+        
+        log_step("5_risk_check", "OK" if risk_decision.allowed else "BLOCKED", {
+            "wallet": test_wallet["name"],
+            "allowed": risk_decision.allowed,
+            "reason": risk_decision.reason,
+            "code": risk_decision.code,
+            "test_qty": qty,
+            "test_price": test_price,
+            "test_notional": qty * test_price,
+        })
+        
+        if not risk_decision.allowed:
+            errors.append(f"Risk check blocked: {risk_decision.reason}")
+        
+        # Step 6: Check if dry_run is blocking
+        if cfg.dry_run:
+            log_step("6_dry_run_check", "WARNING", {
+                "message": "DRY RUN is ON - trades will NOT actually execute",
+                "fix": "Disable 'Dry Run' in Settings to actually trade"
+            })
+            errors.append("DRY RUN is ON - trades are logged but not executed")
+        else:
+            log_step("6_dry_run_check", "OK", {"dry_run": False})
+        
+        # Step 7: Check Claude API
+        from services.claude_client import is_configured as claude_configured
+        claude_ok = claude_configured()
+        log_step("7_claude_api", "OK" if claude_ok else "WARNING", {
+            "configured": claude_ok,
+            "note": "Without Claude, bot uses technical signals only"
+        })
+        
+        # Step 8: Simulate what WOULD happen on a tick
+        simulation = {
+            "would_evaluate_symbols": min(len(universe), cfg.universe_limit),
+            "position_size_per_trade": cfg.position_size_usd,
+            "max_concurrent_positions": cfg.max_open_per_wallet,
+            "wallet_available_slots": max(0, (test_wallet.get("max_open_positions") or cfg.max_open_per_wallet) - test_wallet["open_positions"]),
+            "wallet_balance": test_wallet["paper_balance"],
+            "can_afford_trade": test_wallet["paper_balance"] >= cfg.position_size_usd,
+        }
+        log_step("8_simulation", "OK", simulation)
+        
+        if not simulation["can_afford_trade"]:
+            errors.append(f"Wallet balance (${test_wallet['paper_balance']:.2f}) is less than position size (${cfg.position_size_usd})")
+        
+        if simulation["wallet_available_slots"] <= 0:
+            errors.append("No available slots for new positions (max positions reached)")
+        
+        # Summary
+        can_trade = (
+            cfg.bot_enabled and
+            not cfg.dry_run and
+            risk_decision.allowed and
+            simulation["can_afford_trade"] and
+            simulation["wallet_available_slots"] > 0
+        )
+        
+        return JSONResponse({
+            "ok": True,
+            "can_actually_trade": can_trade,
+            "steps": steps,
+            "errors": errors,
+            "recommendation": (
+                "System is ready to trade!" if can_trade else
+                "Fix the errors above to enable trading"
+            ),
+        })
+        
+    except Exception as e:
+        logging.exception("[TEST_FLOW] Error")
+        return JSONResponse({
+            "ok": False,
+            "steps": steps,
+            "errors": errors + [str(e)],
+            "traceback": traceback.format_exc(),
+        })
