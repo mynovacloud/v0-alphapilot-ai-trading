@@ -7,14 +7,17 @@ Runs every tick to check if any open positions have hit their:
   - Trailing stop price
   - Max loss percentage
   - Time limit
+  - Momentum reversal (smart exit)
+  - Scalper profit targets
 
 Also updates trailing stops as price moves favorably.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 from database.db import session_scope
 from database.models import PaperTrade, ActivityLog
@@ -29,10 +32,24 @@ class ExitSignal:
     """Represents a position that should be closed."""
     trade_id: int
     symbol: str
-    reason: str  # "sl" / "tp" / "trailing" / "max_loss" / "time"
+    reason: str  # "sl" / "tp" / "trailing" / "max_loss" / "time" / "scalp_profit" / "momentum_exit"
     current_price: float
     trigger_price: float | None
     pnl_pct: float
+    urgency: str = "normal"  # "high" for immediate exits, "normal" for standard
+
+
+@dataclass
+class PositionHealth:
+    """Health assessment of a position."""
+    trade_id: int
+    symbol: str
+    health_score: float  # 0-100, where 100 is excellent
+    trend_direction: str  # "bullish", "bearish", "neutral"
+    momentum: float  # -1 to 1
+    time_decay: float  # 0-1, increases as position ages
+    risk_level: str  # "low", "medium", "high", "critical"
+    recommendation: str  # "hold", "take_profit", "cut_loss", "watch"
 
 
 class PositionMonitor:
@@ -48,6 +65,9 @@ class PositionMonitor:
 
     def __init__(self, default_max_loss_pct: float = 0.10):
         self.default_max_loss_pct = default_max_loss_pct
+        # Price history for momentum detection (symbol -> list of recent prices)
+        self._price_history: dict[str, list[float]] = {}
+        self._max_history = 20  # Keep last 20 price points
 
     def check_all_positions(
         self,
@@ -65,7 +85,15 @@ class PositionMonitor:
             List of ExitSignal objects for positions that should be closed
         """
         exits: list[ExitSignal] = []
-        import logging
+
+        # Update price history for momentum detection
+        for symbol, price in price_map.items():
+            if symbol not in self._price_history:
+                self._price_history[symbol] = []
+            self._price_history[symbol].append(price)
+            # Keep only last N prices
+            if len(self._price_history[symbol]) > self._max_history:
+                self._price_history[symbol] = self._price_history[symbol][-self._max_history:]
 
         with session_scope() as s:
             open_trades = (
@@ -81,7 +109,6 @@ class PositionMonitor:
                 current_price = price_map.get(trade.symbol)
                 if current_price is None:
                     # Try to fetch price directly if not in map
-                    import logging
                     logging.warning(f"[POSITION_MONITOR] No price for {trade.symbol} in map, fetching...")
                     try:
                         from connectors.live_prices import get_price
@@ -96,7 +123,10 @@ class PositionMonitor:
                         logging.error(f"[POSITION_MONITOR] Error fetching {trade.symbol}: {e}")
                         continue
 
-                exit_signal = self._check_single_position(s, trade, current_price)
+                # Calculate momentum for this symbol
+                momentum = self._calculate_momentum(trade.symbol)
+                
+                exit_signal = self._check_single_position(s, trade, current_price, momentum)
                 if exit_signal:
                     exits.append(exit_signal)
                 else:
@@ -107,19 +137,145 @@ class PositionMonitor:
 
         return exits
 
+    def _calculate_momentum(self, symbol: str) -> float:
+        """
+        Calculate momentum indicator for a symbol.
+        
+        Returns value from -1 (strong bearish) to +1 (strong bullish).
+        """
+        history = self._price_history.get(symbol, [])
+        if len(history) < 3:
+            return 0.0  # Not enough data
+        
+        # Calculate short-term momentum (last 3 prices)
+        recent = history[-3:]
+        if recent[0] == 0:
+            return 0.0
+        
+        short_change = (recent[-1] - recent[0]) / recent[0]
+        
+        # Calculate medium-term momentum (last 10 prices if available)
+        if len(history) >= 10:
+            medium = history[-10:]
+            medium_change = (medium[-1] - medium[0]) / medium[0] if medium[0] != 0 else 0
+        else:
+            medium_change = short_change
+        
+        # Combined momentum: 60% short-term, 40% medium-term
+        # Scale to -1 to 1 range (assume 2% move is max momentum)
+        raw_momentum = (short_change * 0.6 + medium_change * 0.4) / 0.02
+        return max(-1.0, min(1.0, raw_momentum))
+
+    def assess_position_health(
+        self,
+        trade: PaperTrade,
+        current_price: float,
+    ) -> PositionHealth:
+        """
+        Assess the health of a position for display and decision support.
+        
+        Returns a PositionHealth object with scores and recommendations.
+        """
+        from utils.helpers import time_since_minutes
+        
+        entry = float(trade.entry_price or 0)
+        qty = float(trade.qty or 0)
+        side = trade.side.upper()
+        
+        # Calculate P&L
+        if side == "BUY":
+            pnl_pct = (current_price - entry) / entry if entry > 0 else 0
+        else:
+            pnl_pct = (entry - current_price) / entry if entry > 0 else 0
+        
+        pnl_usd = pnl_pct * entry * qty
+        age_minutes = time_since_minutes(trade.opened_at) if trade.opened_at else 0
+        
+        # Get momentum
+        momentum = self._calculate_momentum(trade.symbol)
+        
+        # Determine trend direction based on momentum
+        if momentum > 0.3:
+            trend = "bullish"
+        elif momentum < -0.3:
+            trend = "bearish"
+        else:
+            trend = "neutral"
+        
+        # Calculate time decay (positions get riskier the longer they're held in scalping)
+        time_decay = min(1.0, age_minutes / 30.0)  # Max decay at 30 minutes
+        
+        # Calculate health score (0-100)
+        health_score = 50.0  # Start at neutral
+        
+        # Adjust for P&L
+        if pnl_pct > 0.01:  # >1% profit
+            health_score += 30
+        elif pnl_pct > 0:  # Any profit
+            health_score += 15
+        elif pnl_pct > -0.005:  # Small loss (<0.5%)
+            health_score -= 10
+        elif pnl_pct > -0.01:  # Medium loss
+            health_score -= 25
+        else:  # Large loss
+            health_score -= 40
+        
+        # Adjust for momentum alignment
+        momentum_aligned = (side == "BUY" and momentum > 0) or (side == "SELL" and momentum < 0)
+        if momentum_aligned:
+            health_score += abs(momentum) * 20
+        else:
+            health_score -= abs(momentum) * 20
+        
+        # Adjust for time decay
+        health_score -= time_decay * 15
+        
+        # Clamp to 0-100
+        health_score = max(0, min(100, health_score))
+        
+        # Determine risk level
+        if health_score >= 70:
+            risk_level = "low"
+        elif health_score >= 50:
+            risk_level = "medium"
+        elif health_score >= 30:
+            risk_level = "high"
+        else:
+            risk_level = "critical"
+        
+        # Determine recommendation
+        if pnl_pct > 0.005 and (not momentum_aligned or age_minutes > 10):
+            recommendation = "take_profit"
+        elif health_score < 30 or (pnl_pct < -0.01 and not momentum_aligned):
+            recommendation = "cut_loss"
+        elif health_score < 50:
+            recommendation = "watch"
+        else:
+            recommendation = "hold"
+        
+        return PositionHealth(
+            trade_id=trade.id,
+            symbol=trade.symbol,
+            health_score=round(health_score, 1),
+            trend_direction=trend,
+            momentum=round(momentum, 2),
+            time_decay=round(time_decay, 2),
+            risk_level=risk_level,
+            recommendation=recommendation,
+        )
+
     def _check_single_position(
         self,
         session: "Session",
         trade: PaperTrade,
         current_price: float,
+        momentum: float = 0.0,
     ) -> ExitSignal | None:
         """
         Check if a single position should be closed.
 
         Returns ExitSignal if position should close, None otherwise.
         """
-        import logging
-        
         entry = float(trade.entry_price)
         qty = float(trade.qty)
         side = trade.side.upper()
@@ -149,34 +305,68 @@ class PositionMonitor:
         min_profit_pct = 0.003
         
         if wallet:
-            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
-            micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-            min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+            # Read from database - use getattr for safety but log actual values
+            db_style = getattr(wallet, 'trading_style', None)
+            db_target = getattr(wallet, 'micro_profit_target_usd', None)
+            db_min_pct = getattr(wallet, 'min_profit_pct', None)
+            
+            logging.info(f"[POSITION_MONITOR] Wallet DB values: style={db_style}, target={db_target}, min_pct={db_min_pct}")
+            
+            # Apply values with fallbacks
+            trading_style = db_style if db_style else 'scalper'
+            micro_target_usd = float(db_target) if db_target is not None else 0.25
+            min_profit_pct = float(db_min_pct) if db_min_pct is not None else 0.003
             
             # Auto-detect scalper mode: if target is under $1, treat as scalper
             if micro_target_usd <= 1.0 and trading_style == 'hybrid':
                 trading_style = 'scalper'
                 logging.info(f"[POSITION_MONITOR] Auto-switching to scalper mode (target=${micro_target_usd})")
+        else:
+            logging.warning(f"[POSITION_MONITOR] No wallet found for trade {trade.id}, using defaults")
         
-        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}")
+        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}, momentum={momentum:.2f}")
 
         # =====================================================================
-        # SCALPER MODE: Aggressive profit-taking and loss-cutting
+        # SCALPER TAKE PROFIT - CHECK THIS FIRST BEFORE ANYTHING ELSE
+        # This is the HIGHEST priority exit - take the money when target is hit
+        # =====================================================================
+        if trading_style == "scalper" and pnl_usd >= micro_target_usd:
+            logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
+            self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="scalp_profit",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+            )
+
+        # =====================================================================
+        # MOMENTUM-BASED EXIT: Exit early if momentum is strongly against us
+        # =====================================================================
+        # For BUY positions: bearish momentum = exit
+        # For SELL positions: bullish momentum = exit
+        momentum_against_us = (side == "BUY" and momentum < -0.5) or (side == "SELL" and momentum > 0.5)
+        
+        if momentum_against_us and pnl_usd < 0 and age_minutes >= 2:
+            # Strong momentum reversal while we're losing - get out!
+            logging.info(f"[MOMENTUM] EXIT: {trade.symbol} momentum={momentum:.2f} against {side}, pnl=${pnl_usd:.2f}")
+            self._log_exit(session, trade, "momentum_reversal", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="momentum_reversal",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+                urgency="high",
+            )
+
+        # =====================================================================
+        # SCALPER MODE: Loss-cutting and time limits (profit-taking handled above)
         # =====================================================================
         if trading_style == "scalper":
-            # TAKE PROFITS: Even tiny profits should be taken
-            if pnl_usd >= micro_target_usd:
-                logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
-                self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_profit",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
             # CUT LOSSES FAST: Scalpers can't hold losers
             # After 5 minutes with ANY loss, exit
             if age_minutes >= 5 and pnl_usd < -0.10:

@@ -1410,12 +1410,18 @@ def training_session_feed(
     session_active = _truthy(cfg_get("training_session_active"))
     started_at = cfg_get("training_session_started_at") or None
     
-    logging.info(f"[SESSION_FEED] session_active={session_active}, started_at={started_at}")
+    logging.info(f"[SESSION_FEED] session_active={session_active}, started_at={started_at}, scheduler={sched}")
     
     with session_scope() as s:
         # ---- Live portfolio mark-to-market ----
-        wallets = s.query(Wallet).all()
-        starting = sum(float(w.paper_balance or 0) for w in wallets)
+        # Query wallets directly from database to ensure we get fresh data
+        wallets_db = s.query(Wallet).all()
+        starting = sum(float(w.paper_balance or 0) for w in wallets_db)
+        wallet_count = len(wallets_db)
+        
+        logging.info(f"[SESSION_FEED] Wallets: {wallet_count} found, starting balance=${starting}")
+        for w in wallets_db:
+            logging.info(f"[SESSION_FEED]   - {w.name}: paper_balance=${w.paper_balance}")
         
         # If no starting balance, use a default seed amount for display
         if starting == 0:
@@ -1463,7 +1469,7 @@ def training_session_feed(
         open_count = len(open_trades_list)
         total_pl = realized + unrealized
         
-        logging.info(f"[SESSION_FEED] Portfolio: starting=${starting}, realized=${realized:.2f}, unrealized=${unrealized:.2f}, open={open_count}")
+        logging.info(f"[SESSION_FEED] Portfolio: starting=${starting}, realized=${realized:.2f}, unrealized=${unrealized:.2f}, open={open_count}, current=${starting + total_pl:.2f}")
         
         portfolio = {
             "starting": round(starting, 2),
@@ -1645,6 +1651,30 @@ def training_memory_reset() -> RedirectResponse:
 def training_memory_consolidate() -> RedirectResponse:
     from ai.claude_learning import consolidate_lessons
     consolidate_lessons()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/meta-analyze")
+def training_memory_meta_analyze() -> RedirectResponse:
+    """
+    Perform deep meta-analysis across recent trades to discover patterns,
+    recurring mistakes, winning setups, and higher-order insights.
+    """
+    from ai.claude_learning import analyze_trade_patterns
+    result = analyze_trade_patterns(lookback_trades=50)
+    # Result is logged in the function, just redirect back
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/discover-edges")
+def training_memory_discover_edges() -> RedirectResponse:
+    """
+    Run advanced learning analysis: cluster mistakes and discover
+    profitable edges from trade history. Does NOT require Claude.
+    """
+    from ai.adaptive_learning_engine import run_advanced_learning_analysis
+    result = run_advanced_learning_analysis()
+    # Result is logged in the function, just redirect back
     return RedirectResponse(url="/training", status_code=303)
 
 
@@ -2662,6 +2692,14 @@ def api_take_all_profits() -> JSONResponse:
     skipped = 0
     errors = []
     total_pnl = 0.0
+    
+    # Get wallet's scalper target
+    with session_scope() as s:
+        wallet = s.query(Wallet).first()
+        micro_target = 0.25  # Default
+        if wallet and hasattr(wallet, 'micro_profit_target_usd'):
+            micro_target = float(wallet.micro_profit_target_usd or 0.25)
+        logging.info(f"[TAKE_PROFITS] Using micro-profit target: ${micro_target}")
 
     try:
         engine = PaperTradingEngine()
@@ -2672,7 +2710,7 @@ def api_take_all_profits() -> JSONResponse:
                 return JSONResponse({"ok": True, "closed": 0, "skipped": 0, "errors": [], "total_pnl": 0.0, "message": "No open positions"})
             trade_info = [(t.id, t.symbol, t.side or "BUY", float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
-        logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
+        logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades, target=${micro_target}")
 
         for trade_id, symbol, side, entry_price, qty in trade_info:
             try:
@@ -2695,10 +2733,11 @@ def api_take_all_profits() -> JSONResponse:
                 else:
                     pnl = (entry_price - current_price) * qty
                 
-                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}")
+                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}, target=${micro_target:.2f}")
                 
-                # Only close if profitable
-                if pnl <= 0:
+                # Only close if profitable AND meets scalper target (if scalper mode)
+                if pnl < micro_target:
+                    logging.info(f"[TAKE_PROFITS] {symbol}: pnl ${pnl:.2f} < target ${micro_target:.2f}, skipping")
                     skipped += 1
                     continue
 

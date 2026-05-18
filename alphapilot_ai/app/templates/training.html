@@ -8,14 +8,20 @@
     <h1>AI Training Center</h1>
     <p>This is where the Claude bot learns to trade. Every paper trade produces a reflection, every reflection updates the playbook, and every playbook rule shapes the next decision. The bot graduates to live trading only when its readiness score is high enough.</p>
   </div>
-  <div class="flex gap-2">
-    <form method="post" action="/training/memory/consolidate">
-      <button class="btn" type="submit" {{ '' if claude_configured else 'disabled' }} title="Ask Claude to merge duplicate rules and re-rank weights">Consolidate Playbook</button>
-    </form>
-    <form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe ALL learned rules and lessons? This cannot be undone.')">
-      <button class="btn btn-danger" type="submit">Reset Memory</button>
-    </form>
-  </div>
+<div class="flex gap-2">
+<form method="post" action="/training/memory/consolidate">
+<button class="btn" type="submit" {{ '' if claude_configured else 'disabled' }} title="Ask Claude to merge duplicate rules and re-rank weights">Consolidate Playbook</button>
+</form>
+<form method="post" action="/training/memory/meta-analyze">
+<button class="btn btn-primary" type="submit" {{ '' if claude_configured else 'disabled' }} title="Analyze patterns across recent trades to discover higher-order insights">Deep Analysis</button>
+</form>
+<form method="post" action="/training/memory/discover-edges">
+<button class="btn btn-success" type="submit" title="Cluster mistakes and discover profitable edges from your trade history">Discover Edges</button>
+</form>
+<form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe ALL learned rules and lessons? This cannot be undone.')">
+<button class="btn btn-danger" type="submit">Reset Memory</button>
+</form>
+</div>
 </div>
 
 <!-- ============================================================ -->
