@@ -53,6 +53,164 @@ def sma(values: list[float], period: int) -> float | None:
     return sum(values[-period:]) / period
 
 
+def sma_list(values: list[float], period: int) -> list[float]:
+    """SMA that returns a full list aligned with input."""
+    if len(values) < period or period <= 0:
+        return [0.0] * len(values)
+    result = [0.0] * len(values)
+    for i in range(period - 1, len(values)):
+        result[i] = sum(values[i - period + 1:i + 1]) / period
+    return result
+
+
+def rsi(closes: list[float], period: int = 14) -> float | None:
+    """Calculate RSI (Relative Strength Index)."""
+    if len(closes) < period + 1:
+        return None
+    
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(0, change))
+        losses.append(max(0, -change))
+    
+    if len(gains) < period:
+        return None
+    
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    
+    if avg_loss == 0:
+        return 100.0
+    
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def macd_indicator(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
+    """Calculate MACD line, signal line, and histogram."""
+    if len(closes) < slow + signal:
+        return {"macd": 0, "signal": 0, "histogram": 0}
+    
+    ema_fast = ema(closes, fast)
+    ema_slow = ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = ema(macd_line, signal)
+    histogram = macd_line[-1] - signal_line[-1] if macd_line and signal_line else 0
+    
+    return {
+        "macd": macd_line[-1] if macd_line else 0,
+        "signal": signal_line[-1] if signal_line else 0,
+        "histogram": histogram
+    }
+
+
+def bollinger_bands(closes: list[float], period: int = 20, std_dev: float = 2.0) -> dict:
+    """Calculate Bollinger Bands."""
+    if len(closes) < period:
+        return {"upper": 0, "middle": 0, "lower": 0, "percent_b": 0.5}
+    
+    middle = sum(closes[-period:]) / period
+    variance = sum((x - middle) ** 2 for x in closes[-period:]) / period
+    std = math.sqrt(variance) if variance > 0 else 0
+    
+    upper = middle + std_dev * std
+    lower = middle - std_dev * std
+    
+    current = closes[-1]
+    band_width = upper - lower
+    percent_b = (current - lower) / band_width if band_width > 0 else 0.5
+    
+    return {"upper": upper, "middle": middle, "lower": lower, "percent_b": percent_b}
+
+
+def adx_indicator(candles: list[dict], period: int = 14) -> dict:
+    """Calculate ADX (Average Directional Index) for trend strength."""
+    if len(candles) < period + 1:
+        return {"adx": 0, "plus_di": 0, "minus_di": 0}
+    
+    plus_dm = []
+    minus_dm = []
+    tr_list = []
+    
+    for i in range(1, len(candles)):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        prev_high = float(candles[i - 1]["high"])
+        prev_low = float(candles[i - 1]["low"])
+        prev_close = float(candles[i - 1]["close"])
+        
+        up_move = high - prev_high
+        down_move = prev_low - low
+        
+        plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
+        minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
+        
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        tr_list.append(tr)
+    
+    if len(tr_list) < period:
+        return {"adx": 0, "plus_di": 0, "minus_di": 0}
+    
+    # Smoothed averages
+    smoothed_tr = sum(tr_list[-period:])
+    smoothed_plus_dm = sum(plus_dm[-period:])
+    smoothed_minus_dm = sum(minus_dm[-period:])
+    
+    if smoothed_tr == 0:
+        return {"adx": 0, "plus_di": 0, "minus_di": 0}
+    
+    plus_di = 100 * smoothed_plus_dm / smoothed_tr
+    minus_di = 100 * smoothed_minus_dm / smoothed_tr
+    
+    di_sum = plus_di + minus_di
+    dx = 100 * abs(plus_di - minus_di) / di_sum if di_sum > 0 else 0
+    
+    return {"adx": dx, "plus_di": plus_di, "minus_di": minus_di}
+
+
+def volume_analysis(candles: list[dict], period: int = 20) -> dict:
+    """Analyze volume patterns."""
+    if len(candles) < period:
+        return {"relative_volume": 1.0, "volume_trend": "NEUTRAL", "buying_pressure": 0.5}
+    
+    volumes = [float(c.get("volume", 0)) for c in candles]
+    avg_volume = sum(volumes[-period:]) / period if period > 0 else 1
+    current_volume = volumes[-1] if volumes else 0
+    
+    relative_volume = current_volume / avg_volume if avg_volume > 0 else 1.0
+    
+    # Volume trend
+    recent_avg = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else avg_volume
+    if recent_avg > avg_volume * 1.3:
+        volume_trend = "INCREASING"
+    elif recent_avg < avg_volume * 0.7:
+        volume_trend = "DECREASING"
+    else:
+        volume_trend = "NEUTRAL"
+    
+    # Buying pressure (simplified)
+    up_volume = 0
+    down_volume = 0
+    closes = [float(c["close"]) for c in candles[-10:]]
+    vols = volumes[-10:]
+    for i in range(1, len(closes)):
+        if closes[i] > closes[i - 1]:
+            up_volume += vols[i]
+        else:
+            down_volume += vols[i]
+    
+    total = up_volume + down_volume
+    buying_pressure = up_volume / total if total > 0 else 0.5
+    
+    return {
+        "relative_volume": relative_volume,
+        "volume_trend": volume_trend,
+        "buying_pressure": buying_pressure
+    }
+
+
 def stdev(values: list[float], period: int) -> float | None:
     if len(values) < period or period <= 1:
         return None
@@ -114,54 +272,105 @@ def momentum_signal(
     lookback: int = 6,
 ) -> Signal:
     """
-    EMA-cross momentum:
-      BUY  when EMA_fast > EMA_slow AND short-term return is positive
-      SELL when EMA_fast < EMA_slow AND short-term return is negative
+    Enhanced EMA-cross momentum with RSI, MACD, and volume confirmation:
+      BUY  when EMA_fast > EMA_slow AND RSI not overbought AND volume confirms
+      SELL when EMA_fast < EMA_slow AND RSI not oversold AND volume confirms
 
-    Confidence scales with the magnitude of the EMA gap (normalized by price)
-    and the magnitude of the recent return.
+    Confidence scales with indicator alignment and volume confirmation.
     """
     closes = _closes(candles)
-    if len(closes) < max(slow, lookback + 2):
+    if len(closes) < max(slow, lookback + 2, 26):
         return Signal("HOLD", 0.0, "insufficient data for momentum", "Momentum")
 
+    # Core EMAs
     ema_fast = ema(closes, fast)[-1]
     ema_slow = ema(closes, slow)[-1]
     ret = pct_return(closes, lookback) or 0.0
     last = closes[-1] or 1e-9
     gap = (ema_fast - ema_slow) / last  # normalized
 
+    # Additional indicators
+    rsi_val = rsi(closes, 14) or 50.0
+    macd_data = macd_indicator(closes)
+    vol_data = volume_analysis(candles)
+    
     indicators = {
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
         "gap_pct": gap,
         "return_lb": ret,
+        "rsi": rsi_val,
+        "macd_histogram": macd_data["histogram"],
+        "relative_volume": vol_data["relative_volume"],
+        "buying_pressure": vol_data["buying_pressure"],
     }
 
-    # Decide side. Loosened: previously required BOTH ema_cross AND positive
-    # return slope, which kept confidence at 0 on most ticks. Now we let either
-    # condition emit a directional signal at moderate confidence; Claude (or
-    # the user's confidence floor) is the final arbiter.
-    if ema_fast > ema_slow and ret >= 0:
-        side = "BUY"
-    elif ema_fast < ema_slow and ret <= 0:
-        side = "SELL"
-    elif ema_fast > ema_slow:        # cross says up, return says down -> weak BUY
-        side = "BUY"
-    elif ema_fast < ema_slow:        # cross says down, return says up -> weak SELL
-        side = "SELL"
+    # Multi-factor signal generation
+    bullish_factors = 0
+    bearish_factors = 0
+    
+    # EMA cross
+    if ema_fast > ema_slow:
+        bullish_factors += 1
     else:
-        return Signal("HOLD", 0.15, "EMAs perfectly equal", "Momentum", indicators)
+        bearish_factors += 1
+    
+    # Return direction
+    if ret > 0.002:  # 0.2% threshold
+        bullish_factors += 1
+    elif ret < -0.002:
+        bearish_factors += 1
+    
+    # RSI
+    if rsi_val < 30:
+        bullish_factors += 1  # Oversold = potential buy
+    elif rsi_val > 70:
+        bearish_factors += 1  # Overbought = potential sell
+    elif rsi_val < 45:
+        bullish_factors += 0.5
+    elif rsi_val > 55:
+        bearish_factors += 0.5
+    
+    # MACD histogram
+    if macd_data["histogram"] > 0:
+        bullish_factors += 1
+    else:
+        bearish_factors += 1
+    
+    # Volume confirmation
+    if vol_data["relative_volume"] > 1.2:
+        if vol_data["buying_pressure"] > 0.6:
+            bullish_factors += 1
+        elif vol_data["buying_pressure"] < 0.4:
+            bearish_factors += 1
+    
+    # Decision logic
+    if bullish_factors >= 3 and bullish_factors > bearish_factors:
+        side = "BUY"
+        strength = bullish_factors
+    elif bearish_factors >= 3 and bearish_factors > bullish_factors:
+        side = "SELL"
+        strength = bearish_factors
+    elif bullish_factors > bearish_factors + 1:
+        side = "BUY"
+        strength = bullish_factors
+    elif bearish_factors > bullish_factors + 1:
+        side = "SELL"
+        strength = bearish_factors
+    else:
+        return Signal("HOLD", 0.15, f"Mixed signals: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
 
-    # Confidence: blend of normalized EMA gap and lookback return,
-    # squashed into 0..1 with a soft cap.
-    raw = min(1.0, abs(gap) * 25.0 + abs(ret) * 8.0)
-    confidence = 0.5 + 0.5 * raw  # always >= 0.5 once we've decided to act
-    confidence = max(0.0, min(0.99, confidence))
-
+    # Confidence based on factor alignment (max factors = 5)
+    confidence = min(0.95, 0.45 + (strength / 5.0) * 0.5)
+    
+    # Volume boost
+    if vol_data["relative_volume"] > 1.5:
+        confidence = min(0.98, confidence + 0.05)
+    
     reasoning = (
-        f"EMA{fast}={ema_fast:.4f} vs EMA{slow}={ema_slow:.4f} "
-        f"({gap:+.2%}); {lookback}-bar return {ret:+.2%}"
+        f"EMA{fast}={ema_fast:.4f} vs EMA{slow}={ema_slow:.4f} ({gap:+.2%}); "
+        f"RSI={rsi_val:.1f}; MACD_hist={macd_data['histogram']:.4f}; "
+        f"Vol={vol_data['relative_volume']:.1f}x; {lookback}-bar ret {ret:+.2%}"
     )
     return Signal(side, confidence, reasoning, "Momentum", indicators)
 
@@ -222,6 +431,231 @@ def mean_reversion_signal(
     return Signal(side, confidence, reasoning, "Mean Reversion", indicators)
 
 
+def scalping_signal(
+    candles: list[dict[str, Any]],
+    *,
+    bb_period: int = 20,
+    rsi_period: int = 7,  # Shorter RSI for scalping
+) -> Signal:
+    """
+    Scalping strategy using Bollinger Bands and fast RSI:
+      BUY  when price near lower band AND RSI oversold (<25)
+      SELL when price near upper band AND RSI overbought (>75)
+    
+    Designed for quick entries and exits with tight stops.
+    """
+    closes = _closes(candles)
+    if len(closes) < max(bb_period, rsi_period + 1):
+        return Signal("HOLD", 0.0, "insufficient data for scalping", "Scalping")
+    
+    bb = bollinger_bands(closes, bb_period)
+    rsi_val = rsi(closes, rsi_period) or 50.0
+    vol_data = volume_analysis(candles, 10)  # Shorter volume lookback
+    
+    current_price = closes[-1]
+    indicators = {
+        "bb_percent_b": bb["percent_b"],
+        "bb_upper": bb["upper"],
+        "bb_lower": bb["lower"],
+        "rsi_fast": rsi_val,
+        "relative_volume": vol_data["relative_volume"],
+    }
+    
+    # Scalp BUY: price near lower band + oversold RSI
+    if bb["percent_b"] < 0.15 and rsi_val < 25:
+        confidence = 0.70 + min(0.25, (25 - rsi_val) / 50)
+        if vol_data["relative_volume"] > 1.3:
+            confidence = min(0.95, confidence + 0.05)
+        return Signal(
+            "BUY",
+            confidence,
+            f"Scalp BUY: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, Vol={vol_data['relative_volume']:.1f}x",
+            "Scalping",
+            indicators
+        )
+    
+    # Scalp SELL: price near upper band + overbought RSI
+    if bb["percent_b"] > 0.85 and rsi_val > 75:
+        confidence = 0.70 + min(0.25, (rsi_val - 75) / 50)
+        if vol_data["relative_volume"] > 1.3:
+            confidence = min(0.95, confidence + 0.05)
+        return Signal(
+            "SELL",
+            confidence,
+            f"Scalp SELL: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, Vol={vol_data['relative_volume']:.1f}x",
+            "Scalping",
+            indicators
+        )
+    
+    return Signal("HOLD", 0.10, f"No scalp setup: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}", "Scalping", indicators)
+
+
+def trend_following_signal(
+    candles: list[dict[str, Any]],
+    *,
+    adx_threshold: float = 25.0,
+    ema_fast: int = 20,
+    ema_slow: int = 50,
+) -> Signal:
+    """
+    Trend following strategy using ADX for trend strength confirmation:
+      BUY  when ADX > threshold AND +DI > -DI AND price > EMA
+      SELL when ADX > threshold AND -DI > +DI AND price < EMA
+    
+    Only trades when there's a confirmed strong trend.
+    """
+    closes = _closes(candles)
+    if len(closes) < max(ema_slow, 30):
+        return Signal("HOLD", 0.0, "insufficient data for trend following", "Trend Following")
+    
+    adx_data = adx_indicator(candles)
+    ema_fast_val = ema(closes, ema_fast)[-1]
+    ema_slow_val = ema(closes, ema_slow)[-1]
+    vol_data = volume_analysis(candles)
+    
+    current_price = closes[-1]
+    indicators = {
+        "adx": adx_data["adx"],
+        "plus_di": adx_data["plus_di"],
+        "minus_di": adx_data["minus_di"],
+        "ema_fast": ema_fast_val,
+        "ema_slow": ema_slow_val,
+        "relative_volume": vol_data["relative_volume"],
+    }
+    
+    # Check for strong trend
+    if adx_data["adx"] < adx_threshold:
+        return Signal(
+            "HOLD",
+            0.15,
+            f"Weak trend: ADX={adx_data['adx']:.1f} < {adx_threshold}",
+            "Trend Following",
+            indicators
+        )
+    
+    # Bullish trend: +DI > -DI and price above EMAs
+    if adx_data["plus_di"] > adx_data["minus_di"] and current_price > ema_fast_val > ema_slow_val:
+        strength = (adx_data["adx"] - adx_threshold) / 30  # Normalize strength
+        confidence = min(0.90, 0.60 + strength * 0.3)
+        
+        if vol_data["relative_volume"] > 1.2:
+            confidence = min(0.95, confidence + 0.05)
+        
+        return Signal(
+            "BUY",
+            confidence,
+            f"Bullish trend: ADX={adx_data['adx']:.1f}, +DI={adx_data['plus_di']:.1f} > -DI={adx_data['minus_di']:.1f}",
+            "Trend Following",
+            indicators
+        )
+    
+    # Bearish trend: -DI > +DI and price below EMAs
+    if adx_data["minus_di"] > adx_data["plus_di"] and current_price < ema_fast_val < ema_slow_val:
+        strength = (adx_data["adx"] - adx_threshold) / 30
+        confidence = min(0.90, 0.60 + strength * 0.3)
+        
+        if vol_data["relative_volume"] > 1.2:
+            confidence = min(0.95, confidence + 0.05)
+        
+        return Signal(
+            "SELL",
+            confidence,
+            f"Bearish trend: ADX={adx_data['adx']:.1f}, -DI={adx_data['minus_di']:.1f} > +DI={adx_data['plus_di']:.1f}",
+            "Trend Following",
+            indicators
+        )
+    
+    return Signal(
+        "HOLD",
+        0.20,
+        f"Trend conflict: ADX={adx_data['adx']:.1f}, +DI={adx_data['plus_di']:.1f}, -DI={adx_data['minus_di']:.1f}",
+        "Trend Following",
+        indicators
+    )
+
+
+def breakout_signal(
+    candles: list[dict[str, Any]],
+    *,
+    lookback: int = 20,
+    volume_threshold: float = 1.5,
+) -> Signal:
+    """
+    Breakout strategy detecting price breaking out of recent range:
+      BUY  when price breaks above recent high with volume confirmation
+      SELL when price breaks below recent low with volume confirmation
+    """
+    if len(candles) < lookback + 5:
+        return Signal("HOLD", 0.0, "insufficient data for breakout", "Breakout")
+    
+    closes = _closes(candles)
+    highs = [float(c["high"]) for c in candles]
+    lows = [float(c["low"]) for c in candles]
+    
+    # Recent range (excluding last 2 bars)
+    recent_high = max(highs[-lookback:-2])
+    recent_low = min(lows[-lookback:-2])
+    current_price = closes[-1]
+    
+    vol_data = volume_analysis(candles, lookback)
+    atr_val = atr(candles, 14) or (recent_high - recent_low) / 10
+    
+    indicators = {
+        "recent_high": recent_high,
+        "recent_low": recent_low,
+        "current_price": current_price,
+        "relative_volume": vol_data["relative_volume"],
+        "atr": atr_val,
+    }
+    
+    # Bullish breakout
+    if current_price > recent_high:
+        breakout_strength = (current_price - recent_high) / atr_val if atr_val > 0 else 0
+        confidence = min(0.90, 0.55 + breakout_strength * 0.2)
+        
+        # Volume confirmation is crucial for breakouts
+        if vol_data["relative_volume"] >= volume_threshold:
+            confidence = min(0.95, confidence + 0.15)
+        elif vol_data["relative_volume"] < 1.0:
+            confidence = max(0.40, confidence - 0.15)  # Weak volume = suspicious
+        
+        return Signal(
+            "BUY",
+            confidence,
+            f"Bullish breakout: ${current_price:.4f} > ${recent_high:.4f}, Vol={vol_data['relative_volume']:.1f}x",
+            "Breakout",
+            indicators
+        )
+    
+    # Bearish breakout
+    if current_price < recent_low:
+        breakout_strength = (recent_low - current_price) / atr_val if atr_val > 0 else 0
+        confidence = min(0.90, 0.55 + breakout_strength * 0.2)
+        
+        if vol_data["relative_volume"] >= volume_threshold:
+            confidence = min(0.95, confidence + 0.15)
+        elif vol_data["relative_volume"] < 1.0:
+            confidence = max(0.40, confidence - 0.15)
+        
+        return Signal(
+            "SELL",
+            confidence,
+            f"Bearish breakout: ${current_price:.4f} < ${recent_low:.4f}, Vol={vol_data['relative_volume']:.1f}x",
+            "Breakout",
+            indicators
+        )
+    
+    # Price within range
+    range_position = (current_price - recent_low) / (recent_high - recent_low) if recent_high != recent_low else 0.5
+    return Signal(
+        "HOLD",
+        0.10,
+        f"In range: {range_position:.0%} between ${recent_low:.4f} and ${recent_high:.4f}",
+        "Breakout",
+        indicators
+    )
+
+
 # ---------------------------------------------------------------------------- #
 # Public API used by the bot loop
 # ---------------------------------------------------------------------------- #
@@ -276,6 +710,12 @@ def evaluate_symbol(
         return momentum_signal(candles)
     if st == "Mean Reversion":
         return mean_reversion_signal(candles)
+    if st == "Scalping":
+        return scalping_signal(candles)
+    if st == "Trend Following":
+        return trend_following_signal(candles)
+    if st == "Breakout":
+        return breakout_signal(candles)
     if st == "Volatility Breakout":
         # Reuse mean reversion math but invert: trade WITH big moves.
         sig = mean_reversion_signal(candles, z_entry=2.0)
