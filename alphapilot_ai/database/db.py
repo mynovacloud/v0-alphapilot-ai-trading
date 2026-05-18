@@ -104,6 +104,10 @@ def _migrate_schema() -> None:
             ("dca_count", "INTEGER DEFAULT 0"),
             ("original_entry", "FLOAT"),
             ("exit_reason", "VARCHAR(30)"),
+            # Breakeven stop columns - move stop to lock in small profit
+            ("breakeven_trigger_pct", "FLOAT"),
+            ("breakeven_stop_pct", "FLOAT"),
+            ("breakeven_activated", "BOOLEAN DEFAULT 0"),
         ],
     }
 

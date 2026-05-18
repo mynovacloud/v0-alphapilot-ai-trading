@@ -1030,7 +1030,22 @@ def training_session_start(
         from services.scheduler import bot_scheduler
 
         if _truthy(cfg_get("training_session_active")):
-            return JSONResponse({"ok": True, "already_running": True})
+            # Session already running - return the current config so UI doesn't show "?"
+            tick = int(float(cfg_get("bot_tick_seconds") or 15))
+            min_conf = float(cfg_get("bot_min_confidence") or 0.55)
+            pos_usd = float(cfg_get("bot_position_size_usd") or 100)
+            max_open = int(float(cfg_get("bot_max_open_per_wallet") or 5))
+            uni_limit = int(float(cfg_get("bot_universe_limit") or 40))
+            return JSONResponse({
+                "ok": True, 
+                "already_running": True,
+                "tick_seconds": tick,
+                "min_confidence": min_conf,
+                "position_size_usd": pos_usd,
+                "max_open_per_wallet": max_open,
+                "universe_limit": uni_limit,
+                "claude_configured": claude_is_configured(),
+            })
 
         # Aggressive preset: drop confidence floor and shrink position size so the
         # bot fires often enough during a short training session for the user to
@@ -1374,31 +1389,45 @@ def training_session_feed(
 ) -> JSONResponse:
     """
     Polled every 3s by the Training Center while a live session is running.
-
+    
     Returns:
-      - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
-      - portfolio: live mark-to-market P&L across every wallet
-      - decisions: new ClaudeDecision rows (BUY / SELL / HOLD / CLOSE) with rationale
-      - fills:     newly opened or closed paper trades
-      - logs:      bot/trade/system activity logs (the streaming console)
-      - ticks:     last 5 tick summaries for the "what just happened" panel
+    - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
+    - portfolio: live mark-to-market P&L across every wallet
+    - decisions: new ClaudeDecision rows (BUY / SELL / HOLD / CLOSE) with rationale
+    - fills:     newly opened or closed paper trades
+    - logs:      bot/trade/system activity logs (the streaming console)
+    - ticks:     last 5 tick summaries for the "what just happened" panel
     """
+    import logging
+    
     from config.bot_config import get as cfg_get
     from connectors.live_prices import get_prices_batch
     from database.models import ClaudeDecision
     from services.scheduler import bot_scheduler
     from trading.bot_engine import bot_engine
-
+    
     sched = bot_scheduler.status()
     session_active = _truthy(cfg_get("training_session_active"))
     started_at = cfg_get("training_session_started_at") or None
-
+    
+    logging.info(f"[SESSION_FEED] session_active={session_active}, started_at={started_at}")
+    
     with session_scope() as s:
         # ---- Live portfolio mark-to-market ----
         wallets = s.query(Wallet).all()
         starting = sum(float(w.paper_balance or 0) for w in wallets)
+        
+        # If no starting balance, use a default seed amount for display
+        if starting == 0:
+            starting = 10000.0  # Default seed for display purposes
+            logging.warning(f"[SESSION_FEED] No wallet balances found, using default seed of ${starting}")
 
         all_trades = s.query(PaperTrade).all()
+        open_trades_list = [t for t in all_trades if t.status == "open"]
+        closed_trades_list = [t for t in all_trades if t.status == "closed"]
+        
+        logging.info(f"[SESSION_FEED] Found {len(all_trades)} total trades: {len(open_trades_list)} open, {len(closed_trades_list)} closed")
+        
         realized = 0.0
         unrealized = 0.0
         invested_open = 0.0
@@ -1406,8 +1435,10 @@ def training_session_feed(
         losses = 0
         
         # Collect all open position symbols for batch price fetch
-        open_symbols = [t.symbol for t in all_trades if t.status == "open"]
+        open_symbols = [t.symbol for t in open_trades_list]
         symbol_prices = get_prices_batch(list(set(open_symbols))) if open_symbols else {}
+        
+        logging.info(f"[SESSION_FEED] Fetched prices for {len(symbol_prices)} symbols")
         
         for t in all_trades:
             if t.status == "closed":
@@ -1429,7 +1460,11 @@ def training_session_feed(
                     unrealized += (entry - mark) * qty
 
         closed_count = wins + losses
+        open_count = len(open_trades_list)
         total_pl = realized + unrealized
+        
+        logging.info(f"[SESSION_FEED] Portfolio: starting=${starting}, realized=${realized:.2f}, unrealized=${unrealized:.2f}, open={open_count}")
+        
         portfolio = {
             "starting": round(starting, 2),
             "realized": round(realized, 2),
@@ -1438,7 +1473,7 @@ def training_session_feed(
             "total_pl": round(total_pl, 2),
             "total_pl_pct": round((total_pl / starting * 100.0) if starting else 0.0, 3),
             "invested_open": round(invested_open, 2),
-            "open_trades": len(all_trades) - closed_count,
+            "open_trades": open_count,
             "closed_trades": closed_count,
             "wins": wins,
             "losses": losses,

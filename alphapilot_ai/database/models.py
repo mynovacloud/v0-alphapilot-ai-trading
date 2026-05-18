@@ -143,6 +143,12 @@ class PaperTrade(Base):
     trailing_stop_price = Column(Float, nullable=True)
     high_water_price = Column(Float, nullable=True)  # best price since open (for trailing calc)
 
+    # Breakeven stop: once profit reaches trigger %, move stop to entry + breakeven_stop_pct
+    # Example: trigger=0.01 (1%), stop=0.002 (0.2%) means once up 1%, move stop to entry+0.2%
+    breakeven_trigger_pct = Column(Float, nullable=True)
+    breakeven_stop_pct = Column(Float, nullable=True)
+    breakeven_activated = Column(Boolean, default=False)  # True once breakeven stop is active
+
     # Hard cap: if unrealized loss exceeds this %, force-close immediately.
     max_loss_pct = Column(Float, default=0.10)
 

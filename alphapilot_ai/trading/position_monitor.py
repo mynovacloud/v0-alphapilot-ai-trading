@@ -118,6 +118,8 @@ class PositionMonitor:
 
         Returns ExitSignal if position should close, None otherwise.
         """
+        import logging
+        
         entry = float(trade.entry_price)
         qty = float(trade.qty)
         side = trade.side.upper()
@@ -130,62 +132,142 @@ class PositionMonitor:
         
         # Calculate P&L in USD
         pnl_usd = pnl_pct * entry * qty
+        
+        # Calculate how long we've held this position
+        from utils.helpers import time_since_minutes
+        age_minutes = time_since_minutes(trade.opened_at) if trade.opened_at else 0
 
         # =====================================================================
-        # SCALPER MODE: Check micro-profit target (highest priority for profits)
+        # GET WALLET SETTINGS
         # =====================================================================
-        # Get wallet settings - use explicit query to ensure fresh data
         from database.models import Wallet
         wallet = session.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
         
         # Default values if columns don't exist yet
-        trading_style = 'hybrid'
+        trading_style = 'scalper'  # Default to scalper for aggressive trading
         micro_target_usd = 0.25
         min_profit_pct = 0.003
         
         if wallet:
-            trading_style = getattr(wallet, 'trading_style', 'hybrid') or 'hybrid'
+            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
             micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
             min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+            
+            # Auto-detect scalper mode: if target is under $1, treat as scalper
+            if micro_target_usd <= 1.0 and trading_style == 'hybrid':
+                trading_style = 'scalper'
+                logging.info(f"[POSITION_MONITOR] Auto-switching to scalper mode (target=${micro_target_usd})")
         
-        # Log for debugging
-        import logging
-        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl_usd=${pnl_usd:.4f}, target=${micro_target_usd}, style={trading_style}")
-        
-        if pnl_usd > 0:  # Only check if we're in profit
-            # Scalper mode: take ANY profit that hits the USD target
-            if trading_style == "scalper" and pnl_usd >= micro_target_usd:
-                logging.info(f"[SCALPER] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f} >= target=${micro_target_usd}")
-                self._log_exit(session, trade, "micro_profit", current_price, pnl_pct)
+        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}")
+
+        # =====================================================================
+        # SCALPER MODE: Aggressive profit-taking and loss-cutting
+        # =====================================================================
+        if trading_style == "scalper":
+            # TAKE PROFITS: Even tiny profits should be taken
+            if pnl_usd >= micro_target_usd:
+                logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
+                self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
                     symbol=trade.symbol,
-                    reason="micro_profit",
+                    reason="scalp_profit",
                     current_price=current_price,
                     trigger_price=None,
                     pnl_pct=pnl_pct,
                 )
             
-            # Hybrid mode: use both USD and percentage targets
-            if trading_style == "hybrid":
-                if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
-                    logging.info(f"[HYBRID] TRIGGERING EXIT for {trade.symbol}: pnl_usd=${pnl_usd:.4f}, pnl_pct={pnl_pct:.4%}")
-                    self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
-                    return ExitSignal(
-                        trade_id=trade.id,
-                        symbol=trade.symbol,
-                        reason="target_profit",
-                        current_price=current_price,
-                        trigger_price=None,
-                        pnl_pct=pnl_pct,
-                    )
+            # CUT LOSSES FAST: Scalpers can't hold losers
+            # After 5 minutes with ANY loss, exit
+            if age_minutes >= 5 and pnl_usd < -0.10:
+                logging.info(f"[SCALPER] CUT LOSS (5m): {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
+                self._log_exit(session, trade, "scalp_stoploss", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="scalp_stoploss",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
             
-            # Swing mode: only use percentage-based targets (traditional SL/TP)
-            # Falls through to the standard SL/TP checks below
+            # After 10 minutes with significant loss (>$1), exit immediately
+            if age_minutes >= 10 and pnl_usd < -1.0:
+                logging.info(f"[SCALPER] CUT LOSS (10m,$1+): {trade.symbol} ${pnl_usd:.2f}")
+                self._log_exit(session, trade, "scalp_maxloss", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="scalp_maxloss",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # After 15 minutes, exit if not profitable
+            if age_minutes >= 15 and pnl_usd <= 0:
+                logging.info(f"[SCALPER] TIME EXIT (15m): {trade.symbol} ${pnl_usd:.2f}")
+                self._log_exit(session, trade, "scalp_timeout", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="scalp_timeout",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
 
-        # 1. Check max loss (hard cap)
+        # =====================================================================
+        # HYBRID MODE: Balance between scalping and swing trading
+        # =====================================================================
+        elif trading_style == "hybrid":
+            # Take profits at target
+            if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
+                logging.info(f"[HYBRID] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f}")
+                self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="target_profit",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # Cut losses after 10 minutes with >$2 loss
+            if age_minutes >= 10 and pnl_usd < -2.0:
+                logging.info(f"[HYBRID] CUT LOSS: {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
+                self._log_exit(session, trade, "hybrid_stoploss", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="hybrid_stoploss",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+            
+            # After 30 minutes, exit if losing
+            if age_minutes >= 30 and pnl_usd < 0:
+                logging.info(f"[HYBRID] TIME EXIT: {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
+                self._log_exit(session, trade, "hybrid_timeout", current_price, pnl_pct)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="hybrid_timeout",
+                    current_price=current_price,
+                    trigger_price=None,
+                    pnl_pct=pnl_pct,
+                )
+
+        # =====================================================================
+        # STANDARD CHECKS (all styles)
+        # =====================================================================
+        
+        # 1. Check max loss (hard cap - 10% default)
         max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)
         if pnl_pct <= -max_loss:
+            logging.info(f"[MAX_LOSS] {trade.symbol} hit {pnl_pct:.2%} >= {max_loss:.2%} max")
             self._log_exit(session, trade, "max_loss", current_price, pnl_pct)
             return ExitSignal(
                 trade_id=trade.id,
@@ -244,7 +326,7 @@ class PositionMonitor:
                     pnl_pct=pnl_pct,
                 )
 
-        # 4. Check take-profit price
+        # 4. Check take-profit price (percentage-based from trade creation)
         if trade.take_profit_price:
             tp_price = float(trade.take_profit_price)
             if side == "BUY" and current_price >= tp_price:
@@ -268,65 +350,23 @@ class PositionMonitor:
                     pnl_pct=pnl_pct,
                 )
 
-        # 5. Check time limit (only if position is flat or losing)
-        # DEFAULT: If no time limit set, use 4 hours for paper trades (faster iteration)
-        time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
-        if trade.opened_at:
-            from utils.helpers import ensure_utc
-            opened_utc = ensure_utc(trade.opened_at)
-            deadline = opened_utc + timedelta(hours=time_limit)
-            if utcnow() >= deadline and pnl_pct <= 0.005:  # Close if flat or losing after time limit
-                self._log_exit(session, trade, "time", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="time",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-        
-        # 6. Take small profits after some time has passed
-        # This ensures we lock in gains instead of letting them evaporate
-        if trade.opened_at and pnl_pct > 0:
-            from utils.helpers import time_since_minutes
-            age_minutes = time_since_minutes(trade.opened_at)
-            
-            # After 30 mins: take 0.5%+ profit
-            if age_minutes >= 30 and pnl_pct >= 0.005:
-                self._log_exit(session, trade, "profit_30m", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="profit_30m",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # After 1 hour: take 0.3%+ profit  
-            if age_minutes >= 60 and pnl_pct >= 0.003:
-                self._log_exit(session, trade, "profit_1h", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="profit_1h",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # After 2 hours: take ANY profit (even $0.01)
-            if age_minutes >= 120 and pnl_pct > 0.001:
-                self._log_exit(session, trade, "profit_2h", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="profit_2h",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
+        # 5. Time limit for swing trades (4 hours default)
+        if trading_style == "swing":
+            time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
+            if trade.opened_at:
+                from utils.helpers import ensure_utc
+                opened_utc = ensure_utc(trade.opened_at)
+                deadline = opened_utc + timedelta(hours=time_limit)
+                if utcnow() >= deadline and pnl_pct <= 0.005:
+                    self._log_exit(session, trade, "time", current_price, pnl_pct)
+                    return ExitSignal(
+                        trade_id=trade.id,
+                        symbol=trade.symbol,
+                        reason="time",
+                        current_price=current_price,
+                        trigger_price=None,
+                        pnl_pct=pnl_pct,
+                    )
 
         return None
 
@@ -338,45 +378,113 @@ class PositionMonitor:
     ) -> None:
         """
         Update the trailing stop price if price has moved favorably.
+        Also handles breakeven stop activation.
 
         For BUY: trailing stop rises when price rises (lock in gains)
         For SELL: trailing stop falls when price falls (lock in gains)
+        
+        The trailing stop uses an ADAPTIVE algorithm:
+        - At small profits: use the configured trailing_stop_pct
+        - As profits grow: tighten the trailing stop to lock in more gains
         """
+        import logging
+        
+        side = trade.side.upper()
+        entry = float(trade.entry_price)
+        
+        # Calculate current profit percentage
+        if side == "BUY":
+            profit_pct = (current_price - entry) / entry if entry > 0 else 0
+        else:
+            profit_pct = (entry - current_price) / entry if entry > 0 else 0
+        
+        # =====================================================================
+        # BREAKEVEN STOP: Once profit hits trigger, move stop to lock in small gain
+        # =====================================================================
+        breakeven_trigger = float(trade.breakeven_trigger_pct or 0)
+        breakeven_stop = float(trade.breakeven_stop_pct or 0)
+        
+        if breakeven_trigger > 0 and not trade.breakeven_activated and profit_pct >= breakeven_trigger:
+            # Activate breakeven stop!
+            if side == "BUY":
+                new_stop = entry * (1 + breakeven_stop)  # Stop above entry
+            else:
+                new_stop = entry * (1 - breakeven_stop)  # Stop below entry for shorts
+            
+            # Update stop loss to breakeven level
+            current_sl = float(trade.stop_loss_price or 0)
+            if side == "BUY" and new_stop > current_sl:
+                trade.stop_loss_price = new_stop
+                trade.breakeven_activated = True
+                logging.info(f"[BREAKEVEN] {trade.symbol}: Activated! Stop moved from ${current_sl:.4f} to ${new_stop:.4f} (entry=${entry:.4f})")
+            elif side == "SELL" and (current_sl == 0 or new_stop < current_sl):
+                trade.stop_loss_price = new_stop
+                trade.breakeven_activated = True
+                logging.info(f"[BREAKEVEN] {trade.symbol}: Activated! Stop moved to ${new_stop:.4f}")
+        
+        # =====================================================================
+        # TRAILING STOP: Ratchet stop up as price rises
+        # =====================================================================
         if not trade.trailing_stop_pct:
             return
 
-        side = trade.side.upper()
         trail_pct = float(trade.trailing_stop_pct)
-        high_water = float(trade.high_water_price or trade.entry_price)
+        high_water = float(trade.high_water_price or entry)
+        
+        # ADAPTIVE TRAILING: Tighten the trailing % as profits grow
+        # - At 1% profit: use base trailing %
+        # - At 2% profit: tighten by 20%
+        # - At 3% profit: tighten by 35%
+        # - At 5%+ profit: tighten by 50%
+        adaptive_multiplier = 1.0
+        if profit_pct >= 0.05:
+            adaptive_multiplier = 0.50  # 50% tighter trailing stop
+        elif profit_pct >= 0.03:
+            adaptive_multiplier = 0.65
+        elif profit_pct >= 0.02:
+            adaptive_multiplier = 0.80
+        elif profit_pct >= 0.01:
+            adaptive_multiplier = 0.90
+        
+        effective_trail_pct = trail_pct * adaptive_multiplier
 
         if side == "BUY":
             # Update high water mark if price is higher
             if current_price > high_water:
                 trade.high_water_price = current_price
                 high_water = current_price
+                logging.debug(f"[TRAILING] {trade.symbol}: New high water ${high_water:.4f}")
 
             # Trailing stop is X% below high water mark
-            new_trailing = high_water * (1 - trail_pct)
+            new_trailing = high_water * (1 - effective_trail_pct)
 
             # Only ratchet UP the trailing stop (never lower it)
             current_trailing = float(trade.trailing_stop_price or 0)
             if new_trailing > current_trailing:
                 trade.trailing_stop_price = new_trailing
+                logging.info(
+                    f"[TRAILING] {trade.symbol}: Stop raised ${current_trailing:.4f} -> ${new_trailing:.4f} "
+                    f"(high=${high_water:.4f}, trail={effective_trail_pct:.2%}, profit={profit_pct:.2%})"
+                )
 
         else:  # SELL / SHORT
             # Update low water mark if price is lower
-            low_water = float(trade.high_water_price or trade.entry_price)
+            low_water = float(trade.high_water_price or entry)
             if current_price < low_water:
                 trade.high_water_price = current_price
                 low_water = current_price
 
             # Trailing stop is X% above low water mark
-            new_trailing = low_water * (1 + trail_pct)
+            new_trailing = low_water * (1 + effective_trail_pct)
 
             # Only ratchet DOWN the trailing stop (never raise it)
             current_trailing = float(trade.trailing_stop_price or float("inf"))
             if new_trailing < current_trailing:
                 trade.trailing_stop_price = new_trailing
+                logging.info(
+                    f"[TRAILING] {trade.symbol} (SHORT): Stop lowered to ${new_trailing:.4f} "
+                    f"(low=${low_water:.4f}, profit={profit_pct:.2%})"
+                )
 
     def _log_exit(
         self,
