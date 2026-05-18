@@ -2273,48 +2273,79 @@ def api_close_all_positions() -> JSONResponse:
     """
     Close all open positions at current market prices.
     """
-    from connectors.live_prices import get_price
-    from trading.paper_trading_engine import PaperTradingEngine
+    import logging
+    import traceback
+    
+    try:
+        from connectors.live_prices import get_price
+        from trading.paper_trading_engine import PaperTradingEngine
+    except ImportError as ie:
+        logging.exception("[CLOSE_ALL] Import error")
+        return JSONResponse({"ok": False, "error": f"Import error: {ie}", "traceback": traceback.format_exc()})
 
-    engine = PaperTradingEngine()
     closed = 0
     errors = 0
+    error_details = []
     total_pnl = 0.0
 
-    with session_scope() as s:
-        open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
-        trade_info = [(t.id, t.symbol) for t in open_trades]
+    try:
+        engine = PaperTradingEngine()
 
-    for trade_id, symbol in trade_info:
-        p = get_price(symbol)
-        if not p.get("ok"):
-            errors += 1
-            continue
+        with session_scope() as s:
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
+            if not open_trades:
+                return JSONResponse({"ok": True, "closed": 0, "errors": 0, "total_pnl": 0.0, "message": "No open positions"})
+            trade_info = [(t.id, t.symbol) for t in open_trades]
 
-        result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
-        if result.get("ok"):
-            closed += 1
-            total_pnl += float(result.get("pnl", 0))
+        logging.info(f"[CLOSE_ALL] Closing {len(trade_info)} positions")
+
+        for trade_id, symbol in trade_info:
+            try:
+                p = get_price(symbol)
+                if not p.get("ok"):
+                    errors += 1
+                    error_details.append(f"{symbol}: no price")
+                    continue
+
+                result = engine.close_trade(trade_id, float(p["price"]), notes="close-all via API")
+                if result.get("ok"):
+                    closed += 1
+                    total_pnl += float(result.get("pnl", 0))
+                    try:
+                        with session_scope() as s:
+                            trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
+                            if trade:
+                                trade.exit_reason = "manual"
+                    except Exception as db_err:
+                        logging.error(f"[CLOSE_ALL] Error setting exit_reason: {db_err}")
+                else:
+                    errors += 1
+                    error_details.append(f"{symbol}: {result.get('reason', 'unknown')}")
+            except Exception as e:
+                logging.error(f"[CLOSE_ALL] Error closing {symbol}: {e}")
+                errors += 1
+                error_details.append(f"{symbol}: {str(e)}")
+
+        try:
             with session_scope() as s:
-                trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                if trade:
-                    trade.exit_reason = "manual"
-        else:
-            errors += 1
-
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="positions",
-                level="info",
-                message=f"Close-all: {closed} positions closed, {errors} errors, total P&L: ${total_pnl:+.2f}",
-            )
-        )
+                s.add(
+                    ActivityLog(
+                        category="positions",
+                        level="info",
+                        message=f"Close-all: {closed} positions closed, {errors} errors, total P&L: ${total_pnl:+.2f}",
+                    )
+                )
+        except Exception as log_err:
+            logging.error(f"[CLOSE_ALL] Error logging activity: {log_err}")
+    except Exception as e:
+        logging.exception("[CLOSE_ALL] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
     return JSONResponse({
         "ok": True,
         "closed": closed,
         "errors": errors,
+        "error_details": error_details,
         "total_pnl": round(total_pnl, 2),
     })
 
@@ -2829,30 +2860,41 @@ def api_emergency_exit() -> JSONResponse:
     """
     Emergency exit: Close all positions AND engage kill switch.
     """
-    # First engage kill switch
-    RiskManager.set_kill_switch(True, reason="emergency exit via API")
-
-    # Then close all positions
-    result = api_close_all_positions()
-    data = result.body.decode() if hasattr(result, "body") else "{}"
     import json
-    close_result = json.loads(data) if data else {}
+    import logging
+    import traceback
+    
+    try:
+        # First engage kill switch
+        RiskManager.set_kill_switch(True, reason="emergency exit via API")
+        logging.warning("[EMERGENCY_EXIT] Kill switch engaged")
 
-    with session_scope() as s:
-        s.add(
-            ActivityLog(
-                category="risk",
-                level="warn",
-                message="EMERGENCY EXIT: Kill switch engaged and all positions closed.",
-            )
-        )
+        # Then close all positions
+        result = api_close_all_positions()
+        data = result.body.decode() if hasattr(result, "body") else "{}"
+        close_result = json.loads(data) if data else {}
 
-    return JSONResponse({
-        "ok": True,
-        "kill_switch_engaged": True,
-        "positions_closed": close_result.get("closed", 0),
-        "total_pnl": close_result.get("total_pnl", 0),
-    })
+        try:
+            with session_scope() as s:
+                s.add(
+                    ActivityLog(
+                        category="risk",
+                        level="warn",
+                        message="EMERGENCY EXIT: Kill switch engaged and all positions closed.",
+                    )
+                )
+        except Exception as log_err:
+            logging.error(f"[EMERGENCY_EXIT] Error logging activity: {log_err}")
+
+        return JSONResponse({
+            "ok": True,
+            "kill_switch_engaged": True,
+            "positions_closed": close_result.get("closed", 0),
+            "total_pnl": close_result.get("total_pnl", 0),
+        })
+    except Exception as e:
+        logging.exception("[EMERGENCY_EXIT] Fatal error")
+        return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
 
 
 @router.get("/v1/portfolio-intel")
