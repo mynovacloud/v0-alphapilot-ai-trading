@@ -1961,7 +1961,7 @@ def api_positions() -> JSONResponse:
     import traceback
     
     try:
-        from connectors.live_prices import get_price
+        from connectors.live_prices import get_prices_batch
 
         with session_scope() as s:
             trades = (
@@ -1970,83 +1970,107 @@ def api_positions() -> JSONResponse:
                 .order_by(PaperTrade.opened_at.desc())
                 .all()
             )
-
-            positions = []
+            
+            # Extract trade data while in session
+            trade_data = []
+            symbols = []
             for t in trades:
-                try:
-                    entry = float(t.entry_price or 0)
-                    qty = float(t.qty or 0)
-                    side = (t.side or "BUY").upper()
+                trade_data.append({
+                    "id": t.id,
+                    "wallet_id": t.wallet_id,
+                    "symbol": t.symbol,
+                    "side": (t.side or "BUY").upper(),
+                    "qty": float(t.qty or 0),
+                    "entry_price": float(t.entry_price or 0),
+                    "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
+                    "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
+                    "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
+                    "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
+                    "max_loss_pct": float(t.max_loss_pct or 0.10),
+                    "dca_count": t.dca_count or 0,
+                    "opened_at": t.opened_at,
+                })
+                symbols.append(t.symbol)
+        
+        # Batch fetch all prices at once (much faster!)
+        price_map = get_prices_batch(list(set(symbols))) if symbols else {}
+        
+        positions = []
+        for t in trade_data:
+            try:
+                entry = t["entry_price"]
+                qty = t["qty"]
+                side = t["side"]
+                symbol = t["symbol"]
 
-                    # Get current price
-                    p = get_price(t.symbol)
-                    current = float(p.get("price") or 0) if p.get("ok") else entry
+                # Get current price from batch results
+                current = price_map.get(symbol, entry)
 
-                    # Calculate P&L
+                # Calculate P&L
+                if side == "BUY":
+                    pnl = (current - entry) * qty
+                    pnl_pct = (current - entry) / entry if entry > 0 else 0
+                else:
+                    pnl = (entry - current) * qty
+                    pnl_pct = (entry - current) / entry if entry > 0 else 0
+
+                # Calculate SL/TP proximity (0-1 where 1 = at the level)
+                sl_proximity = 0.0
+                tp_proximity = 0.0
+
+                if t["stop_loss_price"] and entry > 0:
+                    sl = t["stop_loss_price"]
                     if side == "BUY":
-                        pnl = (current - entry) * qty
-                        pnl_pct = (current - entry) / entry if entry > 0 else 0
+                        sl_range = entry - sl
+                        current_dist = current - sl
+                        sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
                     else:
-                        pnl = (entry - current) * qty
-                        pnl_pct = (entry - current) / entry if entry > 0 else 0
+                        sl_range = sl - entry
+                        current_dist = sl - current
+                        sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
 
-                    # Calculate SL/TP proximity (0-1 where 1 = at the level)
-                    sl_proximity = 0.0
-                    tp_proximity = 0.0
+                if t["take_profit_price"] and entry > 0:
+                    tp = t["take_profit_price"]
+                    if side == "BUY":
+                        tp_range = tp - entry
+                        current_dist = tp - current
+                        tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
+                    else:
+                        tp_range = entry - tp
+                        current_dist = current - tp
+                        tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
 
-                    if t.stop_loss_price and entry > 0:
-                        sl = float(t.stop_loss_price)
-                        if side == "BUY":
-                            sl_range = entry - sl
-                            current_dist = current - sl
-                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
-                        else:
-                            sl_range = sl - entry
-                            current_dist = sl - current
-                            sl_proximity = max(0, 1 - (current_dist / sl_range)) if sl_range > 0 else 0
+                # Time in trade
+                opened = t["opened_at"]
+                time_in_trade_min = 0
+                if opened:
+                    from utils.helpers import time_since_minutes
+                    time_in_trade_min = time_since_minutes(opened)
 
-                    if t.take_profit_price and entry > 0:
-                        tp = float(t.take_profit_price)
-                        if side == "BUY":
-                            tp_range = tp - entry
-                            current_dist = tp - current
-                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
-                        else:
-                            tp_range = entry - tp
-                            current_dist = current - tp
-                            tp_proximity = max(0, 1 - (current_dist / tp_range)) if tp_range > 0 else 0
-
-                    # Time in trade
-                    opened = t.opened_at
-                    time_in_trade_min = 0
-                    if opened:
-                        from utils.helpers import time_since_minutes
-                        time_in_trade_min = time_since_minutes(opened)
-
-                    positions.append({
-                        "id": t.id,
-                        "wallet_id": t.wallet_id,
-                        "symbol": t.symbol,
-                        "side": side,
-                        "qty": qty,
-                        "entry_price": entry,
-                        "current_price": current,
-                        "pnl": round(pnl, 2),
-                        "pnl_pct": round(pnl_pct * 100, 2),
-                        "stop_loss_price": float(t.stop_loss_price) if t.stop_loss_price else None,
-                        "take_profit_price": float(t.take_profit_price) if t.take_profit_price else None,
-                        "trailing_stop_pct": float(t.trailing_stop_pct) if t.trailing_stop_pct else None,
-                        "trailing_stop_price": float(t.trailing_stop_price) if t.trailing_stop_price else None,
-                        "sl_proximity": round(sl_proximity, 3),
-                        "tp_proximity": round(tp_proximity, 3),
-                        "max_loss_pct": float(t.max_loss_pct or 0.10),
-                        "dca_count": t.dca_count or 0,
-                        "time_in_trade_min": round(time_in_trade_min, 1),
-                        "opened_at": t.opened_at.isoformat() if t.opened_at else None,
-                    })
-                except Exception as e:
-                    logging.error(f"[POSITIONS] Error processing trade {t.id}: {e}")
-                    continue
+                positions.append({
+                    "id": t["id"],
+                    "wallet_id": t["wallet_id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry,
+                    "current_price": current,
+                    "pnl": round(pnl, 2),
+                    "pnl_pct": round(pnl_pct * 100, 2),
+                    "stop_loss_price": t["stop_loss_price"],
+                    "take_profit_price": t["take_profit_price"],
+                    "trailing_stop_pct": t["trailing_stop_pct"],
+                    "trailing_stop_price": t["trailing_stop_price"],
+                    "sl_proximity": round(sl_proximity, 3),
+                    "tp_proximity": round(tp_proximity, 3),
+                    "max_loss_pct": t["max_loss_pct"],
+                    "dca_count": t["dca_count"],
+                    "time_in_trade_min": round(time_in_trade_min, 1),
+                    "opened_at": opened.isoformat() if opened else None,
+                })
+            except Exception as e:
+                logging.error(f"[POSITIONS] Error processing trade {t['id']}: {e}")
+                continue
 
         return JSONResponse({"ok": True, "positions": positions})
     except Exception as e:

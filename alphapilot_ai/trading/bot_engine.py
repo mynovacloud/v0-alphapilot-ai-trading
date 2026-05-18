@@ -138,11 +138,34 @@ class BotEngine:
             return self._record(result)
 
         # -----------------------------------------------------------------
+        # PREFETCH PRICES: Warm the cache with all universe + open position
+        # prices in a single batch call. This is MUCH faster than fetching
+        # each price individually during position monitoring.
+        # -----------------------------------------------------------------
+        try:
+            from connectors.live_prices import get_prices_batch
+            from database.db import session_scope
+            from database.models import PaperTrade
+            
+            # Collect all symbols we need prices for
+            symbols_needed = [u.symbol for u in universe]
+            with session_scope() as s:
+                open_positions = s.query(PaperTrade.symbol).filter(PaperTrade.status == "open").distinct().all()
+                symbols_needed.extend([p[0] for p in open_positions])
+            
+            # Batch fetch all prices at once (populates cache)
+            price_map = get_prices_batch(list(set(symbols_needed)))
+            self._log("bot", f"Prefetched {len(price_map)} prices", level="debug")
+        except Exception as e:
+            self._log("bot", f"Price prefetch failed: {e}", level="warn")
+            price_map = {}
+
+        # -----------------------------------------------------------------
         # POSITION MONITORING: Check all open positions for auto-exits
         # before evaluating new entries. This ensures SL/TP/trailing stops
         # are processed at the same frequency as new entry signals.
         # -----------------------------------------------------------------
-        auto_exits = self._monitor_positions(cfg, universe, result)
+        auto_exits = self._monitor_positions(cfg, universe, result, price_map)
         if auto_exits > 0:
             result.notes.append(f"auto_exits={auto_exits}")
 
@@ -570,22 +593,23 @@ class BotEngine:
         cfg: BotConfig,
         universe: list[dict[str, Any]],
         result: TickResult,
+        price_map: dict[str, float] | None = None,
     ) -> int:
         """
         Check all open positions for auto-exit conditions (SL/TP/trailing/time).
 
         Returns the number of positions that were auto-closed.
         """
-        # Build price map from universe for quick lookup
-        price_map: dict[str, float] = {}
-        for product in universe:
-            symbol = product["product_id"]
-            price_payload = get_price(symbol)
-            if price_payload.get("ok"):
-                price_map[symbol] = float(price_payload["price"])
+        # Use provided price_map or build one (for backwards compatibility)
+        if price_map is None:
+            price_map = {}
+            for product in universe:
+                symbol = product["product_id"]
+                price_payload = get_price(symbol)
+                if price_payload.get("ok"):
+                    price_map[symbol] = float(price_payload["price"])
 
-        # CRITICAL: Also fetch prices for ANY open position symbols NOT in universe
-        # This ensures we don't miss exit checks just because a symbol rotated out
+        # Ensure open position symbols have prices (fetch if not in map)
         with session_scope() as s:
             open_symbols = (
                 s.query(PaperTrade.symbol)
