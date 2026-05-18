@@ -228,7 +228,7 @@ def record_trade_outcome(trade_id: int) -> dict[str, Any]:
             raw=result.get("text", ""),
         )
 
-    return _save_reflection(
+    result = _save_reflection(
         trade_id=trade_id,
         verdict=str(parsed.get("verdict", "neutral"))[:40],
         score=_float(parsed.get("score"), 0.0, lo=-1.0, hi=1.0),
@@ -238,6 +238,39 @@ def record_trade_outcome(trade_id: int) -> dict[str, Any]:
         trade_payload=trade_payload,
         raw=result.get("text", ""),
     )
+    
+    # Also update the adaptive learning engine
+    try:
+        from ai.adaptive_learning_engine import learn_from_trade as adaptive_learn
+        # Extract strategy and regime from decision payload if available
+        strategy_name = "Momentum"  # Default
+        regime = "UNKNOWN"
+        patterns = []
+        
+        if decision_payload:
+            key_factors = decision_payload.get("key_factors", [])
+            for factor in key_factors:
+                if isinstance(factor, str):
+                    if factor.startswith("strategy="):
+                        strategy_name = factor.split("=", 1)[1]
+                    elif factor.startswith("patterns="):
+                        # Parse pattern list
+                        try:
+                            import ast
+                            patterns = ast.literal_eval(factor.split("=", 1)[1])
+                        except Exception:
+                            pass
+        
+        adaptive_learn(
+            trade_id=trade_id,
+            patterns_at_entry=patterns,
+            strategy_name=strategy_name,
+            regime=regime,
+        )
+    except Exception as e:
+        logger.warning(f"Failed to update adaptive learning: {e}")
+    
+    return result
 
 
 def consolidate_lessons() -> dict[str, Any]:
