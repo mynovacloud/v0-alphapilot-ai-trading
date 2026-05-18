@@ -1483,50 +1483,171 @@ def training_memory_add(
 
 @router.get("/analytics", response_class=HTMLResponse)
 def analytics_page(request: Request) -> HTMLResponse:
-    summary = portfolio_summary()
-    perf = performance_metrics()
+    """Comprehensive analytics page with all trades and positions."""
+    import traceback
+    from connectors.live_prices import get_prices_batch
+    
+    try:
+        summary = portfolio_summary()
+        perf = performance_metrics()
 
-    eq = equity_curve_df()
-    equity_points: list[dict[str, Any]] = []
-    if not eq.empty:
-        for _, row in eq.iterrows():
-            equity_points.append({"date": str(row["date"]), "equity": float(row["equity"])})
+        eq = equity_curve_df()
+        equity_points: list[dict[str, Any]] = []
+        if not eq.empty:
+            for _, row in eq.iterrows():
+                equity_points.append({"date": str(row["date"]), "equity": float(row["equity"])})
 
-    by_wallet = pnl_by_wallet()
-    wallet_pnl = []
-    if not by_wallet.empty:
-        wallet_pnl = [{"label": r["wallet"], "value": float(r["pnl"])} for _, r in by_wallet.iterrows()]
+        by_wallet = pnl_by_wallet()
+        wallet_pnl = []
+        if not by_wallet.empty:
+            wallet_pnl = [{"label": r["wallet"], "value": float(r["pnl"])} for _, r in by_wallet.iterrows()]
 
-    by_strat = pnl_by_strategy()
-    strategy_pnl = []
-    if not by_strat.empty:
-        strategy_pnl = [{"label": r["strategy"], "value": float(r["pnl"])} for _, r in by_strat.iterrows()]
+        by_strat = pnl_by_strategy()
+        strategy_pnl = []
+        if not by_strat.empty:
+            strategy_pnl = [{"label": r["strategy"], "value": float(r["pnl"])} for _, r in by_strat.iterrows()]
 
-    # Win/loss histogram
-    df = get_all_trades_df()
-    histogram: list[int] = [0] * 10
-    if not df.empty:
-        closed = df[df["status"] == "closed"]
-        if not closed.empty:
-            pnls = closed["realized_pnl"].astype(float).tolist()
-            if pnls:
-                lo, hi = min(pnls), max(pnls)
-                rng = hi - lo if hi > lo else 1.0
-                for v in pnls:
-                    bucket = min(9, max(0, int((v - lo) / rng * 10)))
-                    histogram[bucket] += 1
+        # Get all trades from database
+        df = get_all_trades_df()
+        
+        # Prepare open positions with current prices
+        open_positions = []
+        closed_trades = []
+        symbols = set()
+        
+        if not df.empty:
+            # Get unique symbols for batch price fetch
+            open_df = df[df["status"] == "open"]
+            open_symbols = open_df["symbol"].unique().tolist() if not open_df.empty else []
+            price_map = get_prices_batch(open_symbols) if open_symbols else {}
+            
+            # Process open positions
+            for _, row in open_df.iterrows():
+                symbol = row["symbol"]
+                symbols.add(symbol)
+                entry = float(row["entry_price"] or 0)
+                qty = float(row["qty"] or 0)
+                side = (row["side"] or "BUY").upper()
+                current = price_map.get(symbol, entry)
+                
+                if side == "BUY":
+                    unrealized = (current - entry) * qty
+                    pnl_pct = ((current - entry) / entry * 100) if entry > 0 else 0
+                else:
+                    unrealized = (entry - current) * qty
+                    pnl_pct = ((entry - current) / entry * 100) if entry > 0 else 0
+                
+                opened_at = row["opened_at"]
+                duration_hours = 0
+                if opened_at:
+                    from utils.helpers import utcnow
+                    delta = utcnow().replace(tzinfo=None) - opened_at.replace(tzinfo=None)
+                    duration_hours = delta.total_seconds() / 3600
+                
+                open_positions.append({
+                    "id": row["id"],
+                    "symbol": symbol,
+                    "side": side,
+                    "qty": qty,
+                    "entry_price": entry,
+                    "current_price": current,
+                    "unrealized_pnl": round(unrealized, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "opened_at": opened_at,
+                    "duration_hours": round(duration_hours, 1),
+                })
+            
+            # Process closed trades
+            closed_df = df[df["status"] == "closed"].sort_values("closed_at", ascending=False)
+            for _, row in closed_df.iterrows():
+                symbol = row["symbol"]
+                symbols.add(symbol)
+                entry = float(row["entry_price"] or 0)
+                exit_price = float(row["exit_price"]) if row["exit_price"] else None
+                qty = float(row["qty"] or 0)
+                realized = float(row["realized_pnl"] or 0)
+                
+                pnl_pct = 0
+                if entry > 0 and exit_price:
+                    side = (row["side"] or "BUY").upper()
+                    if side == "BUY":
+                        pnl_pct = ((exit_price - entry) / entry) * 100
+                    else:
+                        pnl_pct = ((entry - exit_price) / entry) * 100
+                
+                opened_at = row["opened_at"]
+                closed_at = row["closed_at"]
+                duration_hours = 0
+                if opened_at and closed_at:
+                    delta = closed_at.replace(tzinfo=None) - opened_at.replace(tzinfo=None)
+                    duration_hours = delta.total_seconds() / 3600
+                
+                closed_trades.append({
+                    "id": row["id"],
+                    "symbol": symbol,
+                    "side": (row["side"] or "BUY").upper(),
+                    "qty": qty,
+                    "entry_price": entry,
+                    "exit_price": exit_price,
+                    "realized_pnl": round(realized, 2),
+                    "pnl_pct": round(pnl_pct, 2),
+                    "opened_at": opened_at,
+                    "closed_at": closed_at,
+                    "duration_hours": round(duration_hours, 1),
+                    "exit_reason": getattr(row, "exit_reason", None) or row.get("exit_reason"),
+                })
 
-    return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
+        # Win/loss histogram
+        histogram: list[int] = [0] * 10
+        if not df.empty:
+            closed = df[df["status"] == "closed"]
+            if not closed.empty:
+                pnls = closed["realized_pnl"].astype(float).tolist()
+                if pnls:
+                    lo, hi = min(pnls), max(pnls)
+                    rng = hi - lo if hi > lo else 1.0
+                    for v in pnls:
+                        bucket = min(9, max(0, int((v - lo) / rng * 10)))
+                        histogram[bucket] += 1
+
+        return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
+                request,
+                active="analytics",
+                summary=summary,
+                perf=perf,
+                equity_points=equity_points,
+                wallet_pnl=wallet_pnl,
+                strategy_pnl=strategy_pnl,
+                histogram=histogram,
+                open_positions=open_positions,
+                closed_trades=closed_trades,
+                open_count=len(open_positions),
+                closed_count=len(closed_trades),
+                total_trades=len(open_positions) + len(closed_trades),
+                symbols=sorted(symbols),
+            ),
+        )
+    except Exception as e:
+        import logging
+        logging.exception("[ANALYTICS] Error loading page")
+        # Return error page instead of crashing
+        return templates.TemplateResponse(request=request, name="analytics.html", context=_ctx(
             request,
             active="analytics",
-            summary=summary,
-            perf=perf,
-            equity_points=equity_points,
-            wallet_pnl=wallet_pnl,
-            strategy_pnl=strategy_pnl,
-            histogram=histogram,
-        ),
-)
+            summary={"total_pnl": 0, "unrealized_pnl": 0, "daily_pnl": 0, "weekly_pnl": 0, "monthly_pnl": 0, "ytd_pnl": 0, "win_rate": 0},
+            perf={"profit_factor": 0, "sharpe_placeholder": 0, "max_drawdown": 0, "avg_rr": 0, "max_consecutive_wins": 0, "max_consecutive_losses": 0, "biggest_win": 0, "biggest_loss": 0, "avg_trade_duration_hours": 0, "avg_win": 0, "avg_loss": 0, "win_rate": 0},
+            equity_points=[],
+            wallet_pnl=[],
+            strategy_pnl=[],
+            histogram=[0]*10,
+            open_positions=[],
+            closed_trades=[],
+            open_count=0,
+            closed_count=0,
+            total_trades=0,
+            symbols=[],
+            error=str(e),
+        ))
 
 
 # ----------------------------------------------------------------------
