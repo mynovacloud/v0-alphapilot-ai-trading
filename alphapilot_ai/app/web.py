@@ -2448,81 +2448,104 @@ def api_force_check_positions() -> JSONResponse:
     This is a debug endpoint to test if scalper settings are working.
     """
     import logging
+    import traceback
     from connectors.live_prices import get_price
-    from trading.position_monitor import PositionMonitor
     
     results = []
     exit_signals = []
     
     try:
-        monitor = PositionMonitor()
-        
         with session_scope() as s:
             # Get all open trades
             open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").all()
             
+            if not open_trades:
+                return JSONResponse({
+                    "ok": True,
+                    "total_positions": 0,
+                    "would_exit": 0,
+                    "positions": [],
+                    "exit_signals": [],
+                    "message": "No open positions to check"
+                })
+            
             for trade in open_trades:
-                # Get wallet settings
-                wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
-                
-                trading_style = wallet.trading_style if wallet else 'hybrid'
-                micro_target = float(wallet.micro_profit_target_usd or 0.25) if wallet else 0.25
-                min_pct = float(wallet.min_profit_pct or 0.003) if wallet else 0.003
-                
-                # Get current price
-                p = get_price(trade.symbol)
-                if not p.get("ok"):
-                    results.append({
+                try:
+                    # Get wallet settings
+                    wallet = s.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
+                    
+                    trading_style = wallet.trading_style if wallet else 'hybrid'
+                    micro_target = float(wallet.micro_profit_target_usd or 0.25) if wallet else 0.25
+                    min_pct = float(wallet.min_profit_pct or 0.003) if wallet else 0.003
+                    
+                    # Get current price
+                    p = get_price(trade.symbol)
+                    if not p.get("ok"):
+                        results.append({
+                            "symbol": trade.symbol,
+                            "error": f"Could not fetch price: {p.get('error', 'unknown')}"
+                        })
+                        continue
+                    
+                    current_price = float(p["price"])
+                    entry = float(trade.entry_price or 0)
+                    qty = float(trade.qty or 0)
+                    side = (trade.side or "BUY").upper()
+                    
+                    if entry <= 0:
+                        results.append({
+                            "symbol": trade.symbol,
+                            "error": "Invalid entry price"
+                        })
+                        continue
+                    
+                    # Calculate P&L
+                    if side == "BUY":
+                        pnl_pct = (current_price - entry) / entry
+                    else:
+                        pnl_pct = (entry - current_price) / entry
+                    
+                    pnl_usd = pnl_pct * entry * qty
+                    
+                    # Check if should exit
+                    should_exit = False
+                    exit_reason = None
+                    
+                    if pnl_usd > 0:
+                        if trading_style == "scalper" and pnl_usd >= micro_target:
+                            should_exit = True
+                            exit_reason = f"SCALPER: pnl_usd ${pnl_usd:.4f} >= target ${micro_target}"
+                        elif trading_style == "hybrid" and (pnl_usd >= micro_target or pnl_pct >= min_pct):
+                            should_exit = True
+                            exit_reason = f"HYBRID: pnl_usd ${pnl_usd:.4f} or pnl_pct {pnl_pct:.4%}"
+                    
+                    result = {
+                        "trade_id": trade.id,
                         "symbol": trade.symbol,
-                        "error": "Could not fetch price"
+                        "side": side,
+                        "entry": entry,
+                        "current": current_price,
+                        "qty": qty,
+                        "pnl_usd": round(pnl_usd, 4),
+                        "pnl_pct": round(pnl_pct * 100, 4),
+                        "wallet_trading_style": trading_style,
+                        "wallet_micro_target": micro_target,
+                        "wallet_min_pct": min_pct,
+                        "should_exit": should_exit,
+                        "exit_reason": exit_reason,
+                    }
+                    results.append(result)
+                    
+                    if should_exit:
+                        exit_signals.append(result)
+                        logging.info(f"[FORCE_CHECK] Would exit {trade.symbol}: {exit_reason}")
+                except Exception as trade_err:
+                    logging.error(f"[FORCE_CHECK] Error processing trade {trade.id}: {trade_err}")
+                    results.append({
+                        "trade_id": trade.id,
+                        "symbol": trade.symbol if trade else "unknown",
+                        "error": str(trade_err)
                     })
-                    continue
-                
-                current_price = float(p["price"])
-                entry = float(trade.entry_price)
-                qty = float(trade.qty)
-                side = (trade.side or "BUY").upper()
-                
-                # Calculate P&L
-                if side == "BUY":
-                    pnl_pct = (current_price - entry) / entry if entry > 0 else 0
-                else:
-                    pnl_pct = (entry - current_price) / entry if entry > 0 else 0
-                
-                pnl_usd = pnl_pct * entry * qty
-                
-                # Check if should exit
-                should_exit = False
-                exit_reason = None
-                
-                if pnl_usd > 0:
-                    if trading_style == "scalper" and pnl_usd >= micro_target:
-                        should_exit = True
-                        exit_reason = f"SCALPER: pnl_usd ${pnl_usd:.4f} >= target ${micro_target}"
-                    elif trading_style == "hybrid" and (pnl_usd >= micro_target or pnl_pct >= min_pct):
-                        should_exit = True
-                        exit_reason = f"HYBRID: pnl_usd ${pnl_usd:.4f} or pnl_pct {pnl_pct:.4%}"
-                
-                result = {
-                    "trade_id": trade.id,
-                    "symbol": trade.symbol,
-                    "side": side,
-                    "entry": entry,
-                    "current": current_price,
-                    "qty": qty,
-                    "pnl_usd": round(pnl_usd, 4),
-                    "pnl_pct": round(pnl_pct * 100, 4),
-                    "wallet_trading_style": trading_style,
-                    "wallet_micro_target": micro_target,
-                    "wallet_min_pct": min_pct,
-                    "should_exit": should_exit,
-                    "exit_reason": exit_reason,
-                }
-                results.append(result)
-                
-                if should_exit:
-                    exit_signals.append(result)
-                    logging.info(f"[FORCE_CHECK] Would exit {trade.symbol}: {exit_reason}")
         
         return JSONResponse({
             "ok": True,
@@ -2532,11 +2555,10 @@ def api_force_check_positions() -> JSONResponse:
             "exit_signals": exit_signals,
         })
     except Exception as e:
-        import traceback
         logging.exception("[FORCE_CHECK] Error")
         return JSONResponse({
             "ok": False,
-            "error": str(e),
+            "error": str(e) or "Unknown error occurred",
             "traceback": traceback.format_exc(),
         })
 
