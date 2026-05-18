@@ -1262,6 +1262,52 @@ def training_session_tick_now() -> JSONResponse:
     )
 
 
+@router.post("/training/session/apply-settings-to-wallets")
+def api_apply_session_settings_to_wallets() -> JSONResponse:
+    """
+    Force-apply the current session settings to all wallets.
+    This fixes the issue where wallet.max_open_positions is out of sync with session settings.
+    """
+    import logging
+    from config.bot_config import BotConfig
+    
+    try:
+        cfg = BotConfig.load()
+        max_open = cfg.max_open_per_wallet
+        pos_usd = cfg.position_size_usd
+        
+        with session_scope() as s:
+            wallets = s.query(Wallet).all()
+            updated = []
+            for w in wallets:
+                old_max = w.max_open_positions
+                old_pos = w.max_position_usd
+                w.max_open_positions = max_open
+                w.max_position_usd = pos_usd
+                w.bot_paused = False
+                updated.append({
+                    "id": w.id,
+                    "name": w.name,
+                    "old_max_open": old_max,
+                    "new_max_open": max_open,
+                    "old_max_position_usd": old_pos,
+                    "new_max_position_usd": pos_usd,
+                })
+            
+            logging.info(f"[APPLY_SETTINGS] Updated {len(wallets)} wallets: max_open={max_open}, pos_usd={pos_usd}")
+        
+        return JSONResponse({
+            "ok": True,
+            "message": f"Updated {len(updated)} wallets",
+            "config": {"max_open_per_wallet": max_open, "position_size_usd": pos_usd},
+            "wallets": updated,
+        })
+    except Exception as e:
+        import traceback
+        logging.exception("[APPLY_SETTINGS] Error")
+        return JSONResponse({"ok": False, "error": str(e), "traceback": traceback.format_exc()})
+
+
 @router.get("/training/session/feed")
 def training_session_feed(
     since_decision_id: int = Query(0, ge=0),
