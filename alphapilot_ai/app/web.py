@@ -1401,7 +1401,7 @@ def training_session_feed(
     import logging
     
     from config.bot_config import get as cfg_get
-    from connectors.live_prices import get_prices_batch
+    from connectors.live_prices import get_prices_batch, get_price
     from database.models import ClaudeDecision
     from services.scheduler import bot_scheduler
     from trading.bot_engine import bot_engine
