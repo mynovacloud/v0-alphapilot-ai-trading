@@ -305,16 +305,42 @@ class PositionMonitor:
         min_profit_pct = 0.003
         
         if wallet:
-            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
-            micro_target_usd = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-            min_profit_pct = getattr(wallet, 'min_profit_pct', 0.003) or 0.003
+            # Read from database - use getattr for safety but log actual values
+            db_style = getattr(wallet, 'trading_style', None)
+            db_target = getattr(wallet, 'micro_profit_target_usd', None)
+            db_min_pct = getattr(wallet, 'min_profit_pct', None)
+            
+            logging.info(f"[POSITION_MONITOR] Wallet DB values: style={db_style}, target={db_target}, min_pct={db_min_pct}")
+            
+            # Apply values with fallbacks
+            trading_style = db_style if db_style else 'scalper'
+            micro_target_usd = float(db_target) if db_target is not None else 0.25
+            min_profit_pct = float(db_min_pct) if db_min_pct is not None else 0.003
             
             # Auto-detect scalper mode: if target is under $1, treat as scalper
             if micro_target_usd <= 1.0 and trading_style == 'hybrid':
                 trading_style = 'scalper'
                 logging.info(f"[POSITION_MONITOR] Auto-switching to scalper mode (target=${micro_target_usd})")
+        else:
+            logging.warning(f"[POSITION_MONITOR] No wallet found for trade {trade.id}, using defaults")
         
         logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}, momentum={momentum:.2f}")
+
+        # =====================================================================
+        # SCALPER TAKE PROFIT - CHECK THIS FIRST BEFORE ANYTHING ELSE
+        # This is the HIGHEST priority exit - take the money when target is hit
+        # =====================================================================
+        if trading_style == "scalper" and pnl_usd >= micro_target_usd:
+            logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
+            self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="scalp_profit",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+            )
 
         # =====================================================================
         # MOMENTUM-BASED EXIT: Exit early if momentum is strongly against us
@@ -338,22 +364,9 @@ class PositionMonitor:
             )
 
         # =====================================================================
-        # SCALPER MODE: Aggressive profit-taking and loss-cutting
+        # SCALPER MODE: Loss-cutting and time limits (profit-taking handled above)
         # =====================================================================
         if trading_style == "scalper":
-            # TAKE PROFITS: Even tiny profits should be taken
-            if pnl_usd >= micro_target_usd:
-                logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
-                self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_profit",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
             # CUT LOSSES FAST: Scalpers can't hold losers
             # After 5 minutes with ANY loss, exit
             if age_minutes >= 5 and pnl_usd < -0.10:

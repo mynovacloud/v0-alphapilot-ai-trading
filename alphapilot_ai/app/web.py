@@ -2692,6 +2692,14 @@ def api_take_all_profits() -> JSONResponse:
     skipped = 0
     errors = []
     total_pnl = 0.0
+    
+    # Get wallet's scalper target
+    with session_scope() as s:
+        wallet = s.query(Wallet).first()
+        micro_target = 0.25  # Default
+        if wallet and hasattr(wallet, 'micro_profit_target_usd'):
+            micro_target = float(wallet.micro_profit_target_usd or 0.25)
+        logging.info(f"[TAKE_PROFITS] Using micro-profit target: ${micro_target}")
 
     try:
         engine = PaperTradingEngine()
@@ -2702,7 +2710,7 @@ def api_take_all_profits() -> JSONResponse:
                 return JSONResponse({"ok": True, "closed": 0, "skipped": 0, "errors": [], "total_pnl": 0.0, "message": "No open positions"})
             trade_info = [(t.id, t.symbol, t.side or "BUY", float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
-        logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades")
+        logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades, target=${micro_target}")
 
         for trade_id, symbol, side, entry_price, qty in trade_info:
             try:
@@ -2725,10 +2733,11 @@ def api_take_all_profits() -> JSONResponse:
                 else:
                     pnl = (entry_price - current_price) * qty
                 
-                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}")
+                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}, target=${micro_target:.2f}")
                 
-                # Only close if profitable
-                if pnl <= 0:
+                # Only close if profitable AND meets scalper target (if scalper mode)
+                if pnl < micro_target:
+                    logging.info(f"[TAKE_PROFITS] {symbol}: pnl ${pnl:.2f} < target ${micro_target:.2f}, skipping")
                     skipped += 1
                     continue
 
