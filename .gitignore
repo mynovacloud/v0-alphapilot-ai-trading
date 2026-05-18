@@ -45,9 +45,13 @@ htmlcov/
 
 # Local databases / data
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 *.sqlite
 *.sqlite3
 alphapilot_ai/data/
+alphapilot_ai/*.db*
 
 # Logs
 *.log
