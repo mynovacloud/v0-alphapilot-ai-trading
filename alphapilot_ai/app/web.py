@@ -1207,7 +1207,7 @@ def training_session_feed(
     since_trade_id: int = Query(0, ge=0),
 ) -> JSONResponse:
     """
-    Polled every 2s by the Training Center while a live session is running.
+    Polled every 3s by the Training Center while a live session is running.
 
     Returns:
       - session:   active flag, started_at, tick_seconds, next_tick (from scheduler)
@@ -1218,7 +1218,7 @@ def training_session_feed(
       - ticks:     last 5 tick summaries for the "what just happened" panel
     """
     from config.bot_config import get as cfg_get
-    from connectors.live_prices import get_price
+    from connectors.live_prices import get_prices_batch
     from database.models import ClaudeDecision
     from services.scheduler import bot_scheduler
     from trading.bot_engine import bot_engine
@@ -1238,9 +1238,11 @@ def training_session_feed(
         invested_open = 0.0
         wins = 0
         losses = 0
-        # Re-mark every open position to the latest live price so the
-        # "Currently Sitting At" number truly updates in real time.
-        symbol_prices: dict[str, float] = {}
+        
+        # Collect all open position symbols for batch price fetch
+        open_symbols = [t.symbol for t in all_trades if t.status == "open"]
+        symbol_prices = get_prices_batch(list(set(open_symbols))) if open_symbols else {}
+        
         for t in all_trades:
             if t.status == "closed":
                 pnl = float(t.realized_pnl or 0)
@@ -1253,11 +1255,7 @@ def training_session_feed(
             entry = float(t.entry_price or 0)
             qty = float(t.qty or 0)
             invested_open += entry * qty
-            mark = symbol_prices.get(t.symbol)
-            if mark is None:
-                p = get_price(t.symbol)
-                mark = float(p.get("price") or 0) if p.get("ok") else 0.0
-                symbol_prices[t.symbol] = mark
+            mark = symbol_prices.get(t.symbol, 0.0)
             if mark > 0 and entry > 0:
                 if (t.side or "").upper() == "BUY":
                     unrealized += (mark - entry) * qty

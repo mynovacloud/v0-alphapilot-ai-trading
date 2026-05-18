@@ -5,8 +5,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from config.settings import settings
 from utils.logger import get_logger
@@ -14,14 +15,32 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 # SQLite needs check_same_thread=False so FastAPI + Streamlit threads can share it.
-_connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+_is_sqlite = settings.database_url.startswith("sqlite")
+_connect_args = {"check_same_thread": False} if _is_sqlite else {}
 
+# Use connection pooling for better performance
 engine = create_engine(
     settings.database_url,
     echo=False,
     future=True,
     connect_args=_connect_args,
+    # Connection pool settings for better concurrency
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=10,
+    pool_pre_ping=True,  # Verify connections before use
 )
+
+# Enable WAL mode for SQLite (much better concurrent read/write performance)
+if _is_sqlite:
+    @event.listens_for(engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA cache_size=10000")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.close()
 
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 

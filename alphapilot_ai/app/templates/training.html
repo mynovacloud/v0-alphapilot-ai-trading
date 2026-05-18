@@ -1112,12 +1112,12 @@ async function executeDca(tradeId) {
   }
 }
 
-// Auto-refresh positions every 10 seconds when page is visible
+// Auto-refresh positions every 15 seconds when page is visible (was 10s)
 document.addEventListener('DOMContentLoaded', () => {
   refreshPositions();
   setInterval(() => {
     if (!document.hidden) refreshPositions();
-  }, 10000);
+  }, 15000);
 });
 
 // Close modal on escape key
@@ -1245,7 +1245,7 @@ document.addEventListener('keydown', e => {
           <div class="kpi" style="border-left: 3px solid var(--border);">
             <div class="kpi-label">Currently Open</div>
             <div class="kpi-value mono" id="lab-kpi-openval" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
-            <div class="text-dim" id="lab-kpi-openval-sub" style="font-size: 0.72rem;">0 positions · unreal —</div>
+            <div class="text-dim" id="lab-kpi-openval-sub" style="font-size: 0.72rem;">0 positions · unreal ���</div>
           </div>
         </div>
 
