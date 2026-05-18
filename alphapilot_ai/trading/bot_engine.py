@@ -368,6 +368,15 @@ class BotEngine:
         for product in shuffled_universe:
             symbol = product["product_id"]
             
+            # DEBUG: Track which symbols we're evaluating
+            if evaluated < 5:  # Only log first 5 to avoid spam
+                self._log(
+                    "bot",
+                    f"[DEBUG] Evaluating symbol {symbol}: is_held={symbol in held_symbols}, slots_left={slots_left}",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+            
             # For NEW entries, skip if we already hold AND have no slots
             # But if we DO have slots, we should diversify into NEW symbols
             is_held = symbol in held_symbols
@@ -379,10 +388,13 @@ class BotEngine:
                 # We might want to DCA - let portfolio intelligence handle that
                 continue
             if slots_left <= 0:
-                # No slots for new positions, but keep evaluating for logging/monitoring
-                # Continue evaluating a few more for "best signal" tracking
-                if evaluated >= 10:  # Evaluate at least 10 symbols even if slots full
+                # No slots for new positions - can't open new trades
+                # Just track a few "best signals" for monitoring then stop
+                if evaluated >= 10:
                     break
+                # Still evaluate to track best signals but skip trade execution
+                # by continuing to next symbol
+                continue
             
             price_payload = get_price(symbol)
             if not price_payload.get("ok"):
@@ -432,6 +444,14 @@ class BotEngine:
 
             side = decision.action
             confidence = float(decision.confidence or 0.0)
+            
+            # DEBUG: Log what decision came back from claude_decide
+            self._log(
+                "bot",
+                f"[DEBUG] claude_decide returned: {symbol} side={side} conf={confidence:.2f} src={decision.source}",
+                wallet_id=wallet["id"],
+                level="debug",
+            )
 
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
@@ -461,6 +481,14 @@ class BotEngine:
                     level="info",
                 )
                 continue
+            
+            # >>> DEBUG: Reached trade execution section <<<
+            self._log(
+                "bot",
+                f"[DEBUG] PASSED conf check for {symbol} {side} conf={confidence:.2f} >= floor={effective_min_conf:.2f}",
+                wallet_id=wallet["id"],
+                level="info",
+            )
 
             # Sizing: Claude's size_multiplier scales the bot's default size,
             # then we clamp to the wallet's hard cap.
@@ -471,14 +499,20 @@ class BotEngine:
             position_usd = max(0.0, base_position_usd * float(decision.size_multiplier or 1.0))
             qty = round(position_usd / price, 6)
             if qty <= 0:
+                self._log(
+                    "bot",
+                    f"[DEBUG] qty <= 0: position_usd={position_usd:.2f}, price={price:.4f}, qty={qty}",
+                    wallet_id=wallet["id"],
+                    level="warn",
+                )
                 continue
 
             # Log the dry_run status to help debug
             self._log(
                 "bot",
-                f"[TRADE CHECK] {symbol} {side}: dry_run={cfg.dry_run}, qty={qty:.6f}, price={price:.4f}",
+                f"[DEBUG] About to execute: dry_run={cfg.dry_run}, qty={qty:.6f}, price={price:.4f}, slots_left={slots_left}",
                 wallet_id=wallet["id"],
-                level="debug",
+                level="info",
             )
 
             if cfg.dry_run:
