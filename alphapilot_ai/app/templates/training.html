@@ -401,6 +401,42 @@ loadPnlStats('today');
         <button id="live-kill-release" class="btn btn-sm" type="button">Release kill switch</button>
       </div>
     </div>
+    
+    <!-- Diagnostics Panel - Shows actual effective settings vs wallet settings -->
+    <details id="diagnostics-panel" style="margin-top:0.8rem;background:rgba(74,163,255,0.08);border:1px solid rgba(74,163,255,0.25);border-radius:var(--radius-sm);padding:0.75rem 0.9rem;">
+      <summary class="mono" style="cursor:pointer;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--accent);">
+        System Diagnostics
+        <span class="text-dim" style="margin-left:0.6rem;font-size:0.72rem;">Click to see effective settings and slot usage</span>
+      </summary>
+      <div class="grid mt-3" style="grid-template-columns:repeat(2,1fr);gap:1rem;">
+        <div>
+          <div class="text-muted" style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.4rem;">Session Config (from settings)</div>
+          <div id="diag-session-config" class="mono" style="font-size:0.78rem;background:var(--bg);padding:0.5rem;border-radius:var(--radius-sm);border:1px solid var(--border);">
+            <div>max_open_per_wallet: <span id="diag-cfg-maxopen">--</span></div>
+            <div>position_size_usd: <span id="diag-cfg-possize">--</span></div>
+            <div>min_confidence: <span id="diag-cfg-minconf">--</span></div>
+            <div>universe_limit: <span id="diag-cfg-universe">--</span></div>
+            <div>tick_seconds: <span id="diag-cfg-tick">--</span></div>
+          </div>
+        </div>
+        <div>
+          <div class="text-muted" style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.4rem;">Wallet Effective Limits</div>
+          <div id="diag-wallet-limits" class="mono" style="font-size:0.78rem;background:var(--bg);padding:0.5rem;border-radius:var(--radius-sm);border:1px solid var(--border);">
+            Loading...
+          </div>
+        </div>
+      </div>
+      <div class="mt-3">
+        <div class="text-muted" style="font-size:0.72rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.4rem;">Recent Slot Checks (from bot logs)</div>
+        <div id="diag-slot-checks" class="mono" style="font-size:0.72rem;background:var(--bg);padding:0.5rem;border-radius:var(--radius-sm);border:1px solid var(--border);max-height:100px;overflow-y:auto;">
+          No recent slot checks...
+        </div>
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button id="diag-sync-btn" class="btn btn-sm" type="button" onclick="syncWalletSettings()">Sync Settings to Wallets</button>
+        <button id="diag-refresh-btn" class="btn btn-sm btn-outline" type="button" onclick="refreshDiagnostics()">Refresh Diagnostics</button>
+      </div>
+    </details>
   </details>
 
   <!-- Live equity strip — these numbers tick every poll -->
@@ -1671,5 +1707,87 @@ document.addEventListener('keydown', e => {
 
 <script src="/static/positions_lab.js?v=2"></script>
 <script src="/static/live_session.js?v=1"></script>
+
+<!-- Diagnostics Panel Scripts -->
+<script>
+// Sync session settings to all wallets
+async function syncWalletSettings() {
+  try {
+    const btn = document.getElementById('diag-sync-btn');
+    btn.disabled = true;
+    btn.textContent = 'Syncing...';
+    
+    const res = await fetch('/training/session/apply-settings-to-wallets', { method: 'POST' });
+    const data = await res.json();
+    
+    if (data.ok) {
+      alert(`Settings synced to ${data.wallets?.length || 0} wallet(s)!\n\nNew limits:\n- max_open: ${data.config?.max_open_per_wallet}\n- position_usd: $${data.config?.position_size_usd}`);
+      refreshDiagnostics();
+    } else {
+      alert('Sync failed: ' + (data.error || 'Unknown error'));
+    }
+  } catch (err) {
+    alert('Sync failed: ' + err.message);
+  } finally {
+    const btn = document.getElementById('diag-sync-btn');
+    btn.disabled = false;
+    btn.textContent = 'Sync Settings to Wallets';
+  }
+}
+
+// Refresh diagnostics panel
+async function refreshDiagnostics() {
+  try {
+    // Load session config
+    const configRes = await fetch('/training/session/config');
+    const config = await configRes.json();
+    if (config.ok) {
+      document.getElementById('diag-cfg-maxopen').textContent = config.max_open_per_wallet;
+      document.getElementById('diag-cfg-possize').textContent = '$' + config.position_size_usd;
+      document.getElementById('diag-cfg-minconf').textContent = config.min_confidence.toFixed(2);
+      document.getElementById('diag-cfg-universe').textContent = config.universe_limit;
+      document.getElementById('diag-cfg-tick').textContent = config.tick_seconds + 's';
+    }
+    
+    // Load wallet limits
+    const walletsRes = await fetch('/api/v1/wallets');
+    const wallets = await walletsRes.json();
+    const walletLimitsDiv = document.getElementById('diag-wallet-limits');
+    if (Array.isArray(wallets) && wallets.length > 0) {
+      walletLimitsDiv.innerHTML = wallets.map(w => `
+        <div style="margin-bottom:0.3rem;padding:0.3rem;border-bottom:1px solid var(--border);">
+          <strong>${w.name}</strong>: max_open=<span style="color:${w.max_open_positions >= 10 ? 'var(--good)' : 'var(--warn)'}">${w.max_open_positions}</span>, max_pos_usd=$${w.max_position_usd}, paused=${w.bot_paused ? 'YES' : 'no'}
+        </div>
+      `).join('');
+    } else {
+      walletLimitsDiv.innerHTML = 'No wallets found';
+    }
+    
+    // Load recent logs with slot checks
+    const logsRes = await fetch('/activity/api?limit=50&category=bot');
+    const logs = await logsRes.json();
+    const slotChecksDiv = document.getElementById('diag-slot-checks');
+    if (logs.logs && logs.logs.length > 0) {
+      const slotLogs = logs.logs.filter(l => l.message.includes('[SLOT_CHECK]') || l.message.includes('slots=') || l.message.includes('No new entry slots'));
+      if (slotLogs.length > 0) {
+        slotChecksDiv.innerHTML = slotLogs.slice(0, 10).map(l => `
+          <div style="margin-bottom:0.2rem;color:var(--text-muted);">${l.message}</div>
+        `).join('');
+      } else {
+        slotChecksDiv.innerHTML = 'No recent slot checks found in logs';
+      }
+    }
+  } catch (err) {
+    console.error('Failed to refresh diagnostics:', err);
+  }
+}
+
+// Load diagnostics when panel is opened
+document.getElementById('diagnostics-panel')?.addEventListener('toggle', (e) => {
+  if (e.target.open) {
+    refreshDiagnostics();
+  }
+});
+</script>
 
 {% endblock %}
