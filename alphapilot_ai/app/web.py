@@ -1097,10 +1097,15 @@ def training_session_start(
             wallets = s.query(Wallet).all()
             for w in wallets:
                 # Save original values so we can restore on stop
-                if not w.meta:
-                    w.meta = {}
-                w.meta["_session_prev_max_open"] = w.max_open_positions
-                w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                # Use getattr with a fallback since meta column may not exist yet
+                try:
+                    if not w.meta:
+                        w.meta = {}
+                    w.meta["_session_prev_max_open"] = w.max_open_positions
+                    w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                except Exception:
+                    # meta column may not exist in older schema - skip the backup
+                    pass
                 # Apply session settings to wallet
                 w.max_open_positions = max_open
                 w.max_position_usd = pos_usd
@@ -1230,12 +1235,16 @@ def training_session_stop() -> JSONResponse:
         with session_scope() as s:
             wallets = s.query(Wallet).all()
             for w in wallets:
-                if w.meta and "_session_prev_max_open" in w.meta:
-                    w.max_open_positions = w.meta.get("_session_prev_max_open")
-                    w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
-                    # Clean up the temporary keys
-                    w.meta.pop("_session_prev_max_open", None)
-                    w.meta.pop("_session_prev_max_position_usd", None)
+                try:
+                    if w.meta and "_session_prev_max_open" in w.meta:
+                        w.max_open_positions = w.meta.get("_session_prev_max_open")
+                        w.max_position_usd = w.meta.get("_session_prev_max_position_usd")
+                        # Clean up the temporary keys
+                        w.meta.pop("_session_prev_max_open", None)
+                        w.meta.pop("_session_prev_max_position_usd", None)
+                except Exception:
+                    # meta column may not exist in older schema - skip the restore
+                    pass
             logger.info(f"[SESSION_STOP] Restored wallet settings for {len(wallets)} wallets")
 
         with session_scope() as s:
@@ -1281,6 +1290,27 @@ def training_session_tick_now() -> JSONResponse:
     except Exception as e:
         logging.exception("[SESSION_TICK] Error")
         return JSONResponse({"ok": False, "error": str(e) or "Unknown error", "traceback": traceback.format_exc()})
+
+
+@router.get("/training/learning-stats")
+def api_get_learning_stats() -> JSONResponse:
+    """
+    Get comprehensive statistics about the adaptive learning engine.
+    Shows pattern recognition, strategy performance, and learning progress.
+    """
+    try:
+        from ai.adaptive_learning_engine import get_adaptive_engine
+        
+        engine = get_adaptive_engine()
+        stats = engine.get_learning_stats()
+        
+        return JSONResponse({
+            "ok": True,
+            "learning_stats": stats,
+        })
+    except Exception as e:
+        logging.exception("[LEARNING_STATS] Error")
+        return JSONResponse({"ok": False, "error": str(e)})
 
 
 @router.post("/training/session/apply-settings-to-wallets")

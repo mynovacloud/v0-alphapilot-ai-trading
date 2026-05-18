@@ -423,15 +423,21 @@
           message: "Claude is not configured — bot will trade on technical signals only.",
         });
       }
+      
+      // Safely handle potentially missing response fields
+      const tickSec = data.tick_seconds != null ? data.tick_seconds : "?";
+      const minConf = data.min_confidence != null ? data.min_confidence.toFixed(2) : "?";
+      const posSize = data.position_size_usd != null ? Math.round(data.position_size_usd) : "?";
+      const maxOpenVal = data.max_open_per_wallet != null ? data.max_open_per_wallet : "?";
+      const uniLimit = data.universe_limit != null ? data.universe_limit : "?";
+      
       renderLog({
         ts: Math.floor(Date.now() / 1000),
         level: "success",
         category: "session",
         message:
-          "Session started — tick " + data.tick_seconds + "s · floor " +
-          (data.min_confidence != null ? data.min_confidence.toFixed(2) : "?") +
-          " · $" + Math.round(data.position_size_usd || 0) + "/trade · " +
-          (data.max_open_per_wallet || "?") + " open · universe " + (data.universe_limit || "?"),
+          "Session started — tick " + tickSec + "s · floor " + minConf +
+          " · $" + posSize + "/trade · " + maxOpenVal + " open · universe " + uniLimit,
       });
       // Collapse the settings card once running so the live feed has more room.
       if (settingsDetails) settingsDetails.open = false;
