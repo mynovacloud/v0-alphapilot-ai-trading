@@ -478,7 +478,20 @@ class PositionMonitor:
             )
 
         # 2. Check stop-loss price
-        if trade.stop_loss_price:
+        # IMPORTANT: Add minimum hold time before SL can trigger
+        # This prevents getting stopped out by normal market noise in the first few minutes
+        min_hold_minutes = 15  # Don't trigger SL for first 15 minutes
+        trade_age_minutes = 0
+        if trade.opened_at:
+            from utils.helpers import ensure_utc
+            opened_utc = ensure_utc(trade.opened_at)
+            trade_age_minutes = (utcnow() - opened_utc).total_seconds() / 60
+        
+        # Only check stop-loss after minimum hold period (unless loss exceeds max_loss_pct)
+        max_loss_exceeded = pnl_pct <= -0.08  # 8% max loss always triggers
+        can_trigger_sl = trade_age_minutes >= min_hold_minutes or max_loss_exceeded
+        
+        if trade.stop_loss_price and can_trigger_sl:
             sl_price = float(trade.stop_loss_price)
             if side == "BUY" and current_price <= sl_price:
                 self._log_exit(session, trade, "sl", current_price, pnl_pct)

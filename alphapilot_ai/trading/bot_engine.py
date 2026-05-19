@@ -508,15 +508,14 @@ class BotEngine:
                     with session_scope() as s:
                         trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
                         if trade:
-                            # Enable trailing stop at 2.5% to lock in profits
-                            # This trails the high-water mark once trade is profitable
+                            # Wider stops for crypto volatility + trailing to lock profits
                             initialize_trade_sl_tp(
                                 trade,
-                                stop_loss_pct=decision.stop_loss_pct,
-                                take_profit_pct=decision.take_profit_pct,
-                                trailing_stop_pct=0.025,  # 2.5% trailing stop to lock profits
-                                max_loss_pct=0.08,  # 8% max loss hard cap
-                                time_limit_hours=48,  # Close stale trades after 48h
+                                stop_loss_pct=decision.stop_loss_pct,  # 5% default
+                                take_profit_pct=decision.take_profit_pct,  # 10% default
+                                trailing_stop_pct=0.03,  # 3% trailing once profitable
+                                max_loss_pct=0.10,  # 10% max loss hard cap
+                                time_limit_hours=72,  # Close stale trades after 72h
                             )
                             s.commit()
                 self._log(

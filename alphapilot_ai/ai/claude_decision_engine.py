@@ -279,8 +279,8 @@ class TradeDecision:
     action: str = "HOLD"           # BUY / SELL / HOLD / CLOSE
     confidence: float = 0.0        # 0..1
     size_multiplier: float = 1.0   # 0..1 (fraction of cfg.position_size_usd)
-    stop_loss_pct: float = 0.035   # 3.5% stop loss - wider to avoid noise/whipsaws
-    take_profit_pct: float = 0.07  # 7% take profit - 2:1 reward/risk minimum
+    stop_loss_pct: float = 0.05    # 5% stop loss - wide enough for crypto volatility
+    take_profit_pct: float = 0.10  # 10% take profit - 2:1 reward/risk ratio
     rationale: str = ""
     key_factors: list[str] = field(default_factory=list)
     risk_flags: list[str] = field(default_factory=list)
@@ -415,14 +415,14 @@ def decide(
     if side in {"BUY", "SELL"} and tech_conf >= bypass_threshold:
         # Use adaptive learning recommendations for sizing and risk parameters
         size_mult = 1.0
-        stop_pct = 0.035   # 3.5% stop loss - wider for crypto volatility
-        take_pct = 0.07    # 7% take profit - 2:1 reward/risk ratio
+        stop_pct = 0.05    # 5% stop loss - crypto needs room to breathe
+        take_pct = 0.10    # 10% take profit - 2:1 reward/risk ratio
         key_factors = [f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"]
         
         if adaptive_rec:
             size_mult = adaptive_rec.size_multiplier
-            stop_pct = 0.035 * adaptive_rec.stop_loss_multiplier  # Base 3.5% SL
-            take_pct = 0.07 * adaptive_rec.take_profit_multiplier  # Base 7% TP (2:1 ratio)
+            stop_pct = 0.05 * adaptive_rec.stop_loss_multiplier  # Base 5% SL
+            take_pct = 0.10 * adaptive_rec.take_profit_multiplier  # Base 10% TP (2:1 ratio)
             
             # Add pattern matches to key factors
             if adaptive_rec.matched_patterns:
