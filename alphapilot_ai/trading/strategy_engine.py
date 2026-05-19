@@ -344,24 +344,31 @@ def momentum_signal(
         elif vol_data["buying_pressure"] < 0.4:
             bearish_factors += 1
     
-    # Decision logic
-    if bullish_factors >= 3 and bullish_factors > bearish_factors:
+    # Decision logic - relaxed thresholds for more signals
+    # Require at least 2 factors with a clear edge, not 3
+    if bullish_factors >= 2 and bullish_factors > bearish_factors:
         side = "BUY"
         strength = bullish_factors
-    elif bearish_factors >= 3 and bearish_factors > bullish_factors:
+    elif bearish_factors >= 2 and bearish_factors > bullish_factors:
         side = "SELL"
         strength = bearish_factors
-    elif bullish_factors > bearish_factors + 1:
+    elif bullish_factors > bearish_factors + 0.5:
         side = "BUY"
         strength = bullish_factors
-    elif bearish_factors > bullish_factors + 1:
+    elif bearish_factors > bullish_factors + 0.5:
         side = "SELL"
         strength = bearish_factors
     else:
-        return Signal("HOLD", 0.15, f"Mixed signals: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
+        # Even mixed signals get a weak directional bias based on EMA
+        if ema_fast > ema_slow:
+            return Signal("BUY", 0.35, f"Weak bullish bias: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
+        elif ema_fast < ema_slow:
+            return Signal("SELL", 0.35, f"Weak bearish bias: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
+        return Signal("HOLD", 0.20, f"No clear direction: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
 
     # Confidence based on factor alignment (max factors = 5)
-    confidence = min(0.95, 0.45 + (strength / 5.0) * 0.5)
+    # More generous confidence scaling
+    confidence = min(0.95, 0.50 + (strength / 5.0) * 0.45)
     
     # Volume boost
     if vol_data["relative_volume"] > 1.5:

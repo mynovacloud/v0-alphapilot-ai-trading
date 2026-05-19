@@ -451,6 +451,25 @@ def decide(
         return passthrough
     # ---------------------------------------------------------------------
 
+    # ----- HOLD signals don't need Claude ---------------------------------
+    # If the technical signal is HOLD, there's no point calling Claude.
+    # Just return the HOLD directly to save API credits.
+    if side == "HOLD":
+        hold_decision = TradeDecision(
+            action="HOLD",
+            confidence=tech_conf,
+            size_multiplier=0.0,
+            stop_loss_pct=0.05,
+            take_profit_pct=0.10,
+            rationale=f"Technical signal is HOLD - no trade opportunity. {technical_signal.reasoning}",
+            key_factors=[f"tech_hold", f"conf={tech_conf:.2f}"],
+            risk_flags=[],
+            source="tech_hold",
+        )
+        _persist_decision(wallet, symbol, price, technical_signal, hold_decision, prompt_used="[TECH_HOLD]")
+        return hold_decision
+    # ---------------------------------------------------------------------
+
     if not claude_is_configured():
         _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="")
         return fallback
