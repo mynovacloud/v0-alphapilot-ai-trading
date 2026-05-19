@@ -1194,7 +1194,10 @@ def training_session_config() -> JSONResponse:
     from config.bot_config import get as cfg_get
     from services.claude_client import is_configured as claude_is_configured
     from trading.risk_manager import RiskManager
+    from ai.claude_decision_engine import get_api_usage_stats
 
+    api_stats = get_api_usage_stats()
+    
     return JSONResponse(
         {
             "ok": True,
@@ -1208,6 +1211,8 @@ def training_session_config() -> JSONResponse:
             # Surfaced so the Training Center can warn / auto-release before the
             # user wonders why their tick log is just "kill switch engaged" forever.
             "kill_switch_engaged": RiskManager.kill_switch_status(),
+            # API usage stats for cost monitoring
+            "api_usage": api_stats,
         }
     )
 
