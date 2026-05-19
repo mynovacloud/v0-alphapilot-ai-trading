@@ -42,6 +42,10 @@ from trading.portfolio_intelligence import (
 from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol
+# Advanced trading modules
+from trading.advanced_signal_engine import get_signal_engine, AdvancedSignal
+from trading.advanced_position_sizer import get_position_sizer
+from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -458,16 +462,42 @@ class BotEngine:
                 below_conf += 1
                 continue
 
-            # Sizing: Claude's size_multiplier scales the bot's default size,
-            # then we clamp to the wallet's hard cap.
-            base_position_usd = min(
-                cfg.position_size_usd,
-                wallet["max_position_usd"] or cfg.position_size_usd,
+            # =====================================================================
+            # ADVANCED POSITION SIZING
+            # Uses Kelly Criterion, drawdown adjustment, portfolio heat management
+            # =====================================================================
+            position_sizer = get_position_sizer()
+            size_result = position_sizer.calculate_size(
+                wallet_id=wallet["id"],
+                symbol=symbol,
+                entry_price=price,
+                stop_loss_pct=decision.stop_loss_pct,
+                confidence=confidence,
+                base_size_usd=cfg.position_size_usd,
+                signal_quality=getattr(decision, 'quality', 'B'),
             )
-            position_usd = max(0.0, base_position_usd * float(decision.size_multiplier or 1.0))
-            qty = round(position_usd / price, 6)
-            if qty <= 0:
+            
+            position_usd = size_result.recommended_usd
+            qty = size_result.recommended_qty
+            
+            if qty <= 0 or position_usd < 10:
+                self._log(
+                    "bot",
+                    f"[SKIP] {symbol}: Position too small (${position_usd:.2f}). {size_result.reasoning}",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
                 continue
+            
+            # Log sizing decision
+            if size_result.warnings:
+                self._log(
+                    "bot",
+                    f"[SIZE] {symbol}: ${position_usd:.0f} ({size_result.conviction_multiplier:.1f}x conv, "
+                    f"{size_result.drawdown_adjustment:.1f}x DD). Warnings: {', '.join(size_result.warnings[:2])}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
 
             if cfg.dry_run:
                 self._log(
@@ -502,22 +532,51 @@ class BotEngine:
             if outcome.get("ok"):
                 result.actions += 1
                 slots_left -= 1
-                # Initialize SL/TP based on Claude's recommendation
+                # =====================================================================
+                # ADVANCED EXIT MANAGEMENT
+                # Dynamic SL/TP based on ATR, with trailing stops and break-even logic
+                # =====================================================================
                 trade_id = outcome.get("trade_id")
                 if trade_id:
                     with session_scope() as s:
                         trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
                         if trade:
-                            # Wider stops for crypto volatility + trailing to lock profits
+                            # Use advanced exit manager for dynamic stops
+                            exit_manager = get_exit_manager()
+                            
+                            # Get ATR for dynamic stop calculation (use decision's stop as fallback)
+                            atr_estimate = price * decision.stop_loss_pct  # Approximate ATR
+                            
+                            stop_price, target_price, trailing_pct = exit_manager.calculate_dynamic_stops(
+                                entry_price=price,
+                                side=side,
+                                atr=atr_estimate,
+                                confidence=confidence,
+                            )
+                            
+                            # Convert prices to percentages for initialize_trade_sl_tp
+                            sl_pct = abs(price - stop_price) / price
+                            tp_pct = abs(target_price - price) / price
+                            
                             initialize_trade_sl_tp(
                                 trade,
-                                stop_loss_pct=decision.stop_loss_pct,  # 5% default
-                                take_profit_pct=decision.take_profit_pct,  # 10% default
-                                trailing_stop_pct=0.03,  # 3% trailing once profitable
-                                max_loss_pct=0.10,  # 10% max loss hard cap
-                                time_limit_hours=72,  # Close stale trades after 72h
+                                stop_loss_pct=sl_pct,
+                                take_profit_pct=tp_pct,
+                                trailing_stop_pct=trailing_pct,
+                                max_loss_pct=0.10,  # 10% absolute max
+                                time_limit_hours=72,  # 3 days max hold
                             )
+                            
+                            # Store high water mark for trailing stop
+                            trade.high_water_mark = price
                             s.commit()
+                            
+                            self._log(
+                                "bot",
+                                f"[STOPS] {symbol}: SL={sl_pct:.1%} TP={tp_pct:.1%} Trail={trailing_pct:.1%}",
+                                wallet_id=wallet["id"],
+                                level="debug",
+                            )
                 self._log(
                     "trade",
                     (
