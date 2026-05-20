@@ -605,34 +605,26 @@ class BotEngine:
                 continue
 
             # =====================================================================
-            # ENTRY QUALITY CONFIDENCE MULTIPLIER
-            # `evaluate_entry_quality` also returns a quality_score and the
-            # naive max R:R for the setup. Setups with great asymmetry (3R+
-            # potential, 4+ ATRs of headroom) get a small confidence boost;
-            # setups that barely cleared the headroom minimum get trimmed.
+            # ENTRY QUALITY + FUNDAMENTAL ALIGNMENT (advisory only)
+            #
+            # Earlier iterations of this block stacked too many multipliers
+            # (quality 0.65..1.20, fundamentals 0.85..1.10, R:R hard floor of
+            # 1.2) and ended up rejecting every realistic scalper BUY in chop.
+            # The S/R `accept` flag above is already the structural gate;
+            # everything below is just a small nudge to break ties between
+            # otherwise-similar candidates. Total swing here is capped at
+            # roughly ±10% of confidence so good signals always survive.
             # =====================================================================
-            sr_quality = float(sr_check.get("quality_score", 1.0))
+            sr_quality_raw = float(sr_check.get("quality_score", 1.0))
             potential_rr = float(sr_check.get("potential_rr", 0.0))
 
-            # Hard reject: structural R:R below 1.2 means we are paying fees
-            # on a coin-flip even if the technicals look great.
-            if potential_rr > 0 and potential_rr < 1.2:
-                self._log(
-                    "bot",
-                    f"[R:R] {symbol} {side} rejected: potential R:R {potential_rr:.1f} (need 1.2+)",
-                    wallet_id=wallet["id"],
-                    level="info",
-                )
-                continue
-
+            # Compress quality_score from [0.65, 1.20] -> [0.95, 1.05].
+            # We trust the S/R headroom gate to do the heavy lifting; this
+            # multiplier just gives a tiny edge to setups with great room.
+            sr_quality = 0.95 + (sr_quality_raw - 0.65) * (0.10 / 0.55)
+            sr_quality = max(0.95, min(1.05, sr_quality))
             confidence *= sr_quality
 
-            # =====================================================================
-            # MARKET-WIDE FUNDAMENTAL ALIGNMENT
-            # Combine fear/greed sentiment and BTC trend to nudge confidence.
-            # Aligned conditions push borderline trades over the floor;
-            # misaligned conditions trim weak signals so they fall short.
-            # =====================================================================
             try:
                 fg_score = float(getattr(market_ctx, "market_fear_greed", 50.0))
             except (TypeError, ValueError):
@@ -643,35 +635,35 @@ class BotEngine:
             fundamental_notes: list[str] = []
 
             if side == "BUY":
-                if fg_score >= 80:
-                    fundamental_mult *= 0.85
+                if fg_score >= 85:  # raised from 80 - only the most extreme greed
+                    fundamental_mult *= 0.95
                     fundamental_notes.append(f"extreme greed ({fg_score:.0f})")
                 elif fg_score <= 25 and signal.strategy in ("Mean Reversion", "Scalping"):
-                    fundamental_mult *= 1.05
+                    fundamental_mult *= 1.03
                     fundamental_notes.append(f"fear ({fg_score:.0f}) + reversion")
                 if btc_trend in ("strong_uptrend", "uptrend", "bullish"):
-                    fundamental_mult *= 1.05
+                    fundamental_mult *= 1.03
                     fundamental_notes.append(f"BTC {btc_trend}")
-                elif btc_trend in ("strong_downtrend", "downtrend", "bearish") and symbol != "BTC-USD":
-                    fundamental_mult *= 0.90
+                elif btc_trend in ("strong_downtrend", "bearish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.95
                     fundamental_notes.append(f"BTC {btc_trend} - alts follow")
             else:  # SELL
-                if fg_score <= 20:
-                    fundamental_mult *= 0.85
+                if fg_score <= 15:  # raised from 20 - only the most extreme fear
+                    fundamental_mult *= 0.95
                     fundamental_notes.append(f"extreme fear ({fg_score:.0f})")
                 elif fg_score >= 75 and signal.strategy in ("Mean Reversion", "Scalping"):
-                    fundamental_mult *= 1.05
+                    fundamental_mult *= 1.03
                     fundamental_notes.append(f"greed ({fg_score:.0f}) + reversion")
-                if btc_trend in ("strong_downtrend", "downtrend", "bearish"):
-                    fundamental_mult *= 1.05
+                if btc_trend in ("strong_downtrend", "bearish"):
+                    fundamental_mult *= 1.03
                     fundamental_notes.append(f"BTC {btc_trend}")
-                elif btc_trend in ("strong_uptrend", "uptrend", "bullish") and symbol != "BTC-USD":
-                    fundamental_mult *= 0.90
+                elif btc_trend in ("strong_uptrend", "bullish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.95
                     fundamental_notes.append(f"BTC {btc_trend}")
 
             confidence *= fundamental_mult
 
-            if fundamental_notes or abs(sr_quality - 1.0) > 0.05:
+            if fundamental_notes or abs(sr_quality - 1.0) > 0.02:
                 self._log(
                     "bot",
                     (
