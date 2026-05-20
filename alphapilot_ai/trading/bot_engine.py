@@ -44,6 +44,7 @@ from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles, smart_stops
 # Advanced trading modules (signal engine temporarily disabled - uses evaluate_symbol instead)
 from trading.advanced_position_sizer import get_position_sizer
+from risk.daily_mission_controller import get_mission_controller
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from trading.market_intelligence import get_market_intelligence
 from trading.strategic_claude import get_strategic_router
@@ -779,6 +780,62 @@ class BotEngine:
                     level="info",
                 )
 
+            # =====================================================================
+            # DAILY MISSION CONTROLLER — the boss layer.
+            # When the operator has enabled mission_controller_enabled in bot_config,
+            # every trade decision passes through the controller. It can:
+            #   - reject the trade (mode is LOCK/KILL, daily limits hit, edge too
+            #     small for the current mode, confidence below mode-specific floor,
+            #     symbol or strategy or combo currently quarantined for a loss
+            #     streak)
+            #   - override position_usd with a mode-scaled approved_notional
+            #     (SCOUT = 25% of proposed, BUILD = 100%, ATTACK = 120%, etc.)
+            # When the flag is off, get_mission_controller() returns a no-op
+            # that approves everything and leaves sizing as-is, so this block is
+            # safe to land before the UI toggle exists.
+            # =====================================================================
+            mission = get_mission_controller()
+            mission_inputs = _compute_mission_inputs(
+                signal=signal,
+                decision=decision,
+                confidence=confidence,
+                proposed_notional=position_usd,
+            )
+            mission_decision = mission.approve_trade(
+                symbol=symbol,
+                strategy=strategy_type,
+                confidence=confidence,
+                proposed_notional=position_usd,
+                expected_net_edge=mission_inputs["expected_net_edge"],
+                spread_bps=mission_inputs["spread_bps"],
+                volatility_score=mission_inputs["volatility_score"],
+                market_quality_score=mission_inputs["market_quality_score"],
+                router_wants_claude=(decision.source == "claude"),
+                metadata={"strategy_type": strategy_type, "decision_source": decision.source},
+            )
+            if not mission_decision.approved:
+                self._log(
+                    "bot",
+                    f"[MISSION REJECT] {symbol} {side}: {mission_decision.rejection_code.value} — {mission_decision.reason}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+            # If the controller is the real one (not the no-op), let it
+            # override the position size. The mode multipliers in MissionConfig
+            # are the authoritative sizing once the flag is on.
+            if getattr(mission_decision, "approved_notional", None) is not None and mission_decision.approved_notional > 0:
+                if mission_decision.approved_notional != position_usd:
+                    position_usd = float(mission_decision.approved_notional)
+                    qty = position_usd / price if price > 0 else 0.0
+                    self._log(
+                        "bot",
+                        f"[MISSION SIZE] {symbol}: mode={mission_decision.mode.value} "
+                        f"size ${size_result.recommended_usd:.0f} -> ${position_usd:.0f} (×{mission_decision.size_multiplier})",
+                        wallet_id=wallet["id"],
+                        level="info",
+                    )
+
             if cfg.dry_run:
                 self._log(
                     "bot",
@@ -1227,6 +1284,74 @@ class BotEngine:
                     message=message,
                 )
             )
+
+
+# =============================================================================
+# MISSION-CONTROLLER INPUT DERIVATION
+# =============================================================================
+# The Daily Mission Controller's approve_trade() expects four numeric inputs
+# the rest of the pipeline doesn't currently track as first-class values:
+#
+#   expected_net_edge  - dollar edge expected after fees/slippage/loss-prob
+#   spread_bps         - bid-ask spread in basis points
+#   volatility_score   - normalized 0..1
+#   market_quality_score - composite 0..1
+#
+# We synthesize them from the technical signal's indicators + the decision's
+# SL/TP percentages. This is a lossy approximation — once we have live order
+# book data the spread/quality scores should become real measurements. Until
+# then the heuristics below give the controller plausible inputs so its
+# mode/edge gates can do useful work in paper trading.
+
+def _compute_mission_inputs(*, signal, decision, confidence: float, proposed_notional: float) -> dict:
+    indicators = getattr(signal, "indicators", {}) or {}
+    sl_pct = max(0.001, float(decision.stop_loss_pct or 0.025))
+    tp_pct = max(0.001, float(decision.take_profit_pct or 0.05))
+
+    # --- Expected net edge (dollars) -------------------------------------
+    # Bayesian-ish: prob_win ≈ confidence. Round-trip fees taken at a coarse
+    # 0.5% (50 bps total) — Coinbase Advanced taker can run lower at higher
+    # tiers; this errs on the conservative side which is what we want from
+    # an entry gate. When we have live fees per-pair we'd source it here.
+    prob_win = max(0.0, min(1.0, float(confidence)))
+    expected_win_pnl = prob_win * tp_pct * proposed_notional
+    expected_loss_pnl = (1.0 - prob_win) * sl_pct * proposed_notional
+    fee_drag = 0.005 * proposed_notional  # 50 bps round-trip
+    expected_net_edge = expected_win_pnl - expected_loss_pnl - fee_drag
+
+    # --- Volatility score (0..1) -----------------------------------------
+    # atr_pct measured fractionally (e.g. 0.02 = 2%). Map 0% -> 0.0,
+    # 5% -> 1.0, clamp. Anything above 5% atr is effectively "extreme".
+    atr_pct = float(indicators.get("atr_pct") or 0.0)
+    volatility_score = max(0.0, min(1.0, atr_pct / 0.05))
+
+    # --- Spread (bps) ----------------------------------------------------
+    # We do not yet track bid-ask spread on the paper side — every fill is
+    # at the polled mid price. Until we wire WebSocket order books, we
+    # approximate "effective spread cost" as half the atr in bps (volatile
+    # markets have wider spreads on Coinbase). Conservative bias, but the
+    # mode-specific max_spread_bps values are forgiving enough on Scout
+    # (12bps) that this won't deadlock training sessions.
+    spread_bps = min(40.0, atr_pct * 100.0 * 5.0)  # atr_pct=2% -> 10 bps
+
+    # --- Market quality (0..1) -------------------------------------------
+    # Composite of (a) volume health, (b) trend strength, (c) signal
+    # confidence. Built so reasonable markets score 0.6+ and only truly
+    # poor conditions drop below the protect_min_market_quality of 0.76.
+    vol_ratio = float(indicators.get("relative_volume") or indicators.get("volume_ratio") or 1.0)
+    adx = float(indicators.get("adx") or indicators.get("adx_trend_strength") or 0.0)
+    q = 0.30
+    q += min(0.25, max(0.0, (vol_ratio - 0.5) / 1.5) * 0.25)  # 0.5x->0, 2.0x->+0.25
+    q += min(0.20, max(0.0, (adx - 15.0) / 20.0) * 0.20)       # ADX 15->0, 35+->+0.20
+    q += min(0.25, max(0.0, (confidence - 0.4)) * 0.50)        # conf 0.4->0, 0.9->+0.25
+    market_quality_score = max(0.0, min(1.0, q))
+
+    return {
+        "expected_net_edge": round(expected_net_edge, 4),
+        "spread_bps": round(spread_bps, 2),
+        "volatility_score": round(volatility_score, 4),
+        "market_quality_score": round(market_quality_score, 4),
+    }
 
 
 # Module-level singleton so the scheduler and HTTP routes share state.

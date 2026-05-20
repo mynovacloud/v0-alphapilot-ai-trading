@@ -1364,6 +1364,25 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _mission_snapshot_for_feed() -> dict[str, Any]:
+    """Lazy import + snapshot of the Daily Mission Controller.
+
+    Returns a small dict every poll so the training UI can render the current
+    mode, distance to target, and key thresholds without separate endpoints.
+    When the controller is disabled (mission_controller_enabled = False) the
+    snapshot returns `{"enabled": False, "mode": "BUILD"}` and the UI hides
+    the panel.
+    """
+    try:
+        from risk.daily_mission_controller import get_mission_controller, is_enabled
+        snap = get_mission_controller().snapshot()
+        snap["enabled"] = is_enabled()
+        return snap
+    except Exception:
+        # Never let the controller break the polling endpoint.
+        return {"enabled": False, "mode": "BUILD", "error": "snapshot_failed"}
+
+
 @router.post("/training/session/start")
 def training_session_start(
     tick_seconds: int = Form(15),
@@ -2076,6 +2095,7 @@ def training_session_feed(
                 "bot_enabled": sched.get("bot_enabled"),
             },
             "portfolio": portfolio,
+            "mission": _mission_snapshot_for_feed(),
             "decisions": decisions_payload,
             "fills": fills_payload,
             "logs": logs_payload,
