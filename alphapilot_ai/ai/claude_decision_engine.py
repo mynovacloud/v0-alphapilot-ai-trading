@@ -1412,8 +1412,15 @@ def _persist_decision(
     snapshot into market_snapshot so the autonomous learning engine can rebuild
     a populated TradeContext at close time. Never lets logging fail a trade."""
     try:
+        # Signal stores its indicator dict on `.indicators` — `.metadata` does
+        # not exist on the Signal dataclass. Reading the wrong attribute here
+        # was silently producing an empty snapshot post-merge, which means
+        # every persisted market_snapshot had rsi=50/macd=0/adx=0 defaults
+        # and the close-side learn fingerprint never matched the decide-side
+        # one (built from .indicators in strategic_claude). That collapses
+        # the whole Phase A loop on every trade.
         snapshot = _extract_market_state(
-            getattr(technical_signal, "metadata", {}) or {},
+            getattr(technical_signal, "indicators", {}) or {},
             extra_context or {},
         )
         new_id: int | None = None
