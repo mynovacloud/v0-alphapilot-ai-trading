@@ -300,7 +300,10 @@ class StrategicRouter:
         
         Returns a TradeDecision object.
         """
-        from ai.claude_decision_engine import TradeDecision, claude_decide
+        # The public entry point in claude_decision_engine is `decide` — alias
+        # it locally as `claude_decide` so the call site below stays readable
+        # and we don't shadow strategic_claude's own `decide` method.
+        from ai.claude_decision_engine import TradeDecision, decide as claude_decide
         from ai.autonomous_learning_engine import get_autonomous_decision
         
         side = technical_signal.side
