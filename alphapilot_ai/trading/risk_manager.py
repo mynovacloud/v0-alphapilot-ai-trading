@@ -332,15 +332,11 @@ class RiskManager:
     def _get_config_max_open(cls) -> int:
         """Get the config setting for max_open_per_wallet.
         This allows training sessions to override wallet-level caps.
+        Uses BotConfig to ensure we get the latest setting including session overrides.
         """
-        with session_scope() as s:
-            row = s.query(AppSetting).filter(AppSetting.key == "bot_max_open_per_wallet").first()
-            if row and row.value:
-                try:
-                    return int(float(row.value))
-                except ValueError:
-                    pass
-            return 3  # Default fallback
+        from config.bot_config import BotConfig
+        cfg = BotConfig()
+        return cfg.max_open_per_wallet
 
     @classmethod
     def set_kill_switch(cls, on: bool, *, reason: str = "") -> None:
