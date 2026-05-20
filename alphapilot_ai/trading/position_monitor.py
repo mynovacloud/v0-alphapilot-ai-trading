@@ -292,9 +292,25 @@ class PositionMonitor:
             pnl_pct = (current_price - entry) / entry if entry > 0 else 0
         else:  # SELL / SHORT
             pnl_pct = (entry - current_price) / entry if entry > 0 else 0
-        
+
         # Calculate P&L in USD
         pnl_usd = pnl_pct * entry * qty
+
+        # Refresh the peak-favorable price (high_water_price) BEFORE running
+        # exit checks. The legacy _update_trailing_stop also maintains this
+        # field, but only when (a) no exit fired AND (b) trailing_stop_pct is
+        # set — neither of which the new profit lock-in floor can rely on.
+        # Updating eagerly here means: peak is current as of this tick, and
+        # the lock-in milestone math below sees real data on the very tick
+        # a new high prints. We ratchet ONE direction (up for BUY, down for
+        # SELL) and never roll back, mirroring the trailing-stop convention.
+        prior_high = float(trade.high_water_price or entry)
+        if side == "BUY" and current_price > prior_high:
+            trade.high_water_price = current_price
+            prior_high = current_price
+        elif side == "SELL" and current_price < prior_high:
+            trade.high_water_price = current_price
+            prior_high = current_price
         
         # Calculate how long we've held this position
         from utils.helpers import time_since_minutes
@@ -510,9 +526,70 @@ class PositionMonitor:
                 )
 
         # =====================================================================
+        # PROFIT LOCK-IN FLOOR (all styles, runs BEFORE the standard exits)
+        # =====================================================================
+        # Hard guarantee: once peak unrealized profit hits a milestone, this
+        # trade can NEVER close below the floor for that milestone. Addresses
+        # the "$20 profit drifts back to $2" failure mode where the
+        # percentage-based trailing stop is too loose at high profit levels.
+        #
+        # The existing adaptive trailing tightens to 0.50× the base trail at
+        # +5% profit and never tightens further. For a 3.5-4% ATR-derived
+        # trail that still leaves 1.5-2% of give-back room at any profit
+        # level — which is fine on a +5% peak but unacceptable on a +20% peak.
+        # This lock-in floor is INDEPENDENT of trail_pct and steps up the
+        # minimum-acceptable exit profit as the peak climbs.
+        peak_high = float(trade.high_water_price or entry)
+        peak_pct: float
+        if side == "BUY":
+            peak_pct = (peak_high - entry) / entry if entry > 0 else 0.0
+        else:  # SELL / SHORT — peak profit is when price went DOWN
+            peak_pct = (entry - peak_high) / entry if entry > 0 else 0.0
+
+        floor_pct = _profit_lock_floor(peak_pct)
+        if floor_pct >= 0.0 and peak_pct > floor_pct:
+            # Compute the price below which we lock in (above for shorts).
+            if side == "BUY":
+                floor_price = entry * (1 + floor_pct)
+                breached = current_price <= floor_price
+            else:
+                floor_price = entry * (1 - floor_pct)
+                breached = current_price >= floor_price
+            if breached:
+                logging.info(
+                    "[LOCK_IN] %s %s: peak=%+.2f%% gave back to %+.2f%% "
+                    "(floor=%+.2f%%, entry=$%.4f, peak_px=$%.4f, exit_px=$%.4f)",
+                    trade.symbol, side, peak_pct * 100, pnl_pct * 100,
+                    floor_pct * 100, entry, peak_high, current_price,
+                )
+                self._log_exit(session, trade, "profit_lock_in", current_price, pnl_pct)
+                # Audit to ActivityLog so the operator can SEE the lock-in
+                # firing in the training console alongside fills.
+                try:
+                    session.add(ActivityLog(
+                        category="auto_exit",
+                        level="info",
+                        wallet_id=trade.wallet_id,
+                        message=(
+                            f"[LOCK_IN] {trade.symbol} {side}: peak +{peak_pct*100:.2f}% "
+                            f"-> exit at +{pnl_pct*100:.2f}% (floor +{floor_pct*100:.2f}%)"
+                        ),
+                    ))
+                except Exception:
+                    logging.debug("Failed to write LOCK_IN ActivityLog", exc_info=True)
+                return ExitSignal(
+                    trade_id=trade.id,
+                    symbol=trade.symbol,
+                    reason="profit_lock_in",
+                    current_price=current_price,
+                    trigger_price=floor_price,
+                    pnl_pct=pnl_pct,
+                )
+
+        # =====================================================================
         # STANDARD CHECKS (all styles)
         # =====================================================================
-        
+
         # 1. Check max loss (hard cap - 10% default)
         max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)
         if pnl_pct <= -max_loss:
@@ -776,6 +853,50 @@ class PositionMonitor:
                 wallet_id=trade.wallet_id,
             )
         )
+
+
+# =============================================================================
+# Profit lock-in floor — staircase of "minimum acceptable exit profit" tiers
+# =============================================================================
+# Once a trade's peak unrealized profit hits a tier, this function returns
+# the floor below which the trade MUST exit. Independent of trailing %.
+#
+# Invariant: floor is monotonically increasing in peak_pct. Each tier locks
+# in a fraction of the prior peak — small at low peaks (where chop dominates)
+# and tighter at higher peaks (where giving back is unacceptable).
+#
+# Returns -1.0 when the peak has not yet earned a floor (i.e. trade hasn't
+# made meaningful gains).
+#
+# Edit these tiers carefully — they're the source-of-truth for "we don't
+# give back a $20 peak to $2". Each row: (peak_pct, floor_pct) where
+# floor_pct is the minimum profit we accept on exit at that peak.
+_PROFIT_LOCK_TIERS = (
+    (0.005, 0.000),   # +0.5% peak: break-even floor (we won't go negative)
+    (0.010, 0.005),   # +1.0% peak: lock +0.5%
+    (0.020, 0.012),   # +2.0% peak: lock +1.2% (give back at most 0.8%)
+    (0.030, 0.022),   # +3.0% peak: lock +2.2%
+    (0.050, 0.040),   # +5.0% peak: lock +4.0%
+    (0.080, 0.065),   # +8.0% peak: lock +6.5%
+    (0.100, 0.085),   # +10% peak: lock +8.5%
+    (0.150, 0.130),   # +15% peak: lock +13%
+    (0.200, 0.180),   # +20% peak: lock +18%
+    (0.300, 0.270),   # +30% peak: lock +27%
+)
+
+
+def _profit_lock_floor(peak_pct: float) -> float:
+    """Return the minimum-acceptable exit profit for a given peak.
+
+    -1.0 means no floor yet (peak hasn't crossed the lowest tier).
+    """
+    floor = -1.0
+    for tier_peak, tier_floor in _PROFIT_LOCK_TIERS:
+        if peak_pct >= tier_peak:
+            floor = tier_floor
+        else:
+            break
+    return floor
 
 
 def initialize_trade_sl_tp(
