@@ -889,6 +889,104 @@ def breakout_signal(
 # ---------------------------------------------------------------------------- #
 
 
+def evaluate_entry_quality(
+    candles: list[dict[str, Any]],
+    side: str,
+) -> dict[str, Any]:
+    """
+    Reject-or-accept gate based on where current price sits relative to
+    market structure. Used to stop the bot from BUYing right under a wall
+    of resistance or SELLing right above support — both of which produce
+    "trade goes nowhere then drifts the wrong way" outcomes.
+
+    Returns:
+        {
+          "accept": bool,
+          "reason": str,
+          "headroom_pct": float,   # % distance to next resistance (BUY) or support (SELL)
+          "swing_high": float,
+          "swing_low": float,
+          "atr_pct": float,
+        }
+    """
+    if not candles or len(candles) < 30:
+        return {"accept": True, "reason": "insufficient bars for S/R check", "headroom_pct": 0.0}
+
+    swings = swing_levels(candles, lookback=30)
+    if not swings:
+        return {"accept": True, "reason": "no swings detected", "headroom_pct": 0.0}
+
+    last = float(candles[-1]["close"])
+    a = atr(candles, period=14) or 0.0
+    atr_pct = (a / last) if last > 0 else 0.0
+
+    if side == "BUY":
+        headroom = (swings["swing_high"] - last) / last if last > 0 else 0.0
+        # Reject BUYs with less headroom than 1.0x ATR — that's barely room
+        # to make 1R before hitting resistance. We need the target to be
+        # reachable WITHIN visible market structure.
+        min_headroom = max(0.008, atr_pct * 1.0)
+        if headroom < min_headroom:
+            return {
+                "accept": False,
+                "reason": (
+                    f"BUY rejected: only {headroom:.2%} headroom to swing high "
+                    f"${swings['swing_high']:.4f} (need {min_headroom:.2%})"
+                ),
+                "headroom_pct": headroom,
+                "swing_high": swings["swing_high"],
+                "swing_low": swings["swing_low"],
+                "atr_pct": atr_pct,
+            }
+    elif side == "SELL":
+        headroom = (last - swings["swing_low"]) / last if last > 0 else 0.0
+        min_headroom = max(0.008, atr_pct * 1.0)
+        if headroom < min_headroom:
+            return {
+                "accept": False,
+                "reason": (
+                    f"SELL rejected: only {headroom:.2%} headroom to swing low "
+                    f"${swings['swing_low']:.4f} (need {min_headroom:.2%})"
+                ),
+                "headroom_pct": headroom,
+                "swing_high": swings["swing_high"],
+                "swing_low": swings["swing_low"],
+                "atr_pct": atr_pct,
+            }
+    else:
+        return {"accept": True, "reason": "non-directional side", "headroom_pct": 0.0}
+
+    return {
+        "accept": True,
+        "reason": "S/R headroom OK",
+        "headroom_pct": headroom,
+        "swing_high": swings["swing_high"],
+        "swing_low": swings["swing_low"],
+        "atr_pct": atr_pct,
+    }
+
+
+def get_entry_candles(
+    product_id: str,
+    *,
+    tick_seconds: int | None = None,
+    lookback_bars: int = 100,
+) -> list[dict[str, Any]]:
+    """Convenience helper: fetch candles at the same granularity used by
+    `evaluate_symbol`, so the bot engine can run S/R + stop calculations on
+    the same data the signal saw."""
+    if tick_seconds is None:
+        granularity = 300
+    else:
+        if tick_seconds <= 10:
+            granularity = 60
+        elif tick_seconds <= 60:
+            granularity = 300
+        else:
+            granularity = 900
+    return get_candles(product_id, granularity=granularity, limit=lookback_bars)
+
+
 def evaluate_symbol(
     product_id: str,
     strategy_type: str,
@@ -1001,3 +1099,141 @@ def stop_take_levels(
             "atr": a,
         }
     return {}
+
+
+# ---------------------------------------------------------------------------- #
+# Swing-anchored stop / take-profit
+# ---------------------------------------------------------------------------- #
+# A stop placed at "round percentage X% below entry" is meaningless to the
+# market — price has no reason to respect it, so the trade frequently grinds
+# through it on noise. A stop placed just past the most recent swing low (for
+# longs) or swing high (for shorts) is anchored to a level where the market
+# has actually pivoted before; if price breaks that level our directional
+# thesis is genuinely wrong.
+
+
+def swing_levels(candles: list[dict[str, Any]], lookback: int = 30) -> dict[str, float]:
+    """Return the most recent swing high / swing low over `lookback` bars.
+
+    A "swing" here is the conventional 3-bar pattern: a bar whose high (or
+    low) is more extreme than its two neighbours on each side. Returns dict
+    with `swing_low` / `swing_high` (latest within lookback) and falls back
+    to absolute high/low if no clean swing was found.
+    """
+    if len(candles) < 7:
+        return {}
+    window = candles[-min(lookback, len(candles)):]
+    swing_high = max(float(c["high"]) for c in window)
+    swing_low = min(float(c["low"]) for c in window)
+    # Look for a more recent (closer to current bar) confirmed pivot. We
+    # walk backward from bar n-3 toward the start, checking 2-bar neighbours.
+    n = len(window)
+    for i in range(n - 3, 1, -1):
+        h = float(window[i]["high"])
+        l = float(window[i]["low"])
+        is_swing_high = (
+            h > float(window[i - 1]["high"])
+            and h > float(window[i - 2]["high"])
+            and h > float(window[i + 1]["high"])
+            and h > float(window[i + 2]["high"])
+        )
+        is_swing_low = (
+            l < float(window[i - 1]["low"])
+            and l < float(window[i - 2]["low"])
+            and l < float(window[i + 1]["low"])
+            and l < float(window[i + 2]["low"])
+        )
+        if is_swing_high and h < swing_high * 1.0001:
+            swing_high = h
+        if is_swing_low and l > swing_low * 0.9999:
+            swing_low = l
+    return {"swing_high": swing_high, "swing_low": swing_low}
+
+
+def smart_stops(
+    candles: list[dict[str, Any]],
+    side: str,
+    confidence: float,
+    *,
+    min_stop_pct: float = 0.012,
+    max_stop_pct: float = 0.06,
+    atr_period: int = 14,
+) -> dict[str, float]:
+    """
+    Compute volatility-AND-structure-aware stops for a fresh entry.
+
+    The stop is the WIDER of (a) `1.2x ATR` (so noise can't tag us out) and
+    (b) `entry - swing_low - 0.2x ATR buffer` (anchored to actual market
+    structure). Then clamped to [min_stop_pct, max_stop_pct] of entry so we
+    never bet the farm on a single trade.
+
+    Confidence does NOT widen the stop — high-confidence trades get the
+    SAME tight invalidation level. Confidence instead widens the take-profit
+    target so we let winners run further when conviction is strong.
+
+    Returns {} if data is insufficient.
+    """
+    if not candles or len(candles) < atr_period + 5:
+        return {}
+    a = atr(candles, period=atr_period)
+    if a is None or a <= 0:
+        return {}
+    swings = swing_levels(candles, lookback=30)
+    if not swings:
+        return {}
+    last = float(candles[-1]["close"])
+    if last <= 0:
+        return {}
+
+    atr_pct = a / last
+    atr_buffer = a * 0.20  # tiny buffer past the swing so we don't sit on it
+
+    if side == "BUY":
+        structural_stop = swings["swing_low"] - atr_buffer
+        atr_stop = last - 1.2 * a
+        # Use the WIDER of the two — whichever is further from price — but
+        # never wider than max_stop_pct.
+        stop_price = min(structural_stop, atr_stop)
+        stop_pct = (last - stop_price) / last
+    elif side == "SELL":
+        structural_stop = swings["swing_high"] + atr_buffer
+        atr_stop = last + 1.2 * a
+        stop_price = max(structural_stop, atr_stop)
+        stop_pct = (stop_price - last) / last
+    else:
+        return {}
+
+    stop_pct = max(min_stop_pct, min(max_stop_pct, stop_pct))
+
+    # ----- Take-profit: confidence-scaled R:R -----
+    # Base 2.0R, scaling up to 3.5R for high-conviction trades. Capped so
+    # the target stays inside reach of typical intraday moves.
+    rr = 2.0 + max(0.0, min(1.0, confidence)) * 1.5
+    tp_pct = stop_pct * rr
+
+    # Also cap TP at 1.5x recent range (high - low over lookback) — chasing
+    # a 12% target on a coin that hasn't moved 4% in a week is a phantom.
+    window = candles[-30:]
+    rng = max(float(c["high"]) for c in window) - min(float(c["low"]) for c in window)
+    if rng > 0:
+        max_tp_pct = (rng * 1.5) / last
+        tp_pct = min(tp_pct, max_tp_pct)
+
+    if side == "BUY":
+        sl_price = last * (1 - stop_pct)
+        tp_price = last * (1 + tp_pct)
+    else:
+        sl_price = last * (1 + stop_pct)
+        tp_price = last * (1 - tp_pct)
+
+    return {
+        "stop_loss": sl_price,
+        "take_profit": tp_price,
+        "stop_pct": stop_pct,
+        "tp_pct": tp_pct,
+        "atr": a,
+        "atr_pct": atr_pct,
+        "swing_high": swings["swing_high"],
+        "swing_low": swings["swing_low"],
+        "rr_ratio": rr,
+    }
