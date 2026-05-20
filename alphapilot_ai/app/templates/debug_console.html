@@ -377,7 +377,7 @@
   <div class="panel">
     <div class="panel-header">
       <div class="panel-title">
-        Risk & Trade Blocks
+        Trading Decisions, Filters &amp; Blocks
         <span class="panel-count" id="panel-risk-count">0</span>
       </div>
     </div>
@@ -518,31 +518,57 @@ function renderLogs() {
   }
   
   // Categorize for panels
-  const errors = filtered.filter(l => l.level === 'error');
-  const apiLogs = filtered.filter(l => l.category === 'api' || l.category === 'data' || l.category === 'websocket');
-  const riskLogs = filtered.filter(l => l.category === 'risk' || l.category === 'trade' || 
-    (l.message && (l.message.includes('BLOCK') || l.message.includes('REJECT'))));
+  // Tag-based routing — every bot/risk/trade rejection log is prefixed with a
+  // bracketed tag like [FILTER], [BLOCKED], [INTEL], [SLOT_CHECK], [SIZE *],
+  // [DRY RUN], [EXECUTING], [TRADE OPENED]. We match those so the panels
+  // actually mirror what the trading engine is reporting in real time —
+  // otherwise these messages only land in the Full Log and the user never
+  // sees *why* trades aren't executing.
+  const tagOf = (l) => {
+    const m = (l.message || '').match(/^\[([A-Z_ ]+)\]/);
+    return m ? m[1].trim().toUpperCase() : '';
+  };
+  const blockTags = new Set([
+    'FILTER', 'BLOCKED', 'INTEL', 'SLOT_CHECK', 'SKIP',
+    'SIZE WARN', 'SIZE OK', 'EXECUTING', 'TRADE OPENED',
+    'STOPS', 'DRY RUN', 'RISK REJECTED',
+  ]);
+  const apiTags = new Set(['API', 'PRICE', 'FETCH', 'WS', 'WEBSOCKET']);
+  const errors = filtered.filter(l => l.level === 'error' || l.level === 'exception');
+  const apiLogs = filtered.filter(l => {
+    const t = tagOf(l);
+    return l.category === 'api' || l.category === 'data' || l.category === 'websocket' || apiTags.has(t);
+  });
+  const riskLogs = filtered.filter(l => {
+    const t = tagOf(l);
+    if (l.category === 'risk' || l.category === 'trade') return true;
+    if (blockTags.has(t)) return true;
+    const msg = (l.message || '');
+    return msg.includes('BLOCK') || msg.includes('REJECT') || msg.includes('rejected') ||
+           msg.includes('Position too small') || msg.includes('Circuit breaker') ||
+           msg.includes('No new entry slots');
+  });
   const settingsLogs = filtered.filter(l => l.category === 'settings' || 
     (l.message && l.message.toLowerCase().includes('config')));
   
   // Render panels
   document.getElementById('panel-errors').innerHTML = errors.length 
-    ? errors.slice(0, 50).map(createLogEntry).join('')
+    ? errors.slice(0, 200).map(createLogEntry).join('')
     : '<div class="empty-state">No errors - system healthy</div>';
   document.getElementById('panel-errors-count').textContent = errors.length;
   
   document.getElementById('panel-api').innerHTML = apiLogs.length
-    ? apiLogs.slice(0, 50).map(createLogEntry).join('')
+    ? apiLogs.slice(0, 200).map(createLogEntry).join('')
     : '<div class="empty-state">No API issues detected</div>';
   document.getElementById('panel-api-count').textContent = apiLogs.length;
   
   document.getElementById('panel-risk').innerHTML = riskLogs.length
-    ? riskLogs.slice(0, 50).map(createLogEntry).join('')
-    : '<div class="empty-state">No risk blocks or trade issues</div>';
+    ? riskLogs.slice(0, 200).map(createLogEntry).join('')
+    : '<div class="empty-state">No trading decisions yet — start a session on the Training page.</div>';
   document.getElementById('panel-risk-count').textContent = riskLogs.length;
   
   document.getElementById('panel-settings').innerHTML = settingsLogs.length
-    ? settingsLogs.slice(0, 50).map(createLogEntry).join('')
+    ? settingsLogs.slice(0, 200).map(createLogEntry).join('')
     : '<div class="empty-state">No settings issues detected</div>';
   document.getElementById('panel-settings-count').textContent = settingsLogs.length;
   
