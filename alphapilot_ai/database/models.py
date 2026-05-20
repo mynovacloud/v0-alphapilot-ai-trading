@@ -155,9 +155,14 @@ class PaperTrade(Base):
     # Time-based exit: auto-close if position is older than N hours and flat.
     time_limit_hours = Column(Float, nullable=True)
 
-    # DCA / averaging support. `dca_count` tracks how many times we've added.
+    # DCA / averaging support. `dca_count` tracks how many times we've added
+    # on losses. `scale_in_count` is the inverse — pyramiding into winners.
+    # Keep them separate so a position that pyramided 3 times during an
+    # uptrend can still DCA once on the inevitable pullback.
     # `original_entry` preserves the first entry before any averaging.
     dca_count = Column(Integer, default=0)
+    scale_in_count = Column(Integer, default=0)
+    last_scale_in_at = Column(DateTime, nullable=True)
     original_entry = Column(Float, nullable=True)
 
     # Exit reason (for analytics): "sl" / "tp" / "trailing" / "max_loss" / "time" / "manual" / "signal"

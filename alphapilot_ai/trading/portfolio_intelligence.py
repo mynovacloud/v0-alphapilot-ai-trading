@@ -17,7 +17,7 @@ This runs at the START of every tick, BEFORE the regular entry evaluation.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any, TYPE_CHECKING
 
 from database.db import session_scope
@@ -241,6 +241,8 @@ class PortfolioIntelligence:
                     "entry_price": float(t.entry_price),
                     "qty": float(t.qty),
                     "dca_count": t.dca_count or 0,
+                    "scale_in_count": getattr(t, "scale_in_count", 0) or 0,
+                    "last_scale_in_at": getattr(t, "last_scale_in_at", None),
                     "original_entry": float(t.original_entry or t.entry_price),
                 }
                 for t in trades
@@ -365,57 +367,140 @@ class PortfolioIntelligence:
         cfg: "BotConfig",
     ) -> list[PortfolioAction]:
         """
-        Find winning positions worth adding to.
-        
-        "Let your winners run" - but also add to them when they're working.
+        Find winning positions worth pyramiding into ("ride the wave").
+
+        The classic trader move: you put a small position in, it moves your
+        way, you scale up and ride the trend. Done right this turns a 1R
+        winner into a 4R+ runner. Done wrong it concentrates risk into a
+        position right before it reverses.
+
+        Scale-in fires only when ALL of these are true:
+          * position is up at least `scale_in_at_profit_pct` from entry
+          * we haven't already pyramided `max_scale_ins` times
+          * cooldown since last scale-in has elapsed (prevents pyramiding
+            three times during a single 30-second vertical spike)
+          * fresh signal still agrees with our direction with conviction
+          * recent momentum confirms the move is still alive (price is
+            above its short-term EMA, not just sitting at a stale high)
+          * total exposure to this symbol stays under the per-symbol
+            concentration cap measured against TOTAL EQUITY (cash +
+            positions), not just open-position value
+          * we're not in recovery mode (capital should fund DCA first)
         """
         actions = []
-        
-        # Don't scale in if portfolio is in recovery mode
+
+        # Don't pyramid into winners while the portfolio is bleeding —
+        # available capital should be reserved for DCA / fixing losers.
         if state.is_recovery_mode:
             return actions
-        
+
+        # Concentration is measured against TOTAL EQUITY (positions + cash),
+        # not just open-position value. With 1-2 positions the latter would
+        # be ~100% by definition, blocking every scale-in we ever try. This
+        # was the silent bug that made pyramiding never fire in practice.
+        total_equity = state.total_value_usd + max(state.available_capital, 0.0)
+        if total_equity <= 0:
+            return actions
+
+        # Minimum cooldown between consecutive scale-ins on the same symbol.
+        # 5 minutes is enough that we add on confirmed continuation candles
+        # rather than on a single tick of a vertical wick.
+        scale_in_cooldown = timedelta(minutes=5)
+        now = datetime.utcnow()
+
         for trade in trades:
             current_price = price_map.get(trade["symbol"])
             if current_price is None:
                 continue
-            
+
             entry = trade["entry_price"]
             side = trade["side"]
-            
+            scale_in_count = trade.get("scale_in_count", 0)
+            last_scale_in = trade.get("last_scale_in_at")
+
+            if scale_in_count >= self.max_scale_ins:
+                continue
+
+            # Cooldown check
+            if last_scale_in is not None and (now - last_scale_in) < scale_in_cooldown:
+                continue
+
             # Calculate profit percentage
             if side == "BUY":
                 profit_pct = (current_price - entry) / entry if entry > 0 else 0
             else:
                 profit_pct = (entry - current_price) / entry if entry > 0 else 0
-            
-            # Only scale in if we're up enough
+
             if profit_pct < self.scale_in_at_profit_pct:
                 continue
-            
-            # Check concentration limit
-            position_value = trade["qty"] * current_price
-            if position_value / state.total_value_usd > self.max_portfolio_concentration_pct:
+
+            # Per-symbol concentration cap against TOTAL equity. We project
+            # what concentration would BECOME after the proposed add, not
+            # what it is now — otherwise a position right at the cap is
+            # forever frozen.
+            current_position_value = trade["qty"] * current_price
+            current_concentration = current_position_value / total_equity
+            if current_concentration > self.max_portfolio_concentration_pct:
                 continue
-            
-            # Check if signal is still strong
+
+            # Momentum confirmation — only pyramid into a position that is
+            # ACTIVELY trending in our favor. A stale +5% from yesterday
+            # that's been chopping all day is not a wave to ride.
+            try:
+                from connectors.candles import get_candles
+                candles = get_candles(trade["symbol"], granularity=300, limit=12)
+            except Exception:
+                candles = []
+            if len(candles) < 6:
+                # Without recent data we can't confirm the trend is alive.
+                # Skip rather than risk pyramiding into a fakeout.
+                continue
+            closes = [float(c.get("close", 0)) for c in candles if c.get("close")]
+            if len(closes) < 6:
+                continue
+            short_ema = sum(closes[-6:]) / 6.0
+            momentum_ok = (
+                (side == "BUY" and current_price > short_ema and closes[-1] > closes[-3])
+                or (side == "SELL" and current_price < short_ema and closes[-1] < closes[-3])
+            )
+            if not momentum_ok:
+                continue
+
+            # Re-evaluate the strategy signal
             signal = evaluate_symbol(trade["symbol"], cfg.default_strategy_type)
             signal_side = (signal.side or "HOLD").upper()
-            
             if signal_side != side:
                 continue
-            
-            if float(signal.confidence or 0) < 0.55:
+
+            sig_conf = float(signal.confidence or 0)
+            # Pyramiding requires HIGHER conviction than the original entry,
+            # because we're adding risk on top of a position already in
+            # profit. A weak 0.55 signal that opened the trade isn't enough.
+            if sig_conf < 0.62:
                 continue
-            
-            # Calculate scale-in size
-            current_value = trade["qty"] * current_price
-            scale_size = current_value * self.scale_in_size_pct
-            scale_size = min(scale_size, state.available_capital * 0.25)
-            
+
+            # Scale off ORIGINAL entry value, not current. Otherwise each
+            # successive add compounds: $100 -> $150 -> $225 -> $337.
+            original_value = trade["original_entry"] * trade["qty"] / max(
+                1, 1 + scale_in_count
+            )
+            scale_size = original_value * self.scale_in_size_pct
+
+            # Cap by what the new concentration would be after the add.
+            max_add_for_concentration = max(
+                0.0,
+                (self.max_portfolio_concentration_pct * total_equity)
+                - current_position_value,
+            )
+            scale_size = min(
+                scale_size,
+                max_add_for_concentration,
+                state.available_capital * 0.25,
+            )
+
             if scale_size < 10:
                 continue
-            
+
             actions.append(PortfolioAction(
                 action_type="scale_in",
                 trade_id=trade["id"],
@@ -423,14 +508,15 @@ class PortfolioIntelligence:
                 side=side,
                 size_usd=scale_size,
                 reason=(
-                    f"Scale-in: {trade['symbol']} up {profit_pct:.1%}, "
-                    f"signal still strong ({signal.confidence:.2f}). "
-                    f"Adding ${scale_size:.0f} to winner."
+                    f"Pyramid: {trade['symbol']} up {profit_pct:.1%} ({side}), "
+                    f"momentum confirmed (last {closes[-1]:.4f} > ema6 {short_ema:.4f}), "
+                    f"signal conf {sig_conf:.2f}. Adding ${scale_size:.0f} "
+                    f"(scale-in #{scale_in_count + 1}/{self.max_scale_ins})."
                 ),
-                priority=4,  # Lower priority than DCA (recovery first)
-                confidence=float(signal.confidence or 0.5),
+                priority=4,  # Lower than DCA (recovery first)
+                confidence=sig_conf,
             ))
-        
+
         return actions
     
     def _find_offset_opportunities(
@@ -572,26 +658,49 @@ def execute_portfolio_action(
             
             current_price = float(current["price"])
             add_qty = action.size_usd / current_price
-            
-            recovery = LossRecoveryEngine()
+
             with session_scope() as s:
                 trade = s.query(PaperTrade).filter(PaperTrade.id == action.trade_id).first()
                 if trade and trade.status == "open":
-                    # For scale-in, we directly update qty (no need for avg entry recalc)
+                    # Pyramiding mechanics:
+                    #   - preserve `original_entry` so we can always reason
+                    #     about the trade's true risk/reward from the start
+                    #   - update weighted-average entry so SL/TP math stays
+                    #     coherent and the next pyramid round's "up X%"
+                    #     check is measured from the new effective basis
+                    #   - bump scale_in_count + stamp last_scale_in_at so
+                    #     the cooldown gate works on subsequent ticks
                     old_qty = float(trade.qty)
-                    trade.qty = old_qty + add_qty
-                    
+                    old_entry = float(trade.entry_price)
+                    if trade.original_entry is None:
+                        trade.original_entry = old_entry
+
+                    new_qty = old_qty + add_qty
+                    if new_qty > 0:
+                        trade.entry_price = (
+                            (old_qty * old_entry) + (add_qty * current_price)
+                        ) / new_qty
+                    trade.qty = new_qty
+                    trade.scale_in_count = (getattr(trade, "scale_in_count", 0) or 0) + 1
+                    trade.last_scale_in_at = datetime.utcnow()
+
                     s.add(ActivityLog(
                         category="portfolio_intel",
                         level="info",
-                        message=f"Scale-in executed: {action.reason}",
+                        message=(
+                            f"Scale-in #{trade.scale_in_count}: added "
+                            f"{add_qty:.6f} {trade.symbol} @ ${current_price:.4f}. "
+                            f"New avg entry ${trade.entry_price:.4f} "
+                            f"(orig ${trade.original_entry:.4f}). {action.reason}"
+                        ),
                         wallet_id=wallet_id,
                     ))
                     s.commit()
-                    
+
                     result["ok"] = True
                     result["added_qty"] = add_qty
                     result["added_usd"] = action.size_usd
+                    result["scale_in_count"] = trade.scale_in_count
                 else:
                     result["error"] = "Trade not found or not open"
         

@@ -102,6 +102,16 @@ def _migrate_schema() -> None:
             ("max_loss_pct", "FLOAT DEFAULT 0.10"),
             ("time_limit_hours", "FLOAT"),
             ("dca_count", "INTEGER DEFAULT 0"),
+            # Scale-in (pyramiding) tracker — separate from `dca_count`.
+            # DCA = "average down on a loser to lower cost basis"
+            # Scale-in = "pyramid into a winner to ride the trend"
+            # These need separate counters because a position that
+            # pyramided 3 times during an uptrend should still be allowed
+            # to DCA on the eventual pullback.
+            ("scale_in_count", "INTEGER DEFAULT 0"),
+            # When the most recent scale-in occurred — used for cooldowns
+            # so we don't pyramid 3x in 30 seconds during a vertical spike.
+            ("last_scale_in_at", "DATETIME"),
             ("original_entry", "FLOAT"),
             ("exit_reason", "VARCHAR(30)"),
             # Breakeven stop columns - move stop to lock in small profit

@@ -54,7 +54,6 @@
   const tickInfo = document.getElementById("live-tick-info");
   const decCountEl = document.getElementById("live-decision-count");
   const fillCountEl = document.getElementById("live-fill-count");
-  const hideHoldsToggle = document.getElementById("live-decision-hide-holds");
 
   // --- State ---
   const state = {
@@ -62,22 +61,9 @@
     timer: null,
     cursors: { decision_id: 0, log_id: 0, trade_id: 0 },
     decisionCount: 0,
-    actionableCount: 0,
     fillCount: 0,
     sessionActive: false,
   };
-
-  // Toggle visibility of HOLD entries without re-fetching. Each rendered
-  // decision card carries data-action="HOLD"|"BUY"|... so we can show/hide
-  // them with a single class flip on the parent feed.
-  function applyDecisionFilter() {
-    if (!decisionFeed) return;
-    const hide = !!(hideHoldsToggle && hideHoldsToggle.checked);
-    decisionFeed.classList.toggle("hide-holds", hide);
-  }
-  if (hideHoldsToggle) {
-    hideHoldsToggle.addEventListener("change", applyDecisionFilter);
-  }
 
   // --- Helpers ---
   function fmtMoney(v) {
@@ -109,12 +95,6 @@
     if (!ts) return "";
     const d = new Date(ts * 1000);
     return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  }
-  // Full ISO timestamp in UTC for tooltip — useful when correlating with
-  // server logs which are timestamped in UTC.
-  function utcTooltipFor(ts) {
-    if (!ts) return "";
-    return new Date(ts * 1000).toISOString().replace("T", " ").replace("Z", " UTC");
   }
   function trimFeed(el) {
     while (el.children.length > MAX_FEED_ITEMS) {
@@ -223,119 +203,30 @@
     if (a === "CLOSE") return { color: "var(--accent,#4aa3ff)", icon: "■" };
     return { color: "var(--text-muted)", icon: "◇" }; // HOLD / other
   }
-  // The `source` column on ClaudeDecision tracks which code path produced
-  // the row. Surface it as a tiny colored badge so you can see at a glance
-  // whether Claude actually weighed in or it was a passthrough/fallback.
-  //   claude              → real Anthropic API call, parsed cleanly
-  //   technical_strong    → tech conf high enough to skip Claude (saves $)
-  //   training_passthrough→ same, but during a training session
-  //   tech_hold           → technical signal said HOLD, Claude not called
-  //   cache               → reused a recent identical Claude decision
-  //   budget_fallback     → daily Claude budget exhausted
-  //   technical / fallback→ Claude failed (network, JSON parse), used tech
-  function sourceBadgeStyle(src) {
-    const s = String(src || "").toLowerCase();
-    if (s === "claude") return { label: "claude", bg: "rgba(74,163,255,0.18)", fg: "#7cb9ff" };
-    if (s === "technical_strong") return { label: "tech-strong", bg: "rgba(38,194,129,0.18)", fg: "#5fdca0" };
-    if (s === "training_passthrough") return { label: "passthrough", bg: "rgba(38,194,129,0.18)", fg: "#5fdca0" };
-    if (s === "tech_hold") return { label: "tech-hold", bg: "rgba(160,160,160,0.18)", fg: "var(--text-muted)" };
-    if (s === "cache") return { label: "cache", bg: "rgba(212,175,55,0.18)", fg: "#d4af37" };
-    if (s === "budget_fallback") return { label: "budget", bg: "rgba(255,107,107,0.18)", fg: "#ff8b8b" };
-    if (s === "fallback" || s === "technical") return { label: "fallback", bg: "rgba(255,107,107,0.18)", fg: "#ff8b8b" };
-    return { label: s || "?", bg: "rgba(160,160,160,0.18)", fg: "var(--text-muted)" };
-  }
   function renderDecision(d) {
-    const action = (d.action || "HOLD").toUpperCase();
-    const isActionable = !!d.actionable && action !== "HOLD";
-    const st = actionStyle(action);
+    const st = actionStyle(d.action);
     const conf = (d.confidence || 0).toFixed(2);
-    const techConf = (d.technical_confidence || 0).toFixed(2);
-    const techSide = (d.technical_side || "?").toUpperCase();
-    const src = sourceBadgeStyle(d.source);
-    const localTime = clockFor(d.ts);
-    const utcTime = utcTooltipFor(d.ts);
-
-    // Show the tech→Claude delta only when something actually changed —
-    // either the side flipped (tech said BUY, Claude said HOLD) or the
-    // confidence shifted by more than 0.05. Otherwise it's just noise.
-    const sideFlipped = techSide !== action && techSide !== "?" && action !== "?";
-    const confDelta = Math.abs((d.confidence || 0) - (d.technical_confidence || 0));
-    const showDelta = sideFlipped || confDelta > 0.05;
-
-    // Only show key_factors / risk_flags when present and there's something
-    // actionable to read — for HOLD/0.00 these are usually empty anyway.
-    const factors = Array.isArray(d.key_factors) ? d.key_factors.slice(0, 4) : [];
-    const flags = Array.isArray(d.risk_flags) ? d.risk_flags.slice(0, 3) : [];
-
     const node = document.createElement("div");
-    node.dataset.action = action;
-    node.dataset.actionable = isActionable ? "1" : "0";
     node.style.cssText =
       "padding:0.4rem 0.5rem;background:var(--bg);border:1px solid var(--border);" +
-      "border-left:3px solid " + st.color + ";border-radius:var(--radius-sm);" +
-      // Subtle dimming for non-actionable rows so the actionable ones pop.
-      (isActionable ? "" : "opacity:0.62;");
-
-    let html =
+      "border-left:3px solid " + st.color + ";border-radius:var(--radius-sm);";
+    node.innerHTML =
       '<div class="flex items-center justify-between" style="gap:0.4rem;">' +
         '<span style="color:' + st.color + ';font-weight:700;">' +
-          st.icon + " " + escapeHtml(action) + "</span>" +
-        '<span class="mono" style="font-weight:700;">' + escapeHtml(d.symbol || "?") + "</span>" +
-        '<span class="text-dim mono" style="font-size:0.7rem;" title="' + escapeHtml(utcTime) + '">' +
-          escapeHtml(localTime) + "</span>" +
+          st.icon + " " + escapeHtml(d.action) + "</span>" +
+        '<span class="mono" style="font-weight:700;">' + escapeHtml(d.symbol) + "</span>" +
+        '<span class="text-dim" style="font-size:0.7rem;">' + clockFor(d.ts) + "</span>" +
       "</div>" +
-      '<div class="flex items-center" style="gap:0.4rem;flex-wrap:wrap;font-size:0.7rem;margin-top:0.2rem;">' +
-        '<span style="background:' + src.bg + ';color:' + src.fg +
-          ';padding:0.05rem 0.3rem;border-radius:3px;font-weight:600;letter-spacing:0.04em;">' +
-          escapeHtml(src.label) + "</span>" +
-        '<span class="text-dim">@ ' + fmtPrice(d.price) + "</span>" +
-        '<span class="text-dim">conf <span style="color:var(--text);font-weight:600;">' +
-          conf + "</span></span>" +
-        '<span class="text-dim">sl ' + (d.stop_loss_pct * 100).toFixed(1) + "%</span>" +
-        '<span class="text-dim">tp ' + (d.take_profit_pct * 100).toFixed(1) + "%</span>" +
-      "</div>";
-
-    // Tech vs Claude delta — only when meaningful.
-    if (showDelta) {
-      const flipColor = sideFlipped ? "var(--accent,#4aa3ff)" : "var(--text-muted)";
-      html +=
-        '<div class="text-dim" style="font-size:0.68rem;margin-top:0.2rem;">' +
-          'tech ' + escapeHtml(techSide) + " " + techConf +
-          ' <span style="color:' + flipColor + ';">→</span> ' +
-          escapeHtml(action) + " " + conf +
-          (sideFlipped ? ' <span style="color:' + flipColor + ';">(side flip)</span>' : "") +
-        "</div>";
-    }
-
-    if (d.rationale) {
-      html +=
-        '<div style="font-size:0.72rem;margin-top:0.25rem;color:var(--text);opacity:0.9;line-height:1.45;">' +
-          escapeHtml(d.rationale) + "</div>";
-    }
-
-    if (factors.length) {
-      html +=
-        '<div class="flex" style="gap:0.25rem;flex-wrap:wrap;margin-top:0.25rem;">' +
-          factors.map(function (f) {
-            return '<span class="mono text-dim" style="font-size:0.64rem;background:var(--bg-elev);' +
-              'padding:0.05rem 0.3rem;border-radius:3px;border:1px solid var(--border);">' +
-              escapeHtml(f) + "</span>";
-          }).join("") +
-        "</div>";
-    }
-
-    if (flags.length) {
-      html +=
-        '<div class="flex" style="gap:0.25rem;flex-wrap:wrap;margin-top:0.2rem;">' +
-          flags.map(function (f) {
-            return '<span class="mono" style="font-size:0.64rem;background:rgba(255,107,107,0.12);' +
-              'color:#ff8b8b;padding:0.05rem 0.3rem;border-radius:3px;">⚠ ' +
-              escapeHtml(f) + "</span>";
-          }).join("") +
-        "</div>";
-    }
-
-    node.innerHTML = html;
+      '<div class="text-dim" style="font-size:0.7rem;margin-top:0.2rem;">' +
+        "@ " + fmtPrice(d.price) + " · conf " + conf +
+        " · sl " + (d.stop_loss_pct * 100).toFixed(1) + "%" +
+        " · tp " + (d.take_profit_pct * 100).toFixed(1) + "%" +
+        " · src " + escapeHtml(d.source || "?") +
+      "</div>" +
+      (d.rationale
+        ? '<div style="font-size:0.72rem;margin-top:0.25rem;color:var(--text);opacity:0.85;">' +
+            escapeHtml(d.rationale) + "</div>"
+        : "");
     decisionFeed.insertBefore(node, decisionFeed.firstChild);
     trimFeed(decisionFeed);
   }
@@ -420,12 +311,7 @@
 
         if (data.decisions && data.decisions.length) {
           state.decisionCount += data.decisions.length;
-          // Track BUY/SELL/CLOSE separately so the user can see the
-          // signal-to-noise ratio at a glance ("3 actionable out of 412").
-          for (const d of data.decisions) {
-            if (d && d.actionable) state.actionableCount += 1;
-          }
-          decCountEl.textContent = state.actionableCount + " / " + state.decisionCount;
+          decCountEl.textContent = state.decisionCount;
         }
         if (data.fills && data.fills.length) {
           state.fillCount += data.fills.length;
@@ -746,9 +632,6 @@
   // detects an already-running session (e.g. if the user reloaded mid-run).
   // Also re-check kill switch state every 10s so a daily-loss event that
   // re-engages it mid-session is surfaced immediately.
-  // Apply the "actionable only" filter immediately on load so the default
-  // checked state is honored before the first tick arrives.
-  applyDecisionFilter();
   hydrateSettings().then(pollOnce).then(() => {
     if (state.sessionActive) startPolling();
   });
