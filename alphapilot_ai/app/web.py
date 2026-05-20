@@ -2032,6 +2032,14 @@ def training_memory_consolidate() -> RedirectResponse:
     return RedirectResponse(url="/training", status_code=303)
 
 
+@router.post("/training/memory/compact")
+def training_memory_compact() -> RedirectResponse:
+    """Offline merge of duplicate playbook entries (no Claude required)."""
+    from ai.claude_learning import compact_playbook_offline
+    compact_playbook_offline()
+    return RedirectResponse(url="/training", status_code=303)
+
+
 @router.post("/training/memory/meta-analyze")
 def training_memory_meta_analyze() -> RedirectResponse:
     """

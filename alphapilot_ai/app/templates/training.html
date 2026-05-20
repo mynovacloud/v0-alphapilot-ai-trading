@@ -9,6 +9,9 @@
     <p>This is where the Claude bot learns to trade. Every paper trade produces a reflection, every reflection updates the playbook, and every playbook rule shapes the next decision. The bot graduates to live trading only when its readiness score is high enough.</p>
   </div>
 <div class="flex gap-2">
+<form method="post" action="/training/memory/compact">
+<button class="btn" type="submit" title="Offline: merge near-duplicate rules and reinforce the canonical phrasing. No Claude call needed.">Compact Duplicates</button>
+</form>
 <form method="post" action="/training/memory/consolidate">
 <button class="btn" type="submit" {{ '' if claude_configured else 'disabled' }} title="Ask Claude to merge duplicate rules and re-rank weights">Consolidate Playbook</button>
 </form>

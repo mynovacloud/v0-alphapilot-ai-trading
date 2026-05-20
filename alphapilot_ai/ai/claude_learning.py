@@ -438,6 +438,77 @@ def consolidate_lessons() -> dict[str, Any]:
     return {"ok": True, "applied": applied}
 
 
+def compact_playbook_offline() -> dict[str, Any]:
+    """Collapse near-duplicate playbook entries WITHOUT calling Claude.
+
+    Walks every AILearningMemory row, groups them by normalized-token Jaccard
+    similarity (same threshold used at save-time), and within each group
+    keeps the highest-weight phrasing while accumulating sibling weights into
+    it (capped at 5.0). Used to clean up an already-bloated playbook — e.g.
+    the user had 100 rules that were really ~15 distinct insights repeated
+    with different wording. Returns counts of merged/kept rows.
+
+    This is intentionally cheaper and more deterministic than
+    `consolidate_lessons`, which round-trips to Claude and has been observed
+    to leave duplicate clusters intact.
+    """
+    with session_scope() as s:
+        rows = (
+            s.query(AILearningMemory)
+            .order_by(AILearningMemory.weight.desc(), AILearningMemory.id.asc())
+            .all()
+        )
+        if len(rows) < 2:
+            return {"ok": True, "skipped": True, "kept": len(rows), "merged": 0}
+
+        # Greedy union-find by Jaccard. We seed clusters with the
+        # highest-weight rule first, so smaller paraphrases get folded INTO
+        # the canonical phrasing.
+        normalized = [_normalize_lesson(r.content or "") for r in rows]
+        cluster_of: dict[int, int] = {}  # row.id -> canonical row.id
+        for i, row_i in enumerate(rows):
+            if row_i.id in cluster_of:
+                continue
+            cluster_of[row_i.id] = row_i.id
+            for j in range(i + 1, len(rows)):
+                row_j = rows[j]
+                if row_j.id in cluster_of:
+                    continue
+                if _jaccard(normalized[i], normalized[j]) >= _DEDUP_SIMILARITY_THRESHOLD:
+                    cluster_of[row_j.id] = row_i.id
+
+        # Group siblings.
+        siblings: dict[int, list[Any]] = {}
+        for row in rows:
+            canon_id = cluster_of[row.id]
+            siblings.setdefault(canon_id, []).append(row)
+
+        merged = 0
+        for canon_id, group in siblings.items():
+            if len(group) <= 1:
+                continue
+            canonical = next(r for r in group if r.id == canon_id)
+            # Sum weights with damping (sqrt) so a 30-row pileup doesn't
+            # immediately peg the rule at the cap; we still want repeated
+            # firings to push it up, but proportionally.
+            total = float(canonical.weight or 0.0)
+            for r in group:
+                if r.id == canon_id:
+                    continue
+                total += float(r.weight or 0.0) * 0.5
+                s.delete(r)
+                merged += 1
+            canonical.weight = max(0.05, min(total, 5.0))
+
+        s.add(ActivityLog(
+            category="ai",
+            level="info",
+            message=f"Playbook compacted offline: merged {merged} duplicates, kept {len(rows) - merged}.",
+        ))
+
+    return {"ok": True, "merged": merged, "kept": len(rows) - merged}
+
+
 def reset_playbook() -> dict[str, Any]:
     """Wipe the entire learned playbook. Used from the Training UI."""
     with session_scope() as s:
@@ -772,6 +843,46 @@ def recent_decisions(limit: int = 25) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------- #
 
 
+def _normalize_lesson(text: str) -> str:
+    """Normalize lesson text for fuzzy duplicate detection.
+
+    Strips punctuation, collapses whitespace, lowercases, and drops common
+    filler tokens so two phrasings of the same insight collapse to the same
+    bag-of-words key. Used to detect when a "new" lesson is really a
+    restatement of one already in the playbook.
+    """
+    import re
+    s = (text or "").lower()
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    # Drop tiny/uninformative tokens; the structural words like "do", "not",
+    # "when" are what keeps two opposite rules from collapsing to the same
+    # signature, so we keep them. Numbers are stripped because exact thresholds
+    # ("0.5x", "0.1x", "30%", etc.) shouldn't make an otherwise-duplicate
+    # lesson look novel.
+    tokens = [t for t in s.split() if t and not t.isdigit() and len(t) > 1]
+    return " ".join(sorted(set(tokens)))
+
+
+def _jaccard(a: str, b: str) -> float:
+    """Jaccard similarity over normalized token sets."""
+    sa = set(a.split())
+    sb = set(b.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+# Rules whose normalized token sets overlap by >= this threshold are treated
+# as the SAME rule. 0.72 is empirically tight enough to keep "do not buy when
+# RSI < 30" distinct from "do not sell when RSI < 30" while collapsing the
+# 30+ paraphrases of "contradictory divergence patterns = noise" into one.
+_DEDUP_SIMILARITY_THRESHOLD = 0.72
+
+# Per-repeat weight increment when a duplicate fires. Capped at 5.0 globally
+# so a loud insight crowds out noise but can't infinitely dominate.
+_DEDUP_WEIGHT_BOOST = 0.15
+
+
 def _save_reflection(
     *,
     trade_id: int,
@@ -798,27 +909,80 @@ def _save_reflection(
         s.flush()
         ref_id = ref.id
 
-        # Promote each lesson to AILearningMemory.
+        # Promote each lesson to AILearningMemory — but DEDUP first.
+        # Claude generates 2-5 lessons per losing trade and tends to repeat
+        # the same insight with slightly different wording each time. Without
+        # dedup the playbook bloats to hundreds of near-duplicates (we had
+        # 30+ rules about "contradictory divergence patterns = noise" before
+        # this fix). Instead, when a near-duplicate fires we reinforce the
+        # existing rule by bumping its weight — so "we keep getting burned
+        # by this" becomes a strong, single rule rather than 30 weak ones.
+        existing_rules: list[tuple[Any, str]] = []
+        for row in s.query(AILearningMemory).all():
+            if row.content:
+                existing_rules.append((row, _normalize_lesson(row.content)))
+
+        added = 0
+        reinforced = 0
         for lesson in lessons:
             content = str(lesson.get("content", "")).strip()
             if not content:
                 continue
-            s.add(AILearningMemory(
-                category=str(lesson.get("category", "lesson"))[:60],
-                content=content[:2000],
-                weight=max(0.05, min(float(lesson.get("weight", 1.0) or 1.0), 5.0)),
-            ))
+            new_norm = _normalize_lesson(content)
+            new_weight = max(0.05, min(float(lesson.get("weight", 1.0) or 1.0), 5.0))
+
+            # Find best fuzzy match against existing playbook.
+            best_row = None
+            best_sim = 0.0
+            for row, row_norm in existing_rules:
+                sim = _jaccard(new_norm, row_norm)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_row = row
+
+            if best_row is not None and best_sim >= _DEDUP_SIMILARITY_THRESHOLD:
+                # Same insight — reinforce instead of cloning. Bump weight
+                # toward the higher of (existing, lesson_weight + boost) so a
+                # repeatedly-fired rule converges to the cap quickly.
+                target = max(float(best_row.weight or 0.0), new_weight) + _DEDUP_WEIGHT_BOOST
+                best_row.weight = max(0.05, min(target, 5.0))
+                # Replace the stored content if Claude's new phrasing is
+                # meaningfully shorter and the categories agree — keeps the
+                # playbook from drifting toward verbose paraphrases.
+                if (
+                    str(lesson.get("category", "lesson")) == (best_row.category or "")
+                    and 0 < len(content) < len(best_row.content or "") * 0.8
+                ):
+                    best_row.content = content[:2000]
+                reinforced += 1
+            else:
+                row = AILearningMemory(
+                    category=str(lesson.get("category", "lesson"))[:60],
+                    content=content[:2000],
+                    weight=new_weight,
+                )
+                s.add(row)
+                # Add to in-memory list so subsequent lessons in the SAME
+                # reflection also dedup against it.
+                existing_rules.append((row, new_norm))
+                added += 1
 
         s.add(ActivityLog(
             category="ai",
             level="info",
             message=(
                 f"Reflection saved for trade #{trade_id}: verdict={verdict}, "
-                f"score={score:.2f}, lessons={len(lessons)}"
+                f"score={score:.2f}, lessons={len(lessons)} "
+                f"(new={added}, reinforced={reinforced})"
             ),
         ))
 
-    return {"ok": True, "reflection_id": ref_id, "lessons_added": len(lessons)}
+    return {
+        "ok": True,
+        "reflection_id": ref_id,
+        "lessons_added": added,
+        "lessons_reinforced": reinforced,
+    }
 
 
 def _decision_to_dict(d: ClaudeDecision) -> dict[str, Any]:

@@ -419,6 +419,32 @@ class PatternRecognizer:
                         last_seen=utcnow(),
                     ))
         
+        # =====================================================================
+        # CONFLICT SUPPRESSION
+        # =====================================================================
+        # Several pattern pairs are mutually exclusive in reality but the
+        # naive condition checks above can fire BOTH simultaneously when the
+        # market_state is ambiguous (e.g. divergence_type was set to ""). The
+        # learned playbook has dozens of duplicated rules saying "when both
+        # divergence_bullish AND divergence_bearish fire, the signal is
+        # noise" — so codify that here once instead of relearning it every
+        # losing trade. When a conflicting pair is matched together, drop
+        # BOTH so the pattern layer contributes zero directional bias and
+        # Claude doesn't have to babysit it.
+        _CONFLICT_PAIRS = (
+            ("divergence_bullish", "divergence_bearish"),
+            ("mtf_alignment_bullish", "mtf_alignment_bearish"),
+            ("fear_capitulation", "greed_exhaustion"),
+        )
+        matched_names = {p.name for p in matched}
+        suppressed: set[str] = set()
+        for a, b in _CONFLICT_PAIRS:
+            if a in matched_names and b in matched_names:
+                suppressed.add(a)
+                suppressed.add(b)
+        if suppressed:
+            matched = [p for p in matched if p.name not in suppressed]
+
         return matched
     
     def _check_conditions(self, state: dict, conditions: dict) -> bool:
