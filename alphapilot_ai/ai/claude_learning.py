@@ -292,6 +292,12 @@ def record_trade_outcome(trade_id: int) -> dict[str, Any]:
         # Claude room to complete the JSON; cost is bounded by daily budget.
         max_tokens=2000,
         temperature=0.2,
+        # 30s default was timing out on every reflection because the read
+        # phase scales with output size and a 2000-token nested JSON takes
+        # longer than a 700-token decision response. 120s gives a comfortable
+        # margin for the longest plausible reflection. Errors are still
+        # caught and persisted as empty reflections with the cause logged.
+        timeout=120.0,
     )
     if not result.get("ok"):
         return _save_reflection(
