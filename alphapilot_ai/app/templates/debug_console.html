@@ -1,0 +1,471 @@
+{% extends "base.html" %}
+{% block title %}Debug Console — {{ app_name }}{% endblock %}
+{% block topbar %}Debug Console{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <div>
+    <h1>System Debug Console</h1>
+    <p>Real-time error tracking, system diagnostics, and trade execution logs. Everything is persisted and timestamped.</p>
+  </div>
+  <div class="flex gap-2">
+    <button class="btn btn-danger" onclick="clearLogs()">Clear All Logs</button>
+    <button class="btn" onclick="exportLogs()">Export Logs</button>
+    <button class="btn btn-primary" onclick="refreshLogs()">Refresh Now</button>
+  </div>
+</div>
+
+<style>
+  .debug-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 1200px) {
+    .debug-grid { grid-template-columns: 1fr; }
+  }
+  .log-container {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-height: 500px;
+    overflow-y: auto;
+  }
+  .log-header {
+    position: sticky;
+    top: 0;
+    background: var(--bg-card);
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    z-index: 10;
+  }
+  .log-header h3 {
+    margin: 0;
+    font-size: 0.9rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .log-count {
+    background: var(--accent);
+    color: var(--bg);
+    padding: 0.15rem 0.5rem;
+    border-radius: 10px;
+    font-size: 0.7rem;
+    font-weight: 600;
+  }
+  .log-count.error { background: var(--bad); }
+  .log-count.warning { background: #f59e0b; }
+  .log-count.success { background: var(--good); }
+  .log-body {
+    padding: 0;
+  }
+  .log-entry {
+    padding: 0.5rem 1rem;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+  }
+  .log-entry:last-child { border-bottom: none; }
+  .log-entry.error { background: rgba(239, 68, 68, 0.1); border-left: 3px solid var(--bad); }
+  .log-entry.warning { background: rgba(245, 158, 11, 0.1); border-left: 3px solid #f59e0b; }
+  .log-entry.success { background: rgba(34, 197, 94, 0.1); border-left: 3px solid var(--good); }
+  .log-entry.info { border-left: 3px solid var(--accent); }
+  .log-entry.debug { border-left: 3px solid var(--text-dim); opacity: 0.8; }
+  .log-time {
+    color: var(--text-dim);
+    font-size: 0.7rem;
+    margin-bottom: 0.25rem;
+  }
+  .log-source {
+    display: inline-block;
+    background: var(--bg-hover);
+    padding: 0.1rem 0.4rem;
+    border-radius: 4px;
+    font-size: 0.65rem;
+    margin-right: 0.5rem;
+    text-transform: uppercase;
+  }
+  .log-message {
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+  .log-message code {
+    background: var(--bg-hover);
+    padding: 0.1rem 0.3rem;
+    border-radius: 3px;
+  }
+  .empty-state {
+    padding: 2rem;
+    text-align: center;
+    color: var(--text-dim);
+  }
+  
+  /* Stats cards */
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+  .stat-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem;
+    text-align: center;
+  }
+  .stat-value {
+    font-size: 1.5rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+  }
+  .stat-value.error { color: var(--bad); }
+  .stat-value.warning { color: #f59e0b; }
+  .stat-value.success { color: var(--good); }
+  .stat-label {
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    margin-top: 0.25rem;
+  }
+  
+  /* Filters */
+  .filter-bar {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+  .filter-btn {
+    padding: 0.4rem 0.8rem;
+    border: 1px solid var(--border);
+    background: var(--bg-card);
+    border-radius: 6px;
+    font-size: 0.75rem;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .filter-btn:hover { background: var(--bg-hover); }
+  .filter-btn.active { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+  
+  /* Full width section */
+  .full-width-section {
+    margin-top: 1rem;
+  }
+</style>
+
+<!-- Stats Overview -->
+<div class="stats-row">
+  <div class="stat-card">
+    <div class="stat-value error" id="stat-errors">0</div>
+    <div class="stat-label">Errors (24h)</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value warning" id="stat-warnings">0</div>
+    <div class="stat-label">Warnings (24h)</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="stat-blocked">0</div>
+    <div class="stat-label">Trades Blocked</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value success" id="stat-executed">0</div>
+    <div class="stat-label">Trades Executed</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="stat-decisions">0</div>
+    <div class="stat-label">Decisions Made</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" id="stat-api-calls">0</div>
+    <div class="stat-label">API Calls</div>
+  </div>
+</div>
+
+<!-- Filter Bar -->
+<div class="filter-bar">
+  <button class="filter-btn active" data-filter="all">All</button>
+  <button class="filter-btn" data-filter="error">Errors Only</button>
+  <button class="filter-btn" data-filter="warning">Warnings</button>
+  <button class="filter-btn" data-filter="blocked">Blocked Trades</button>
+  <button class="filter-btn" data-filter="risk">Risk Rejections</button>
+  <button class="filter-btn" data-filter="execution">Trade Execution</button>
+  <span style="margin-left: auto; color: var(--text-dim); font-size: 0.75rem;">
+    Auto-refresh: <span id="refresh-status">ON</span> | Last: <span id="last-refresh">--</span>
+  </span>
+</div>
+
+<div class="debug-grid">
+  <!-- Errors & Warnings -->
+  <div class="log-container">
+    <div class="log-header">
+      <h3>Errors & Warnings <span class="log-count error" id="error-count">0</span></h3>
+    </div>
+    <div class="log-body" id="error-logs">
+      <div class="empty-state">No errors or warnings</div>
+    </div>
+  </div>
+  
+  <!-- Trade Execution -->
+  <div class="log-container">
+    <div class="log-header">
+      <h3>Trade Execution <span class="log-count" id="execution-count">0</span></h3>
+    </div>
+    <div class="log-body" id="execution-logs">
+      <div class="empty-state">No trade execution logs</div>
+    </div>
+  </div>
+  
+  <!-- Risk Manager -->
+  <div class="log-container">
+    <div class="log-header">
+      <h3>Risk Manager <span class="log-count warning" id="risk-count">0</span></h3>
+    </div>
+    <div class="log-body" id="risk-logs">
+      <div class="empty-state">No risk manager logs</div>
+    </div>
+  </div>
+  
+  <!-- System & API -->
+  <div class="log-container">
+    <div class="log-header">
+      <h3>System & API <span class="log-count" id="system-count">0</span></h3>
+    </div>
+    <div class="log-body" id="system-logs">
+      <div class="empty-state">No system logs</div>
+    </div>
+  </div>
+</div>
+
+<!-- Full Activity Log -->
+<div class="full-width-section">
+  <div class="log-container" style="max-height: 600px;">
+    <div class="log-header">
+      <h3>Full Activity Log <span class="log-count" id="full-count">0</span></h3>
+      <input type="text" id="log-search" placeholder="Search logs..." style="padding: 0.3rem 0.6rem; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); color: var(--text); font-size: 0.75rem; width: 200px;">
+    </div>
+    <div class="log-body" id="full-logs">
+      <div class="empty-state">Loading logs...</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const MAX_LOGS = 500;
+let autoRefresh = true;
+let refreshInterval = null;
+let allLogs = [];
+let currentFilter = 'all';
+
+// Format timestamp to local time
+function formatTime(ts) {
+  if (!ts) return '--';
+  const d = new Date(ts);
+  return d.toLocaleString('en-US', { 
+    month: '2-digit', 
+    day: '2-digit',
+    hour: '2-digit', 
+    minute: '2-digit', 
+    second: '2-digit',
+    hour12: true 
+  });
+}
+
+// Determine log level from message content
+function inferLevel(msg, category) {
+  const lower = (msg || '').toLowerCase();
+  if (lower.includes('error') || lower.includes('failed') || lower.includes('exception') || lower.includes('traceback')) return 'error';
+  if (lower.includes('warning') || lower.includes('warn') || lower.includes('blocked') || lower.includes('rejected') || lower.includes('skip')) return 'warning';
+  if (lower.includes('success') || lower.includes('opened') || lower.includes('closed') || lower.includes('executed')) return 'success';
+  if (category === 'risk') return 'warning';
+  return 'info';
+}
+
+// Create log entry HTML
+function createLogEntry(log) {
+  const level = log.level || inferLevel(log.message, log.category);
+  return `
+    <div class="log-entry ${level}" data-category="${log.category}" data-level="${level}">
+      <div class="log-time">${formatTime(log.created_at || log.timestamp)}</div>
+      <span class="log-source">${log.category || 'system'}</span>
+      <span class="log-message">${escapeHtml(log.message || '')}</span>
+    </div>
+  `;
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/[&<>"']/g, c => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+  })[c]);
+}
+
+// Fetch logs from API
+async function fetchLogs() {
+  try {
+    const res = await fetch('/debug/logs');
+    if (!res.ok) throw new Error('Failed to fetch logs');
+    const data = await res.json();
+    if (data.ok) {
+      allLogs = data.logs || [];
+      updateStats(data.stats || {});
+      renderLogs();
+      document.getElementById('last-refresh').textContent = formatTime(new Date());
+    }
+  } catch (e) {
+    console.error('[v0] Failed to fetch debug logs:', e);
+  }
+}
+
+// Update stats
+function updateStats(stats) {
+  document.getElementById('stat-errors').textContent = stats.errors_24h || 0;
+  document.getElementById('stat-warnings').textContent = stats.warnings_24h || 0;
+  document.getElementById('stat-blocked').textContent = stats.trades_blocked || 0;
+  document.getElementById('stat-executed').textContent = stats.trades_executed || 0;
+  document.getElementById('stat-decisions').textContent = stats.decisions_made || 0;
+  document.getElementById('stat-api-calls').textContent = stats.api_calls || 0;
+}
+
+// Render logs based on current filter
+function renderLogs() {
+  const searchTerm = (document.getElementById('log-search').value || '').toLowerCase();
+  
+  // Filter logs
+  let filtered = allLogs;
+  if (currentFilter !== 'all') {
+    filtered = allLogs.filter(log => {
+      const level = log.level || inferLevel(log.message, log.category);
+      const msg = (log.message || '').toLowerCase();
+      const cat = (log.category || '').toLowerCase();
+      
+      switch (currentFilter) {
+        case 'error': return level === 'error';
+        case 'warning': return level === 'warning' || level === 'error';
+        case 'blocked': return msg.includes('blocked') || msg.includes('skip') || msg.includes('rejected');
+        case 'risk': return cat === 'risk' || msg.includes('risk');
+        case 'execution': return cat === 'trade' || cat === 'execution' || msg.includes('open') || msg.includes('close');
+        default: return true;
+      }
+    });
+  }
+  
+  // Apply search
+  if (searchTerm) {
+    filtered = filtered.filter(log => 
+      (log.message || '').toLowerCase().includes(searchTerm) ||
+      (log.category || '').toLowerCase().includes(searchTerm)
+    );
+  }
+  
+  // Categorize logs
+  const errors = filtered.filter(l => (l.level || inferLevel(l.message, l.category)) === 'error' || (l.level || inferLevel(l.message, l.category)) === 'warning');
+  const execution = filtered.filter(l => {
+    const cat = (l.category || '').toLowerCase();
+    const msg = (l.message || '').toLowerCase();
+    return cat === 'trade' || cat === 'execution' || msg.includes('open_trade') || msg.includes('close_trade');
+  });
+  const risk = filtered.filter(l => {
+    const cat = (l.category || '').toLowerCase();
+    const msg = (l.message || '').toLowerCase();
+    return cat === 'risk' || msg.includes('risk') || msg.includes('blocked') || msg.includes('rejected');
+  });
+  const system = filtered.filter(l => {
+    const cat = (l.category || '').toLowerCase();
+    return cat === 'system' || cat === 'api' || cat === 'bot' || cat === 'scheduler';
+  });
+  
+  // Render each section
+  renderSection('error-logs', errors, 'error-count');
+  renderSection('execution-logs', execution, 'execution-count');
+  renderSection('risk-logs', risk, 'risk-count');
+  renderSection('system-logs', system, 'system-count');
+  renderSection('full-logs', filtered.slice(0, MAX_LOGS), 'full-count');
+}
+
+function renderSection(containerId, logs, countId) {
+  const container = document.getElementById(containerId);
+  const countEl = document.getElementById(countId);
+  
+  if (!logs || logs.length === 0) {
+    container.innerHTML = '<div class="empty-state">No logs in this category</div>';
+    countEl.textContent = '0';
+    return;
+  }
+  
+  container.innerHTML = logs.slice(0, 100).map(createLogEntry).join('');
+  countEl.textContent = logs.length;
+}
+
+// Filter buttons
+document.querySelectorAll('.filter-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.filter-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentFilter = btn.dataset.filter;
+    renderLogs();
+  });
+});
+
+// Search
+document.getElementById('log-search').addEventListener('input', () => {
+  renderLogs();
+});
+
+// Actions
+function refreshLogs() {
+  fetchLogs();
+}
+
+function clearLogs() {
+  if (!confirm('Clear all debug logs? This cannot be undone.')) return;
+  fetch('/debug/logs/clear', { method: 'POST' })
+    .then(res => res.json())
+    .then(data => {
+      if (data.ok) {
+        allLogs = [];
+        renderLogs();
+      }
+    });
+}
+
+function exportLogs() {
+  const blob = new Blob([JSON.stringify(allLogs, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `debug-logs-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Auto-refresh
+function startAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = setInterval(fetchLogs, 3000);
+  document.getElementById('refresh-status').textContent = 'ON';
+}
+
+function stopAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = null;
+  document.getElementById('refresh-status').textContent = 'OFF';
+}
+
+// Initialize
+fetchLogs();
+startAutoRefresh();
+
+// Pause auto-refresh when tab is hidden
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopAutoRefresh();
+  } else {
+    startAutoRefresh();
+  }
+});
+</script>
+
+{% endblock %}

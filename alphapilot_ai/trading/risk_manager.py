@@ -268,7 +268,7 @@ class RiskManager:
         confidence: float,
         strategy_id: int | None = None,
     ) -> RiskDecision:
-        return self.evaluate_trade(
+        result = self.evaluate_trade(
             wallet_id=wallet_id,
             qty=qty,
             entry_price=entry_price,
@@ -276,6 +276,23 @@ class RiskManager:
             strategy_id=strategy_id,
             is_paper=True,
         )
+        
+        # Log ALL rejections to activity log for debug console
+        if not result.approved:
+            try:
+                from database.db import session_scope
+                from database.models import ActivityLog
+                with session_scope() as s:
+                    s.add(ActivityLog(
+                        category="risk",
+                        level="warn",
+                        message=f"RISK REJECTED: {result.reason} (code={result.code}) - qty={qty}, price={entry_price}, conf={confidence}",
+                        wallet_id=wallet_id,
+                    ))
+            except Exception:
+                pass  # Don't let logging failures break the flow
+        
+        return result
 
     # ------------------------------------------------------------------ #
     # Kill switch (global, AppSetting-backed)

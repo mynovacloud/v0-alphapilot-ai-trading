@@ -778,8 +778,95 @@ def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form
 # ----------------------------------------------------------------------
 # Training Lab
 # ----------------------------------------------------------------------
+# DEBUG CONSOLE
+# ----------------------------------------------------------------------
 
-@router.get("/training", response_class=HTMLResponse)
+@router.get("/debug", response_class=HTMLResponse)
+def debug_console_page(request: Request) -> HTMLResponse:
+    """Debug console page - shows all system errors, warnings, and execution logs."""
+    return templates.TemplateResponse("debug_console.html", {
+        "request": request,
+        **_common_ctx(),
+    })
+
+
+@router.get("/debug/logs")
+def debug_get_logs() -> JSONResponse:
+    """Get all debug logs with stats."""
+    from datetime import timedelta
+    
+    now = utcnow()
+    day_ago = now - timedelta(hours=24)
+    
+    with session_scope() as s:
+        # Get all activity logs
+        logs = s.query(ActivityLog).order_by(ActivityLog.created_at.desc()).limit(1000).all()
+        
+        # Count stats
+        errors_24h = s.query(ActivityLog).filter(
+            ActivityLog.level == 'error',
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        warnings_24h = s.query(ActivityLog).filter(
+            ActivityLog.level == 'warn',
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        # Count blocked trades (messages containing 'blocked' or 'rejected')
+        blocked = s.query(ActivityLog).filter(
+            ActivityLog.message.ilike('%blocked%') | ActivityLog.message.ilike('%rejected%'),
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        # Count executed trades
+        executed = s.query(ActivityLog).filter(
+            ActivityLog.message.ilike('%opened%') | ActivityLog.message.ilike('%executed%'),
+            ActivityLog.category == 'trade',
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        # Count decisions
+        decisions = s.query(ActivityLog).filter(
+            ActivityLog.category == 'bot',
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        log_list = []
+        for log in logs:
+            log_list.append({
+                "id": log.id,
+                "category": log.category,
+                "level": log.level,
+                "message": log.message,
+                "created_at": log.created_at.isoformat() if log.created_at else None,
+                "wallet_id": log.wallet_id,
+            })
+        
+        return JSONResponse({
+            "ok": True,
+            "logs": log_list,
+            "stats": {
+                "errors_24h": errors_24h,
+                "warnings_24h": warnings_24h,
+                "trades_blocked": blocked,
+                "trades_executed": executed,
+                "decisions_made": decisions,
+                "api_calls": 0,  # TODO: track API calls
+            }
+        })
+
+
+@router.post("/debug/logs/clear")
+def debug_clear_logs() -> JSONResponse:
+    """Clear all debug logs."""
+    with session_scope() as s:
+        s.query(ActivityLog).delete()
+    return JSONResponse({"ok": True})
+
+
+# ----------------------------------------------------------------------
+# TRAINING CENTER
 def training_page(request: Request) -> HTMLResponse:
     from ai.claude_learning import (
         get_playbook_with_metadata,
