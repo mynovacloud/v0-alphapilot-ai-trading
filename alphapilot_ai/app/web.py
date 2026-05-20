@@ -7,6 +7,7 @@ HTML fragments for HTMX to swap in.
 """
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -1858,10 +1859,31 @@ def training_session_feed(
                 session_start_naive = None
 
         # ---- New Claude decisions since the client's last cursor ----
+        # NOTE: every tick can write 100+ rows (one per scanned symbol), and
+        # the vast majority are HOLD/0.00 because most coins have no signal.
+        # We still ship them so the UI can show "Claude looked at N symbols
+        # and acted on M", but the limit is generous so actionable rows
+        # (BUY/SELL/CLOSE) never fall off the back of the cursor window.
+        def _safe_json_list(raw: Any) -> list[Any]:
+            """ClaudeDecision stores key_factors / risk_flags as JSON-encoded
+            strings. Decode defensively so a malformed row never breaks the
+            live feed."""
+            if not raw:
+                return []
+            if isinstance(raw, list):
+                return raw[:8]
+            try:
+                parsed = json.loads(str(raw))
+                if isinstance(parsed, list):
+                    return [str(x)[:80] for x in parsed][:8]
+            except Exception:
+                pass
+            return []
+
         decisions_q = s.query(ClaudeDecision).filter(ClaudeDecision.id > since_decision_id)
         if session_start_naive is not None:
             decisions_q = decisions_q.filter(ClaudeDecision.created_at >= session_start_naive)
-        new_decisions = decisions_q.order_by(ClaudeDecision.id.asc()).limit(50).all()
+        new_decisions = decisions_q.order_by(ClaudeDecision.id.asc()).limit(150).all()
         decisions_payload = [
             {
                 "id": d.id,
@@ -1882,8 +1904,15 @@ def training_session_feed(
                 "technical_side": d.technical_side,
                 "technical_confidence": float(d.technical_confidence or 0),
                 "price": float(d.price or 0),
-                "rationale": (d.rationale or "")[:400],
+                "rationale": (d.rationale or "")[:600],
                 "source": d.source,
+                "model": (d.model or "")[:80],
+                # Pre-parse JSON columns so the client doesn't have to.
+                "key_factors": _safe_json_list(d.key_factors),
+                "risk_flags": _safe_json_list(d.risk_flags),
+                # Convenience flag — anything that isn't a HOLD is something
+                # the bot actually decided to act on (or change its mind on).
+                "actionable": (d.action or "HOLD").upper() != "HOLD",
             }
             for d in new_decisions
         ]

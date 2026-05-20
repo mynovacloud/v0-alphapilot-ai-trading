@@ -556,9 +556,21 @@ loadPnlStats('today');
   <div class="grid" style="grid-template-columns:1.1fr 1fr 1fr;gap:0.75rem;">
     <!-- Claude decision feed -->
     <div style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.6rem;">
-      <div class="flex items-center justify-between mb-2">
+      <style>
+        /* When "actionable only" is checked, hide HOLD decision cards
+           inside the live feed. Each card carries data-actionable="0"
+           when its action is HOLD (or the row was non-actionable). */
+        #live-decision-feed.hide-holds > div[data-actionable="0"] { display: none; }
+      </style>
+      <div class="flex items-center justify-between mb-2" style="gap:0.5rem;flex-wrap:wrap;">
         <div class="mono" style="font-size:0.78rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">Claude decisions</div>
-        <span class="text-dim" id="live-decision-count" style="font-size:0.72rem;">0</span>
+        <div class="flex items-center" style="gap:0.5rem;">
+          <label class="mono text-dim" style="font-size:0.7rem;display:flex;align-items:center;gap:0.25rem;cursor:pointer;" title="Hide HOLD-only entries (Claude scanned but didn't act)">
+            <input type="checkbox" id="live-decision-hide-holds" checked style="margin:0;cursor:pointer;" />
+            actionable only
+          </label>
+          <span class="text-dim" id="live-decision-count" style="font-size:0.72rem;" title="actionable / total this session">0 / 0</span>
+        </div>
       </div>
       <div id="live-decision-feed" class="mono"
            style="height:340px;overflow-y:auto;font-size:0.78rem;display:flex;flex-direction:column-reverse;gap:0.35rem;">
