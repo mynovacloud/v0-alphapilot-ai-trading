@@ -118,6 +118,17 @@ def _migrate_schema() -> None:
             ("breakeven_trigger_pct", "FLOAT"),
             ("breakeven_stop_pct", "FLOAT"),
             ("breakeven_activated", "BOOLEAN DEFAULT 0"),
+            # Link to the ClaudeDecision that produced this entry, so the
+            # autonomous learning engine can rebuild entry-time market context
+            # at close time. Nullable for trades that don't originate from
+            # a Claude decision.
+            ("claude_decision_id", "INTEGER"),
+        ],
+        "claude_decisions": [
+            # JSON snapshot of indicators + regime at decision time. Consumed
+            # by autonomous_learning_engine._build_context_from_trade so closed
+            # trades produce real fingerprints instead of degenerate defaults.
+            ("market_snapshot", "TEXT DEFAULT '{}'"),
         ],
     }
 

@@ -517,7 +517,7 @@ def decide(
             source="training_passthrough" if is_training else "technical_strong",
         )
         passthrough.quality = _grade_from_confidence(passthrough.confidence)
-        _persist_decision(wallet, symbol, price, technical_signal, passthrough, prompt_used="")
+        _persist_decision(wallet, symbol, price, technical_signal, passthrough, prompt_used="", extra_context=extra_context)
         return passthrough
 
     # ----- HOLD signals don't need Claude --------------------------------- #
@@ -531,11 +531,11 @@ def decide(
             source="tech_hold",
         )
         hold.quality = _grade_from_confidence(tech_conf)
-        _persist_decision(wallet, symbol, price, technical_signal, hold, prompt_used="[TECH_HOLD]")
+        _persist_decision(wallet, symbol, price, technical_signal, hold, prompt_used="[TECH_HOLD]", extra_context=extra_context)
         return hold
 
     if not claude_is_configured():
-        _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="")
+        _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="", extra_context=extra_context)
         return fallback
 
     # ----- Claude path ---------------------------------------------------- #
@@ -556,7 +556,7 @@ def decide(
                 quality=cached.quality,
             )
             logger.info("[CACHE_HIT] %s: reuse (%s, conf=%.2f)", symbol, cached.action, cached.confidence)
-            _persist_decision(wallet, symbol, price, technical_signal, cached_copy, prompt_used="[CACHED]")
+            _persist_decision(wallet, symbol, price, technical_signal, cached_copy, prompt_used="[CACHED]", extra_context=extra_context)
             return cached_copy
 
         can_call, remaining = _check_api_budget()
@@ -574,7 +574,7 @@ def decide(
                 source="budget_fallback",
             )
             budget_fb.quality = _grade_from_confidence(budget_fb.confidence)
-            _persist_decision(wallet, symbol, price, technical_signal, budget_fb, prompt_used="[BUDGET_EXCEEDED]")
+            _persist_decision(wallet, symbol, price, technical_signal, budget_fb, prompt_used="[BUDGET_EXCEEDED]", extra_context=extra_context)
             return budget_fb
 
         if remaining <= 5 or remaining % 10 == 0:
@@ -608,7 +608,7 @@ def decide(
 
         if not result.get("ok"):
             logger.warning("Claude decision call failed: %s", result.get("error"))
-            _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used=prompt)
+            _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used=prompt, extra_context=enhanced_context)
             return fallback
 
         text = result.get("text", "")
@@ -618,6 +618,7 @@ def decide(
             _persist_decision(
                 wallet, symbol, price, technical_signal, fallback,
                 prompt_used=prompt, raw_text=text, source_override="fallback",
+                extra_context=enhanced_context,
             )
             return fallback
 
@@ -652,12 +653,12 @@ def decide(
             )
 
         _cache_decision(wallet_id, symbol, price, decision)
-        _persist_decision(wallet, symbol, price, technical_signal, decision, prompt_used=prompt, raw_text=text)
+        _persist_decision(wallet, symbol, price, technical_signal, decision, prompt_used=prompt, raw_text=text, extra_context=enhanced_context)
         return decision
 
     except Exception as e:
         logger.exception("Claude decision engine raised: %s", e)
-        _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="", raw_text=str(e))
+        _persist_decision(wallet, symbol, price, technical_signal, fallback, prompt_used="", raw_text=str(e), extra_context=extra_context)
         return fallback
 
 
@@ -1337,10 +1338,16 @@ def _persist_decision(
     prompt_used: str = "",
     raw_text: str = "",
     source_override: str | None = None,
+    extra_context: dict[str, Any] | None = None,
 ) -> None:
-    """Write a ClaudeDecision row. Same column contract as v1 (no new columns,
-    so this can't crash on a schema mismatch). Never lets logging fail a trade."""
+    """Write a ClaudeDecision row. Captures the entry-time indicator/regime
+    snapshot into market_snapshot so the autonomous learning engine can rebuild
+    a populated TradeContext at close time. Never lets logging fail a trade."""
     try:
+        snapshot = _extract_market_state(
+            getattr(technical_signal, "metadata", {}) or {},
+            extra_context or {},
+        )
         with session_scope() as s:
             row = ClaudeDecision(
                 wallet_id=int(wallet["id"]),
@@ -1360,6 +1367,7 @@ def _persist_decision(
                 model=decision.model or "",
                 prompt_used=(prompt_used or "")[:8000],
                 raw_response=(raw_text or decision.raw_text or "")[:8000],
+                market_snapshot=json.dumps(snapshot)[:4000],
             )
             s.add(row)
     except Exception:
