@@ -380,6 +380,10 @@ class BotEngine:
 
         # Sweep the universe. DON'T break when slots are full - we still want to
         # call Claude for existing positions (re-evaluate, DCA opportunities, etc.)
+        symbols_evaluated = 0
+        symbols_skipped_held = 0
+        symbols_skipped_noslots = 0
+        
         for product in shuffled_universe:
             symbol = product["product_id"]
             
@@ -392,14 +396,14 @@ class BotEngine:
             # 2. We have no slots left AND we don't hold it (can't act anyway)
             if is_held:
                 # We might want to DCA - let portfolio intelligence handle that
+                symbols_skipped_held += 1
                 continue
             if slots_left <= 0:
                 # No slots for new positions - can't open new trades
                 # Just track a few "best signals" for monitoring then stop
+                symbols_skipped_noslots += 1
                 if evaluated >= 10:
                     break
-                # Still evaluate to track best signals but skip trade execution
-                # by continuing to next symbol
                 continue
             
             price_payload = get_price(symbol)
@@ -620,18 +624,23 @@ class BotEngine:
             if qty <= 0 or position_usd < 10:
                 self._log(
                     "bot",
-                    f"[SKIP] {symbol}: Position too small (${position_usd:.2f}). {size_result.reasoning}",
+                    f"[SKIP] {symbol}: Position too small (${position_usd:.2f}, qty={qty}). {size_result.reasoning}",
                     wallet_id=wallet["id"],
-                    level="debug",
+                    level="info",
                 )
                 continue
             
             # Log sizing decision
+            self._log(
+                "bot",
+                f"[SIZE OK] {symbol}: ${position_usd:.0f}, qty={qty:.6f} ({size_result.conviction_multiplier:.1f}x conv)",
+                wallet_id=wallet["id"],
+                level="info",
+            )
             if size_result.warnings:
                 self._log(
                     "bot",
-                    f"[SIZE] {symbol}: ${position_usd:.0f} ({size_result.conviction_multiplier:.1f}x conv, "
-                    f"{size_result.drawdown_adjustment:.1f}x DD). Warnings: {', '.join(size_result.warnings[:2])}",
+                    f"[SIZE WARN] {symbol}: {', '.join(size_result.warnings[:2])}",
                     wallet_id=wallet["id"],
                     level="info",
                 )
@@ -652,6 +661,13 @@ class BotEngine:
                 continue
 
             # Real path: open a paper trade through the existing engine.
+            self._log(
+                "bot",
+                f"[EXECUTING] {wallet['name']}: {side} {qty:.6f} {symbol} @ ${price:.4f} (conf={confidence:.2f})",
+                wallet_id=wallet["id"],
+                level="info",
+            )
+            
             outcome = self.paper.open_trade(
                 wallet_id=wallet["id"],
                 symbol=symbol,
@@ -667,6 +683,12 @@ class BotEngine:
             )
 
             if outcome.get("ok"):
+                self._log(
+                    "bot",
+                    f"[TRADE OPENED] {symbol} {side} - trade_id={outcome.get('trade_id')}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
                 result.actions += 1
                 slots_left -= 1
                 # =====================================================================
@@ -757,7 +779,8 @@ class BotEngine:
             (
                 f"{wallet['name']}: evaluated {evaluated}/{len(universe)} symbols, "
                 f"claude_calls={claude_calls}, floor={cfg.min_confidence:.2f}, below={below_conf}, "
-                f"slots={cap - open_count}/{cap}, held={len(held_symbols)}, {best_line}."
+                f"slots={slots_left}/{cap}, held={len(held_symbols)}, skipped_held={symbols_skipped_held}, "
+                f"skipped_noslots={symbols_skipped_noslots}, {best_line}."
             ),
             wallet_id=wallet["id"],
             level="info",
