@@ -784,10 +784,7 @@ def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form
 @router.get("/debug", response_class=HTMLResponse)
 def debug_console_page(request: Request) -> HTMLResponse:
     """Debug console page - shows all system errors, warnings, and execution logs."""
-    return templates.TemplateResponse("debug_console.html", {
-        "request": request,
-        **_common_ctx(),
-    })
+    return templates.TemplateResponse("debug_console.html", _ctx(request))
 
 
 @router.get("/debug/logs")
