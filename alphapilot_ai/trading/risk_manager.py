@@ -39,7 +39,7 @@ from database.models import (
     Strategy,
     Wallet,
 )
-from utils.helpers import utcnow
+from utils.helpers import utcnow, ensure_utc
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -449,7 +449,9 @@ class RiskManager:
         last_close = recent[0].closed_at
         if not last_close:
             return None
-        unlock = last_close + timedelta(minutes=COOLDOWN_MINUTES)
+        # Ensure timezone-aware comparison (DB may store naive datetimes)
+        last_close_utc = ensure_utc(last_close)
+        unlock = last_close_utc + timedelta(minutes=COOLDOWN_MINUTES)
         if utcnow() >= unlock:
             return None
         return unlock

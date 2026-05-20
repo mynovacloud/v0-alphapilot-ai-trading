@@ -197,7 +197,8 @@ class BotEngine:
             from database.models import PaperTrade
             
             # Collect all symbols we need prices for
-            symbols_needed = [u.symbol for u in universe]
+            # Universe items are dicts with "product_id" key, not objects with .symbol
+            symbols_needed = [u["product_id"] for u in universe if isinstance(u, dict) and "product_id" in u]
             with session_scope() as s:
                 open_positions = s.query(PaperTrade.symbol).filter(PaperTrade.status == "open").distinct().all()
                 symbols_needed.extend([p[0] for p in open_positions])
