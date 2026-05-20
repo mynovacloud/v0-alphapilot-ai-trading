@@ -976,7 +976,7 @@ def _run_diagnostics_inner() -> JSONResponse:
     pos_size = cfg.position_size_usd
     cfg_checks.append({"status": "ok", "message": f"position_size_usd=${pos_size}"})
     
-    session_active = cfg.get_bool("training_session_active")
+    session_active = str(bot_config.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     if session_active:
         cfg_checks.append({"status": "ok", "message": "Training session is ACTIVE"})
     else:
@@ -997,7 +997,7 @@ def _run_diagnostics_inner() -> JSONResponse:
         api_checks.append({"status": "error", "message": f"Coinbase API failed: {str(e)}"})
     
     # Check Claude API
-    claude_key = os.environ.get("ANTHROPIC_API_KEY") or cfg.get_str("anthropic_api_key")
+    claude_key = os.environ.get("ANTHROPIC_API_KEY") or bot_config.get("anthropic_api_key")
     if claude_key:
         api_checks.append({"status": "ok", "message": "Claude API key configured"})
     else:
@@ -2029,6 +2029,14 @@ def training_memory_reset() -> RedirectResponse:
 def training_memory_consolidate() -> RedirectResponse:
     from ai.claude_learning import consolidate_lessons
     consolidate_lessons()
+    return RedirectResponse(url="/training", status_code=303)
+
+
+@router.post("/training/memory/compact")
+def training_memory_compact() -> RedirectResponse:
+    """Offline merge of duplicate playbook entries (no Claude required)."""
+    from ai.claude_learning import compact_playbook_offline
+    compact_playbook_offline()
     return RedirectResponse(url="/training", status_code=303)
 
 
