@@ -195,9 +195,36 @@ function recordIntelAction(type, symbol, reason) {
 {% set pl = portfolio.total_pl %}
 {% set pl_color = 'var(--good)' if pl > 0.005 else ('var(--bad)' if pl < -0.005 else 'var(--text-muted)') %}
 {% set pl_sign = '+' if pl >= 0 else '−' %}
-<div class="card mb-4" id="paper-money-strip"
+{% set is_session = portfolio.is_session_scoped %}
+{% set hero_subtitle = ('this session' if is_session else 'seeded') %}
+{% set wr_subtitle = ('since reset' if is_session else 'across all paper trades') %}
+<div class="card mb-4 money-strip-card" id="paper-money-strip"
      style="background: linear-gradient(135deg, var(--bg-elev), var(--bg)); border: 1px solid var(--border);">
-  <div class="grid" style="grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr; gap: 1rem; align-items: stretch;">
+
+  {# Session-reset banner: only when a Paper Trading Reset has fired. #}
+  {# Wording is deliberate — operator must see that history is preserved, #}
+  {# not deleted, and exactly how many trades the strip is now hiding.    #}
+  {% if is_session %}
+  <div class="session-reset-banner" style="
+       display: flex; align-items: center; gap: 0.5rem;
+       padding: 0.4rem 0.6rem; margin-bottom: 0.8rem;
+       border-radius: 6px; background: rgba(255,255,255,0.03);
+       border: 1px solid var(--border); font-size: 0.78rem;">
+    <span style="font-weight: 600; color: var(--text);">Session view</span>
+    <span class="text-muted">·</span>
+    <span class="text-muted">
+      Showing P&amp;L since <span class="mono" style="color: var(--text);">{{ portfolio.session_reset_label }}</span>.
+      {% if portfolio.excluded_pre_reset_trades %}
+        {{ portfolio.excluded_pre_reset_trades }} trade{{ '' if portfolio.excluded_pre_reset_trades == 1 else 's' }}
+        from prior sessions hidden — still in DB and feeding the learning engines.
+      {% else %}
+        Full trade history preserved in the database; nothing was deleted.
+      {% endif %}
+    </span>
+  </div>
+  {% endif %}
+
+  <div class="money-strip-grid">
 
     <!-- HERO: current paper equity + P&L -->
     <div style="padding: 0.6rem 0.4rem;">
@@ -205,20 +232,20 @@ function recordIntelAction(type, symbol, reason) {
       <div class="mono" style="font-size: 2.6rem; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em;">
         ${{ '{:,.2f}'.format(portfolio.current) }}
       </div>
-      <div class="flex items-center gap-2" style="margin-top: 0.35rem;">
+      <div class="flex items-center gap-2" style="margin-top: 0.35rem; flex-wrap: wrap;">
         <span class="mono" style="font-size: 1.15rem; font-weight: 700; color: {{ pl_color }};">
           {{ pl_sign }}${{ '{:,.2f}'.format(pl|abs) }}
         </span>
         <span class="mono" style="font-size: 0.95rem; font-weight: 600; color: {{ pl_color }};">
           ({{ pl_sign }}{{ '%.2f' | format(portfolio.total_pl_pct|abs) }}%)
         </span>
-        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} seeded</span>
+        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} {{ hero_subtitle }}</span>
       </div>
     </div>
 
     <!-- Realized P&L -->
     {% set rcol = 'var(--good)' if portfolio.realized > 0.005 else ('var(--bad)' if portfolio.realized < -0.005 else 'var(--text)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Realized P&amp;L</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ rcol }};">
         {{ '+' if portfolio.realized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.realized|abs) }}
@@ -228,16 +255,16 @@ function recordIntelAction(type, symbol, reason) {
 
     <!-- Unrealized P&L -->
     {% set ucol = 'var(--good)' if portfolio.unrealized > 0.005 else ('var(--bad)' if portfolio.unrealized < -0.005 else 'var(--text)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Unrealized P&amp;L</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ ucol }};">
         {{ '+' if portfolio.unrealized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.unrealized|abs) }}
       </div>
-      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open positions</div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open position{{ '' if portfolio.open_trades == 1 else 's' }}</div>
     </div>
 
     <!-- Capital deployed -->
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Capital Deployed</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800;">
         ${{ '{:,.2f}'.format(portfolio.invested_open) }}
@@ -249,16 +276,44 @@ function recordIntelAction(type, symbol, reason) {
 
     <!-- Win rate -->
     {% set wcol = 'var(--good)' if portfolio.win_rate >= 0.55 else ('var(--warn)' if portfolio.win_rate >= 0.4 else 'var(--bad)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Win Rate</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ wcol if portfolio.closed_trades else 'var(--text)' }};">
         {{ '%.1f' | format(portfolio.win_rate * 100) }}%
       </div>
-      <div class="text-dim" style="font-size: 0.78rem;">across all paper trades</div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ wr_subtitle }}</div>
     </div>
 
   </div>
 </div>
+
+<style>
+/* Money strip: 5-column desktop, collapses cleanly at narrow widths.
+   Without this the fixed `1.4fr 1fr 1fr 1fr 1fr` grid squashes the hero
+   number into a 2-line wrap by the time you hit a 13" laptop. */
+.money-strip-grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+.money-strip-cell {
+  padding: 0.6rem 0.4rem;
+  border-left: 1px solid var(--border);
+}
+@media (max-width: 1100px) {
+  .money-strip-grid { grid-template-columns: 1fr 1fr 1fr; }
+  .money-strip-cell:nth-child(2),
+  .money-strip-cell:nth-child(3) { border-left: 1px solid var(--border); }
+  .money-strip-cell:nth-child(4) { border-left: none; border-top: 1px solid var(--border); padding-top: 0.8rem; }
+  .money-strip-cell:nth-child(5) { border-left: 1px solid var(--border); border-top: 1px solid var(--border); padding-top: 0.8rem; }
+}
+@media (max-width: 720px) {
+  .money-strip-grid { grid-template-columns: 1fr 1fr; }
+  .money-strip-cell { border-left: none; border-top: 1px solid var(--border); padding-top: 0.6rem; }
+  .money-strip-cell:nth-child(odd) { border-right: 1px solid var(--border); }
+}
+</style>
 
 <!-- ============================================================ -->
 <!-- P&L BY TIME PERIOD                                            -->
