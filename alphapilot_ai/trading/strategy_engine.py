@@ -899,29 +899,57 @@ def evaluate_entry_quality(
     of resistance or SELLing right above support — both of which produce
     "trade goes nowhere then drifts the wrong way" outcomes.
 
+    Beyond the binary accept/reject, this also returns a `quality_score` in
+    [0, 1] that the caller should use as a CONFIDENCE MULTIPLIER. The score
+    rewards setups where there is plenty of room to the next structural
+    level relative to the structural risk (large potential R:R), and
+    penalises setups where headroom barely clears the minimum.
+
     Returns:
         {
           "accept": bool,
           "reason": str,
           "headroom_pct": float,   # % distance to next resistance (BUY) or support (SELL)
+          "risk_pct": float,       # % distance to the structural stop
+          "potential_rr": float,   # headroom / risk — naive max R:R
+          "quality_score": float,  # 0..1 multiplier for confidence
           "swing_high": float,
           "swing_low": float,
           "atr_pct": float,
         }
     """
     if not candles or len(candles) < 30:
-        return {"accept": True, "reason": "insufficient bars for S/R check", "headroom_pct": 0.0}
+        return {
+            "accept": True,
+            "reason": "insufficient bars for S/R check",
+            "headroom_pct": 0.0,
+            "risk_pct": 0.0,
+            "potential_rr": 0.0,
+            "quality_score": 1.0,
+        }
 
     swings = swing_levels(candles, lookback=30)
     if not swings:
-        return {"accept": True, "reason": "no swings detected", "headroom_pct": 0.0}
+        return {
+            "accept": True,
+            "reason": "no swings detected",
+            "headroom_pct": 0.0,
+            "risk_pct": 0.0,
+            "potential_rr": 0.0,
+            "quality_score": 1.0,
+        }
 
     last = float(candles[-1]["close"])
     a = atr(candles, period=14) or 0.0
     atr_pct = (a / last) if last > 0 else 0.0
 
+    swing_high = swings["swing_high"]
+    swing_low = swings["swing_low"]
+
     if side == "BUY":
-        headroom = (swings["swing_high"] - last) / last if last > 0 else 0.0
+        headroom = (swing_high - last) / last if last > 0 else 0.0
+        # Risk = distance to swing low (where our structural stop lives) + ATR buffer.
+        risk = ((last - swing_low) / last + atr_pct * 0.2) if last > 0 else 0.0
         # Reject BUYs with less headroom than 1.0x ATR — that's barely room
         # to make 1R before hitting resistance. We need the target to be
         # reachable WITHIN visible market structure.
@@ -931,37 +959,89 @@ def evaluate_entry_quality(
                 "accept": False,
                 "reason": (
                     f"BUY rejected: only {headroom:.2%} headroom to swing high "
-                    f"${swings['swing_high']:.4f} (need {min_headroom:.2%})"
+                    f"${swing_high:.4f} (need {min_headroom:.2%})"
                 ),
                 "headroom_pct": headroom,
-                "swing_high": swings["swing_high"],
-                "swing_low": swings["swing_low"],
+                "risk_pct": risk,
+                "potential_rr": (headroom / risk) if risk > 0 else 0.0,
+                "quality_score": 0.0,
+                "swing_high": swing_high,
+                "swing_low": swing_low,
                 "atr_pct": atr_pct,
             }
     elif side == "SELL":
-        headroom = (last - swings["swing_low"]) / last if last > 0 else 0.0
+        headroom = (last - swing_low) / last if last > 0 else 0.0
+        risk = ((swing_high - last) / last + atr_pct * 0.2) if last > 0 else 0.0
         min_headroom = max(0.008, atr_pct * 1.0)
         if headroom < min_headroom:
             return {
                 "accept": False,
                 "reason": (
                     f"SELL rejected: only {headroom:.2%} headroom to swing low "
-                    f"${swings['swing_low']:.4f} (need {min_headroom:.2%})"
+                    f"${swing_low:.4f} (need {min_headroom:.2%})"
                 ),
                 "headroom_pct": headroom,
-                "swing_high": swings["swing_high"],
-                "swing_low": swings["swing_low"],
+                "risk_pct": risk,
+                "potential_rr": (headroom / risk) if risk > 0 else 0.0,
+                "quality_score": 0.0,
+                "swing_high": swing_high,
+                "swing_low": swing_low,
                 "atr_pct": atr_pct,
             }
     else:
-        return {"accept": True, "reason": "non-directional side", "headroom_pct": 0.0}
+        return {
+            "accept": True,
+            "reason": "non-directional side",
+            "headroom_pct": 0.0,
+            "risk_pct": 0.0,
+            "potential_rr": 0.0,
+            "quality_score": 1.0,
+        }
+
+    # ----- Quality score -----
+    # Two factors: (a) potential R:R and (b) absolute headroom in ATR units.
+    # Both must be decent to score high. Floor at 0.65 (don't kill a valid
+    # signal too aggressively) and cap at 1.20 (reward genuinely great
+    # setups but don't let them bypass other safeguards).
+    potential_rr = (headroom / risk) if risk > 0 else 0.0
+    headroom_atrs = (headroom / atr_pct) if atr_pct > 0 else 0.0
+
+    # R:R component: 1.5 R:R -> 0.85, 2.0 -> 1.00, 3.0+ -> 1.15
+    if potential_rr >= 3.0:
+        rr_factor = 1.15
+    elif potential_rr >= 2.0:
+        rr_factor = 1.00 + (potential_rr - 2.0) * 0.15
+    elif potential_rr >= 1.5:
+        rr_factor = 0.85 + (potential_rr - 1.5) * 0.30
+    elif potential_rr >= 1.0:
+        rr_factor = 0.70 + (potential_rr - 1.0) * 0.30
+    else:
+        rr_factor = 0.65
+
+    # Headroom-in-ATRs component: 1 ATR -> 0.80, 2 ATR -> 1.00, 4+ ATR -> 1.10
+    if headroom_atrs >= 4.0:
+        room_factor = 1.10
+    elif headroom_atrs >= 2.0:
+        room_factor = 1.00 + (headroom_atrs - 2.0) * 0.05
+    elif headroom_atrs >= 1.0:
+        room_factor = 0.80 + (headroom_atrs - 1.0) * 0.20
+    else:
+        room_factor = 0.70
+
+    quality_score = max(0.65, min(1.20, rr_factor * room_factor))
 
     return {
         "accept": True,
-        "reason": "S/R headroom OK",
+        "reason": (
+            f"S/R OK: headroom={headroom:.2%} ({headroom_atrs:.1f}xATR), "
+            f"risk={risk:.2%}, potential R:R={potential_rr:.1f}, q={quality_score:.2f}"
+        ),
         "headroom_pct": headroom,
-        "swing_high": swings["swing_high"],
-        "swing_low": swings["swing_low"],
+        "risk_pct": risk,
+        "potential_rr": potential_rr,
+        "quality_score": quality_score,
+        "swing_high": swing_high,
+        "swing_low": swing_low,
         "atr_pct": atr_pct,
     }
 

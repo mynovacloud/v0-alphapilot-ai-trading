@@ -604,6 +604,85 @@ class BotEngine:
                 )
                 continue
 
+            # =====================================================================
+            # ENTRY QUALITY CONFIDENCE MULTIPLIER
+            # `evaluate_entry_quality` also returns a quality_score and the
+            # naive max R:R for the setup. Setups with great asymmetry (3R+
+            # potential, 4+ ATRs of headroom) get a small confidence boost;
+            # setups that barely cleared the headroom minimum get trimmed.
+            # =====================================================================
+            sr_quality = float(sr_check.get("quality_score", 1.0))
+            potential_rr = float(sr_check.get("potential_rr", 0.0))
+
+            # Hard reject: structural R:R below 1.2 means we are paying fees
+            # on a coin-flip even if the technicals look great.
+            if potential_rr > 0 and potential_rr < 1.2:
+                self._log(
+                    "bot",
+                    f"[R:R] {symbol} {side} rejected: potential R:R {potential_rr:.1f} (need 1.2+)",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+
+            confidence *= sr_quality
+
+            # =====================================================================
+            # MARKET-WIDE FUNDAMENTAL ALIGNMENT
+            # Combine fear/greed sentiment and BTC trend to nudge confidence.
+            # Aligned conditions push borderline trades over the floor;
+            # misaligned conditions trim weak signals so they fall short.
+            # =====================================================================
+            try:
+                fg_score = float(getattr(market_ctx, "market_fear_greed", 50.0))
+            except (TypeError, ValueError):
+                fg_score = 50.0
+            btc_trend = (getattr(market_ctx, "btc_trend", "") or "").lower()
+
+            fundamental_mult = 1.0
+            fundamental_notes: list[str] = []
+
+            if side == "BUY":
+                if fg_score >= 80:
+                    fundamental_mult *= 0.85
+                    fundamental_notes.append(f"extreme greed ({fg_score:.0f})")
+                elif fg_score <= 25 and signal.strategy in ("Mean Reversion", "Scalping"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"fear ({fg_score:.0f}) + reversion")
+                if btc_trend in ("strong_uptrend", "uptrend", "bullish"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"BTC {btc_trend}")
+                elif btc_trend in ("strong_downtrend", "downtrend", "bearish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.90
+                    fundamental_notes.append(f"BTC {btc_trend} - alts follow")
+            else:  # SELL
+                if fg_score <= 20:
+                    fundamental_mult *= 0.85
+                    fundamental_notes.append(f"extreme fear ({fg_score:.0f})")
+                elif fg_score >= 75 and signal.strategy in ("Mean Reversion", "Scalping"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"greed ({fg_score:.0f}) + reversion")
+                if btc_trend in ("strong_downtrend", "downtrend", "bearish"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"BTC {btc_trend}")
+                elif btc_trend in ("strong_uptrend", "uptrend", "bullish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.90
+                    fundamental_notes.append(f"BTC {btc_trend}")
+
+            confidence *= fundamental_mult
+
+            if fundamental_notes or abs(sr_quality - 1.0) > 0.05:
+                self._log(
+                    "bot",
+                    (
+                        f"[QUALITY] {symbol} {side}: sr_q={sr_quality:.2f} "
+                        f"(R:R={potential_rr:.1f}), fundamentals={fundamental_mult:.2f} "
+                        f"({'; '.join(fundamental_notes) or 'neutral'}) -> conf={confidence:.2f}"
+                    ),
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
             if best is None or confidence > best.get("confidence", 0.0):
