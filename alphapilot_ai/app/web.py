@@ -792,7 +792,7 @@ def debug_console_page(request: Request) -> HTMLResponse:
 
 @router.get("/debug/logs")
 def debug_get_logs() -> JSONResponse:
-    """Get all debug logs with stats."""
+    """Get all debug logs with comprehensive stats."""
     from datetime import timedelta
     
     now = utcnow()
@@ -804,43 +804,74 @@ def debug_get_logs() -> JSONResponse:
         
         # Count stats
         errors_24h = s.query(ActivityLog).filter(
-            ActivityLog.level == 'error',
+            ActivityLog.level.in_(['error', 'exception']),
             ActivityLog.created_at >= day_ago
         ).count()
         
         warnings_24h = s.query(ActivityLog).filter(
-            ActivityLog.level == 'warn',
+            ActivityLog.level.in_(['warn', 'warning']),
             ActivityLog.created_at >= day_ago
         ).count()
         
-        # Count blocked trades (messages containing 'blocked' or 'rejected')
+        # Count blocked/rejected trades
         blocked = s.query(ActivityLog).filter(
-            ActivityLog.message.ilike('%blocked%') | ActivityLog.message.ilike('%rejected%'),
+            (ActivityLog.message.ilike('%blocked%') | 
+             ActivityLog.message.ilike('%rejected%') |
+             ActivityLog.message.ilike('%RISK REJECTED%')),
             ActivityLog.created_at >= day_ago
         ).count()
         
         # Count executed trades
         executed = s.query(ActivityLog).filter(
-            ActivityLog.message.ilike('%opened%') | ActivityLog.message.ilike('%executed%'),
+            (ActivityLog.message.ilike('%opened%') | 
+             ActivityLog.message.ilike('%PAPER TRADE%')),
             ActivityLog.category == 'trade',
             ActivityLog.created_at >= day_ago
         ).count()
         
-        # Count decisions
-        decisions = s.query(ActivityLog).filter(
-            ActivityLog.category == 'bot',
+        # Count API failures
+        api_failures = s.query(ActivityLog).filter(
+            (ActivityLog.category == 'api') | 
+            (ActivityLog.message.ilike('%api%error%')) |
+            (ActivityLog.message.ilike('%fetch%fail%')) |
+            (ActivityLog.message.ilike('%request%fail%')),
+            ActivityLog.level.in_(['error', 'warn', 'warning']),
             ActivityLog.created_at >= day_ago
         ).count()
         
+        # Count settings/config issues
+        settings_issues = s.query(ActivityLog).filter(
+            (ActivityLog.category == 'settings') |
+            (ActivityLog.message.ilike('%config%')) |
+            (ActivityLog.message.ilike('%setting%')),
+            ActivityLog.level.in_(['error', 'warn', 'warning']),
+            ActivityLog.created_at >= day_ago
+        ).count()
+        
+        # Check if session is active
+        from config.bot_config import BotConfig
+        cfg = BotConfig()
+        session_active = cfg.get_bool("training_session_active")
+        
         log_list = []
         for log in logs:
+            # Parse source from message if available
+            source = ""
+            msg = log.message or ""
+            if msg.startswith("[") and "]" in msg:
+                source = msg[1:msg.index("]")]
+                msg = msg[msg.index("]")+1:].strip()
+            
             log_list.append({
                 "id": log.id,
-                "category": log.category,
-                "level": log.level,
-                "message": log.message,
+                "category": log.category or "system",
+                "level": log.level or "info",
+                "message": msg,
+                "source": source,
                 "created_at": log.created_at.isoformat() if log.created_at else None,
                 "wallet_id": log.wallet_id,
+                "details": {},
+                "traceback": None,
             })
         
         return JSONResponse({
@@ -851,8 +882,9 @@ def debug_get_logs() -> JSONResponse:
                 "warnings_24h": warnings_24h,
                 "trades_blocked": blocked,
                 "trades_executed": executed,
-                "decisions_made": decisions,
-                "api_calls": 0,  # TODO: track API calls
+                "api_failures": api_failures,
+                "settings_issues": settings_issues,
+                "session_active": session_active,
             }
         })
 
@@ -863,6 +895,132 @@ def debug_clear_logs() -> JSONResponse:
     with session_scope() as s:
         s.query(ActivityLog).delete()
     return JSONResponse({"ok": True})
+
+
+@router.get("/debug/diagnostics")
+def debug_run_diagnostics() -> JSONResponse:
+    """Run system diagnostics and return results."""
+    from config.bot_config import BotConfig
+    import os
+    
+    diagnostics = {}
+    
+    # 1. Database checks
+    db_checks = []
+    try:
+        with session_scope() as s:
+            wallet_count = s.query(Wallet).count()
+            trade_count = s.query(PaperTrade).count()
+            db_checks.append({"status": "ok", "message": f"Database connected ({wallet_count} wallets, {trade_count} trades)"})
+    except Exception as e:
+        db_checks.append({"status": "error", "message": f"Database error: {str(e)}"})
+    diagnostics["Database"] = db_checks
+    
+    # 2. Configuration checks
+    cfg_checks = []
+    cfg = BotConfig()
+    
+    min_conf = cfg.min_confidence
+    if min_conf > 0.7:
+        cfg_checks.append({"status": "warn", "message": f"min_confidence={min_conf} is very high - few trades will execute"})
+    elif min_conf < 0.2:
+        cfg_checks.append({"status": "warn", "message": f"min_confidence={min_conf} is very low - many low-quality trades"})
+    else:
+        cfg_checks.append({"status": "ok", "message": f"min_confidence={min_conf} is reasonable"})
+    
+    max_open = cfg.max_open_per_wallet
+    if max_open < 5:
+        cfg_checks.append({"status": "warn", "message": f"max_open_per_wallet={max_open} is low - limits diversification"})
+    else:
+        cfg_checks.append({"status": "ok", "message": f"max_open_per_wallet={max_open}"})
+    
+    pos_size = cfg.position_size_usd
+    cfg_checks.append({"status": "ok", "message": f"position_size_usd=${pos_size}"})
+    
+    session_active = cfg.get_bool("training_session_active")
+    if session_active:
+        cfg_checks.append({"status": "ok", "message": "Training session is ACTIVE"})
+    else:
+        cfg_checks.append({"status": "warn", "message": "Training session is NOT active"})
+    
+    diagnostics["Configuration"] = cfg_checks
+    
+    # 3. API connectivity checks
+    api_checks = []
+    try:
+        from connectors.live_prices import get_price
+        result = get_price("BTC-USD")
+        if result.get("ok"):
+            api_checks.append({"status": "ok", "message": f"Coinbase API connected (BTC=${result.get('price', 0):,.0f})"})
+        else:
+            api_checks.append({"status": "error", "message": f"Coinbase API error: {result.get('error', 'unknown')}"})
+    except Exception as e:
+        api_checks.append({"status": "error", "message": f"Coinbase API failed: {str(e)}"})
+    
+    # Check Claude API
+    claude_key = os.environ.get("ANTHROPIC_API_KEY") or cfg.get_str("anthropic_api_key")
+    if claude_key:
+        api_checks.append({"status": "ok", "message": "Claude API key configured"})
+    else:
+        api_checks.append({"status": "warn", "message": "Claude API key not set - AI decisions disabled"})
+    
+    diagnostics["API Connectivity"] = api_checks
+    
+    # 4. Trading system checks
+    trading_checks = []
+    try:
+        with session_scope() as s:
+            open_trades = s.query(PaperTrade).filter(PaperTrade.status == "open").count()
+            trading_checks.append({"status": "ok", "message": f"{open_trades} open positions"})
+            
+            # Check for stale positions (open > 24h)
+            from datetime import timedelta
+            stale_cutoff = utcnow() - timedelta(hours=24)
+            stale_trades = s.query(PaperTrade).filter(
+                PaperTrade.status == "open",
+                PaperTrade.opened_at < stale_cutoff
+            ).count()
+            if stale_trades > 0:
+                trading_checks.append({"status": "warn", "message": f"{stale_trades} positions open > 24 hours"})
+            
+            # Check wallet balance
+            wallet = s.query(Wallet).first()
+            if wallet:
+                if wallet.paper_balance < 100:
+                    trading_checks.append({"status": "error", "message": f"Low paper balance: ${wallet.paper_balance:.2f}"})
+                else:
+                    trading_checks.append({"status": "ok", "message": f"Paper balance: ${wallet.paper_balance:.2f}"})
+    except Exception as e:
+        trading_checks.append({"status": "error", "message": f"Trading check failed: {str(e)}"})
+    
+    diagnostics["Trading System"] = trading_checks
+    
+    # 5. Risk manager checks
+    risk_checks = []
+    try:
+        from trading.risk_manager import RiskManager
+        rm = RiskManager()
+        with session_scope() as s:
+            wallet = s.query(Wallet).first()
+            if wallet:
+                # Check if circuit breaker is active
+                if rm._check_daily_loss_breaker(wallet.id):
+                    risk_checks.append({"status": "warn", "message": "Daily loss circuit breaker is ACTIVE"})
+                else:
+                    risk_checks.append({"status": "ok", "message": "Circuit breaker not triggered"})
+                
+                # Check cooldown
+                cooldown_status, msg = rm._check_cooldown(wallet.id)
+                if not cooldown_status:
+                    risk_checks.append({"status": "warn", "message": f"Cooldown active: {msg}"})
+                else:
+                    risk_checks.append({"status": "ok", "message": "No cooldown active"})
+    except Exception as e:
+        risk_checks.append({"status": "error", "message": f"Risk check failed: {str(e)}"})
+    
+    diagnostics["Risk Manager"] = risk_checks
+    
+    return JSONResponse({"ok": True, "diagnostics": diagnostics})
 
 
 # ----------------------------------------------------------------------
