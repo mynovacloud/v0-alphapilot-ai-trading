@@ -9,23 +9,79 @@
     <p>This is where the Claude bot learns to trade. Every paper trade produces a reflection, every reflection updates the playbook, and every playbook rule shapes the next decision. The bot graduates to live trading only when its readiness score is high enough.</p>
   </div>
 <div class="flex gap-2">
-<form method="post" action="/training/memory/compact">
+<form method="post" action="/training/memory/compact" data-ajax-action="Compact Duplicates">
 <button class="btn" type="submit" title="Offline: merge near-duplicate rules and reinforce the canonical phrasing. No Claude call needed.">Compact Duplicates</button>
 </form>
-<form method="post" action="/training/memory/consolidate">
+<form method="post" action="/training/memory/consolidate" data-ajax-action="Consolidate Playbook">
 <button class="btn" type="submit" {{ '' if claude_configured else 'disabled' }} title="Ask Claude to merge duplicate rules and re-rank weights">Consolidate Playbook</button>
 </form>
-<form method="post" action="/training/memory/meta-analyze">
+<form method="post" action="/training/memory/meta-analyze" data-ajax-action="Deep Analysis">
 <button class="btn btn-primary" type="submit" {{ '' if claude_configured else 'disabled' }} title="Analyze patterns across recent trades to discover higher-order insights">Deep Analysis</button>
 </form>
-<form method="post" action="/training/memory/discover-edges">
+<form method="post" action="/training/memory/discover-edges" data-ajax-action="Discover Edges">
 <button class="btn btn-success" type="submit" title="Cluster mistakes and discover profitable edges from your trade history">Discover Edges</button>
 </form>
-<form method="post" action="/training/memory/reset" onsubmit="return confirm('Wipe ALL learned rules and lessons? This cannot be undone.')">
+<form method="post" action="/training/memory/reset" data-ajax-action="Reset Memory" data-ajax-confirm="Wipe ALL learned rules and lessons? This cannot be undone.">
 <button class="btn btn-danger" type="submit">Reset Memory</button>
 </form>
 </div>
 </div>
+
+<!--
+  Run the memory-action POSTs over fetch() so the page (and the live
+  trading session feed) never reload. A page reload was wiping the
+  Claude Decisions and Fills panels back to zero whenever the user
+  clicked Compact Duplicates / Consolidate / etc. while a session was
+  running, because the in-memory cursors reset and the rendered DOM
+  was discarded. With AJAX, the live-session controller keeps polling
+  and the panels stay populated.
+-->
+<script>
+(function () {
+  const forms = document.querySelectorAll("form[data-ajax-action]");
+  forms.forEach((form) => {
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const label = form.dataset.ajaxAction || "Action";
+      const confirmMsg = form.dataset.ajaxConfirm;
+      if (confirmMsg && !confirm(confirmMsg)) return;
+      const btn = form.querySelector("button[type=submit]");
+      const orig = btn ? btn.textContent : "";
+      if (btn) { btn.disabled = true; btn.textContent = label + "…"; }
+      try {
+        const res = await fetch(form.action, {
+          method: "POST",
+          headers: { "Accept": "application/json", "X-Requested-With": "fetch" },
+        });
+        // The endpoint may either redirect (303) or return JSON. Either
+        // way, success means the action ran. We surface the result in
+        // the live-session console if it exists, otherwise a toast-ish
+        // text update on the button.
+        const ok = res.ok || res.redirected || res.status === 303;
+        const consoleEl = document.getElementById("live-console");
+        if (consoleEl) {
+          const node = document.createElement("div");
+          node.style.cssText = "color:" + (ok ? "#26c281" : "#ff6b6b") + ";line-height:1.35;";
+          const t = new Date().toLocaleTimeString();
+          node.innerHTML = '<span style="color:#666;">[' + t + "][memory]</span> " +
+            label + (ok ? " complete." : " failed (HTTP " + res.status + ").");
+          consoleEl.insertBefore(node, consoleEl.firstChild);
+        }
+        if (btn) {
+          btn.textContent = ok ? (label + " ✓") : (label + " ✗");
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+        }
+      } catch (e) {
+        if (btn) {
+          btn.textContent = label + " ✗";
+          setTimeout(() => { btn.textContent = orig; btn.disabled = false; }, 2000);
+        }
+        console.error("[v0] memory action failed", e);
+      }
+    });
+  });
+})();
+</script>
 
 <!-- ============================================================ -->
 <!-- PORTFOLIO INTELLIGENCE STATUS                                   -->
@@ -1341,7 +1397,7 @@ document.addEventListener('keydown', e => {
           <div class="kpi" style="border-left: 3px solid var(--border);">
             <div class="kpi-label">Realized P&amp;L</div>
             <div class="kpi-value mono" id="lab-kpi-pnl" style="font-size: 1.6rem; font-weight: 800;">$0.00</div>
-            <div class="text-dim" id="lab-kpi-pnl-sub" style="font-size: 0.72rem;">best — / worst —</div>
+            <div class="text-dim" id="lab-kpi-pnl-sub" style="font-size: 0.72rem;">best — / worst ��</div>
           </div>
           <!-- Currently open in this symbol -->
           <div class="kpi" style="border-left: 3px solid var(--border);">
