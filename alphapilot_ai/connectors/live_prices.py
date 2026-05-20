@@ -130,21 +130,12 @@ def get_price(symbol: str, use_cache: bool = True) -> dict[str, Any]:
             cached = _CACHE.get(cache_key) or _CACHE.get(f"cb:{sym}")
             if cached:
                 return {"ok": True, "symbol": sym, "price": cached[0], "source": "cache (stale)", "live": False}
-        logger.warning("Price fetch failed for %s: %s", sym, e)
-        
-        # Log to activity log for debug console
-        try:
-            from database.db import session_scope
-            from database.models import ActivityLog
-            with session_scope() as s:
-                s.add(ActivityLog(
-                    category="api",
-                    level="warn",
-                    message=f"[live_prices] Price fetch failed for {sym}: {str(e)[:200]}",
-                ))
-        except Exception:
-            pass
-        
+        # We intentionally do NOT write a per-symbol ActivityLog here. With a
+        # 200-symbol universe, a single Coinbase 429 burst would otherwise
+        # spawn hundreds of warn rows per tick and drown the debug console.
+        # Aggregate price-fetch errors are surfaced at the batch level by
+        # `get_prices_batch` instead.
+        logger.debug("Price fetch failed for %s: %s", sym, e)
         return {"ok": False, "symbol": sym, "error": f"Live price fetch failed: {e}"}
 
 
@@ -211,9 +202,22 @@ def get_prices_batch(symbols: list[str]) -> dict[str, float]:
             # Fall back to individual Coinbase fetches
             coinbase_symbols.extend(coingecko_symbols.keys())
     
-    # Fetch remaining from Coinbase (no batch API, but use connection pooling)
+    # Fetch remaining from Coinbase. Coinbase has no batch endpoint, so we
+    # serialize the requests and back off the moment we hit a 429 — otherwise
+    # a 200-symbol universe instantly burns through their unauthenticated rate
+    # limit and the rest of the tick gets nothing but errors.
+    failed: list[tuple[str, str]] = []
+    rate_limited = False
     for sym in coinbase_symbols:
         if sym in result:
+            continue
+        if rate_limited:
+            # Once Coinbase has signaled overload, stop hammering it for the
+            # rest of this tick. Use stale cache where we can.
+            with _CACHE_LOCK:
+                cached = _CACHE.get(f"cb:{sym}")
+                if cached:
+                    result[sym] = cached[0]
             continue
         product_id = sym if "-" in sym else f"{sym}-USD"
         url = f"https://api.exchange.coinbase.com/products/{product_id}/ticker"
@@ -225,14 +229,42 @@ def get_prices_batch(symbols: list[str]) -> dict[str, float]:
             result[sym] = price
             with _CACHE_LOCK:
                 _CACHE[f"cb:{sym}"] = (price, now)
-        except Exception as e:
-            logger.debug("Coinbase fetch failed for %s: %s", sym, e)
-            # Try cached value as fallback
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 429:
+                rate_limited = True
             with _CACHE_LOCK:
                 cached = _CACHE.get(f"cb:{sym}")
                 if cached:
                     result[sym] = cached[0]
-    
+                else:
+                    failed.append((sym, f"HTTP {e.response.status_code if e.response is not None else '?'}"))
+        except Exception as e:
+            logger.debug("Coinbase fetch failed for %s: %s", sym, e)
+            with _CACHE_LOCK:
+                cached = _CACHE.get(f"cb:{sym}")
+                if cached:
+                    result[sym] = cached[0]
+                else:
+                    failed.append((sym, str(e)[:80]))
+
+    # Single aggregated DB log instead of one row per failed symbol so the
+    # debug console stays useful instead of being flooded with 429 noise.
+    if failed:
+        try:
+            from database.db import session_scope
+            from database.models import ActivityLog
+            preview = ", ".join(s for s, _ in failed[:8])
+            extra = "" if len(failed) <= 8 else f" (+{len(failed) - 8} more)"
+            note = " — Coinbase rate-limited (429); falling back to cached prices for the rest of this tick" if rate_limited else ""
+            with session_scope() as s:
+                s.add(ActivityLog(
+                    category="api",
+                    level="warn",
+                    message=f"[live_prices] Price fetch failed for {len(failed)} symbols: {preview}{extra}{note}",
+                ))
+        except Exception:
+            pass
+
     return result
 
 

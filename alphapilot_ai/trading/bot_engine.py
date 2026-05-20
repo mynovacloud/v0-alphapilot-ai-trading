@@ -560,7 +560,14 @@ class BotEngine:
                 side=side,
                 confidence=confidence,
                 current_positions=current_positions,
-                market_regime=market_ctx.regime if market_ctx else None,
+                # MarketContext exposes regime info via two separate fields
+                # (`volatility_regime` and `correlation_regime`); the trade
+                # filter only needs a single string, so we forward the
+                # volatility regime which is what its rules key off of.
+                market_regime=(
+                    getattr(market_ctx, "volatility_regime", None)
+                    if market_ctx else None
+                ),
                 signal_strategy=signal.strategy if signal else None,
             )
             
