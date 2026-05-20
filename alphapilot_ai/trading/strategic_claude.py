@@ -385,8 +385,16 @@ class StrategicRouter:
         # low-confidence trades. Using a hard floor here would override the user's
         # configured floor and cause the wallet summary to show "no signals" even
         # when the user lowered the floor in the UI to encourage paper trades.
+        #
+        # In training mode we're even more permissive — the risk manager and
+        # position sizer still protect capital, but we want the bot to take
+        # trades so it can learn which patterns work.
+        from config import bot_config as bot_cfg_mod
+        training_active = str(bot_cfg_mod.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+        conf_floor = 0.15 if training_active else 0.30
+        
         return TradeDecision(
-            action=side if adjusted_confidence >= 0.30 else "HOLD",
+            action=side if adjusted_confidence >= conf_floor else "HOLD",
             confidence=adjusted_confidence,
             size_multiplier=size_multiplier,
             stop_loss_pct=autonomous_decision.stop_loss_pct,
