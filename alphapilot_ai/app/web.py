@@ -976,7 +976,7 @@ def _run_diagnostics_inner() -> JSONResponse:
     pos_size = cfg.position_size_usd
     cfg_checks.append({"status": "ok", "message": f"position_size_usd=${pos_size}"})
     
-    session_active = cfg.get_bool("training_session_active")
+    session_active = str(bot_config.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     if session_active:
         cfg_checks.append({"status": "ok", "message": "Training session is ACTIVE"})
     else:
@@ -997,7 +997,7 @@ def _run_diagnostics_inner() -> JSONResponse:
         api_checks.append({"status": "error", "message": f"Coinbase API failed: {str(e)}"})
     
     # Check Claude API
-    claude_key = os.environ.get("ANTHROPIC_API_KEY") or cfg.get_str("anthropic_api_key")
+    claude_key = os.environ.get("ANTHROPIC_API_KEY") or bot_config.get("anthropic_api_key")
     if claude_key:
         api_checks.append({"status": "ok", "message": "Claude API key configured"})
     else:
