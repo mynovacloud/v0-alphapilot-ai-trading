@@ -1390,6 +1390,42 @@ def _persist_decision(
         logger.exception("Failed to persist ClaudeDecision row.")
 
 
+def persist_decision(
+    wallet: dict[str, Any],
+    symbol: str,
+    price: float,
+    technical_signal: Signal,
+    decision: "TradeDecision",
+    *,
+    prompt_used: str = "",
+    raw_text: str = "",
+    source_override: str | None = None,
+    extra_context: dict[str, Any] | None = None,
+) -> None:
+    """Public wrapper around _persist_decision.
+
+    The strategic router's autonomous-only path returns a TradeDecision without
+    routing through claude_decide(), so without this hook those trades would
+    open with no ClaudeDecision row, no market_snapshot, and no
+    claude_decision_id — breaking the learn-side loop for the most common
+    trade type (signals not worth a Claude consult).
+
+    Side effect: on a successful commit, decision.claude_decision_id is set to
+    the new row's primary key. Caller can then thread it onto PaperTrade.
+    """
+    _persist_decision(
+        wallet=wallet,
+        symbol=symbol,
+        price=price,
+        technical_signal=technical_signal,
+        decision=decision,
+        prompt_used=prompt_used,
+        raw_text=raw_text,
+        source_override=source_override,
+        extra_context=extra_context,
+    )
+
+
 # =============================================================================
 # TINY HELPERS
 # =============================================================================
