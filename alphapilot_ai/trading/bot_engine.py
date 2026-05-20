@@ -47,6 +47,7 @@ from trading.advanced_signal_engine import get_signal_engine, AdvancedSignal
 from trading.advanced_position_sizer import get_position_sizer
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from trading.market_intelligence import get_market_intelligence
+from trading.strategic_claude import get_strategic_router
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -469,15 +470,28 @@ class BotEngine:
                     }
                 continue
 
-            # Hand the technical signal to Claude for the FINAL decision.
-            claude_calls += 1
-            decision = claude_decide(
+            # =====================================================================
+            # STRATEGIC CLAUDE ROUTING
+            # Only calls expensive Claude API when it adds value:
+            # - Ambiguous signals (40-65% confidence)
+            # - Large positions (>$500)
+            # - Reversal situations
+            # - High volatility moments
+            # Otherwise uses fast technical decision
+            # =====================================================================
+            strategic_router = get_strategic_router()
+            decision = strategic_router.decide(
                 wallet=wallet,
                 symbol=symbol,
                 price=price,
                 technical_signal=signal,
                 strategy_type=strategy_type,
+                position_size_usd=cfg.position_size_usd,
             )
+            
+            # Track if we used Claude for logging
+            if decision.source == "claude":
+                claude_calls += 1
 
             side = decision.action
             confidence = float(decision.confidence or 0.0)

@@ -17,11 +17,18 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, List, Dict
 
 from database.db import session_scope
 from database.models import PaperTrade, ActivityLog
 from utils.helpers import utcnow
+
+# Import advanced exit manager for smarter exit decisions
+try:
+    from trading.advanced_exit_manager import get_exit_manager, ExitDecision
+    ADVANCED_EXIT_AVAILABLE = True
+except ImportError:
+    ADVANCED_EXIT_AVAILABLE = False
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
