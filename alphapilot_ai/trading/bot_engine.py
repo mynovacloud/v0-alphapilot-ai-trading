@@ -413,13 +413,44 @@ class BotEngine:
             # Get market context (BTC trend, overall sentiment)
             market_ctx = market_intel.get_market_context()
             
-            # Compute the REAL signal from Coinbase candle data instead of a
-            # synthetic snapshot. evaluate_symbol picks the strategy implementation
-            # (Momentum / Mean Reversion / Volatility Breakout / Probability Edge)
-            # and returns a Signal with confidence, reasoning, and indicators.
-            # Granularity follows the tick rate so a 2s real-time session uses
-            # 60s bars instead of stale 5-minute data.
-            signal = evaluate_symbol(symbol, strategy_type, tick_seconds=cfg.tick_seconds)
+            # =====================================================================
+            # ADVANCED MULTI-FACTOR SIGNAL GENERATION
+            # Uses the new advanced_signal_engine with:
+            # - Trend analysis (EMA alignment, ADX)
+            # - Momentum (RSI, MACD histogram, rate of change)
+            # - Volatility (ATR, Bollinger Band position)
+            # - Volume confirmation
+            # - Pattern recognition
+            # - Quality grades (A+, A, B, C, F)
+            # =====================================================================
+            signal_engine = get_signal_engine()
+            advanced_signal = signal_engine.generate_signal(
+                symbol=symbol,
+                current_price=price,
+                strategy_type=strategy_type,
+            )
+            
+            # Convert to legacy Signal format for compatibility
+            from trading.strategy_engine import Signal
+            signal = Signal(
+                side=advanced_signal.side,
+                confidence=advanced_signal.confidence,
+                reasoning=advanced_signal.reasoning,
+                strategy=advanced_signal.strategy,
+                indicators=advanced_signal.indicators,
+            )
+            
+            # Log quality grade for high-conviction signals
+            if advanced_signal.quality in ("A+", "A") and advanced_signal.side != "HOLD":
+                self._log(
+                    "bot",
+                    f"[SIGNAL] {symbol}: {advanced_signal.side} Grade={advanced_signal.quality} "
+                    f"Factors={advanced_signal.confirming_factors}/{advanced_signal.total_factors} "
+                    f"Conf={advanced_signal.confidence:.2f}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+            
             evaluated += 1
             result.decisions += 1
             

@@ -4,20 +4,43 @@ Market Intelligence Module - Makes the bot smarter than average humans.
 This module adds the "trader's intuition" that humans have:
 1. Cross-asset correlation (BTC leads alts, macro awareness)
 2. Sentiment analysis (fear/greed, funding rates)  
-3. Liquidity analysis (spread, volume profile)
+3. Liquidity analysis (spread, volume profile, order book depth)
 4. Smart entry timing (wait for pullbacks, support levels)
-5. News/event awareness (earnings, upgrades, macro)
+5. Real-time data (websocket feeds, order flow)
+6. Funding rate analysis (crowded trade detection)
 """
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Dict, List
 from datetime import datetime, timedelta
 from utils.logger import get_logger
 from utils.helpers import utcnow
 
 logger = get_logger(__name__)
+
+# Import advanced data sources
+try:
+    from trading.orderbook_analyzer import get_orderbook_analyzer, OrderBookAnalysis
+    ORDERBOOK_AVAILABLE = True
+except ImportError:
+    ORDERBOOK_AVAILABLE = False
+    logger.debug("Order book analyzer not available")
+
+try:
+    from trading.funding_tracker import get_funding_tracker, FundingAnalysis
+    FUNDING_AVAILABLE = True
+except ImportError:
+    FUNDING_AVAILABLE = False
+    logger.debug("Funding tracker not available")
+
+try:
+    from connectors.websocket_feed import get_websocket_feed
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+    logger.debug("WebSocket feed not available")
 
 
 # =============================================================================
@@ -383,6 +406,11 @@ class MarketIntelligence:
     """
     Central hub for all market intelligence.
     Makes the bot "smarter" by considering factors humans naturally consider.
+    
+    Now integrates:
+    - Order book depth analysis
+    - Funding rate tracking  
+    - Real-time websocket data
     """
     
     def __init__(self):
@@ -391,6 +419,19 @@ class MarketIntelligence:
         self.entry_timing = EntryTimingAnalyzer()
         self.sentiment = SentimentAnalyzer()
         self._price_cache: dict[str, list[float]] = {}
+        
+        # Initialize advanced data sources
+        self._orderbook_analyzer = get_orderbook_analyzer() if ORDERBOOK_AVAILABLE else None
+        self._funding_tracker = get_funding_tracker() if FUNDING_AVAILABLE else None
+        self._ws_feed = get_websocket_feed() if WEBSOCKET_AVAILABLE else None
+        
+        # Start background services
+        if self._funding_tracker:
+            try:
+                self._funding_tracker.start()
+                logger.info("Funding rate tracker started")
+            except Exception as e:
+                logger.debug(f"Failed to start funding tracker: {e}")
     
     def update_price(self, symbol: str, price: float):
         """Update price cache for a symbol."""
@@ -488,7 +529,30 @@ class MarketIntelligence:
             result.size_adjustment *= 0.7
             result.market_context.reasoning += " Extreme greed detected - reducing position size."
         
-        # 5. Calculate recommended exposure
+        # 5. Funding rate analysis (for perpetual futures sentiment)
+        if self._funding_tracker:
+            try:
+                if side == "BUY":
+                    funding_analysis = self._funding_tracker.should_enter_long(symbol)
+                else:
+                    funding_analysis = self._funding_tracker.should_enter_short(symbol)
+                
+                # Adjust based on funding conditions
+                if not funding_analysis.get("favorable", True):
+                    result.confidence_adjustment *= 0.8
+                    result.market_context.reasoning += f" Funding unfavorable: {funding_analysis.get('reasons', [''])[0]}."
+                elif funding_analysis.get("score", 50) > 70:
+                    result.confidence_adjustment *= 1.1
+                    result.market_context.reasoning += " Funding conditions favorable."
+                
+                # Wait for funding if recommended
+                if funding_analysis.get("wait_for_funding"):
+                    result.entry_timing.should_wait = True
+                    result.entry_timing.wait_reason = "Funding payment approaching"
+            except Exception as e:
+                logger.debug(f"Funding analysis error: {e}")
+        
+        # 6. Calculate recommended exposure
         result.market_context.recommended_exposure = min(1.0, result.confidence_adjustment * result.size_adjustment)
         
         return result
