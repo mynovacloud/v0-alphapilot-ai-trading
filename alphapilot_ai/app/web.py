@@ -847,7 +847,7 @@ def debug_get_logs() -> JSONResponse:
         
         # Check if session is active
         from config.bot_config import BotConfig
-        cfg = BotConfig()
+        cfg = BotConfig.load()
         session_active = cfg.get_bool("training_session_active")
         
         log_list = []
@@ -959,7 +959,7 @@ def _run_diagnostics_inner() -> JSONResponse:
     
     # 2. Configuration checks
     cfg_checks = []
-    cfg = BotConfig()
+    cfg = BotConfig.load()
     
     min_conf = cfg.min_confidence
     if min_conf > 0.7:

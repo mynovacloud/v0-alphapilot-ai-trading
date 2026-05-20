@@ -335,7 +335,7 @@ class RiskManager:
         Uses BotConfig to ensure we get the latest setting including session overrides.
         """
         from config.bot_config import BotConfig
-        cfg = BotConfig()
+        cfg = BotConfig.load()
         return cfg.max_open_per_wallet
 
     @classmethod
