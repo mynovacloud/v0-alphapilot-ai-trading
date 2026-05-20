@@ -136,8 +136,14 @@ class RiskManager:
                         "daily_loss_breaker",
                     )
 
-            # 4. Cooldown after consecutive losses (bypass in training mode)
-            if not self.is_training_mode():
+            # 4. Cooldown after consecutive losses.
+            #    - Skipped during training mode (bypass flag).
+            #    - Skipped entirely for paper wallets: paper trades have no
+            #      real capital at risk, so a "lock out after 3 losses" rule
+            #      just kills the learning loop. The cooldown exists to
+            #      protect LIVE capital after a bad streak; in paper, the
+            #      whole point is to keep trading and gather data.
+            if not self.is_training_mode() and not is_paper:
                 cooldown_until = self._cooldown_until(s, wallet, is_paper=is_paper)
                 if cooldown_until is not None:
                     return RiskDecision(
