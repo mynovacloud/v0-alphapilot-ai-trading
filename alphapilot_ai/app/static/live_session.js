@@ -427,6 +427,8 @@
       fd.append("max_open_per_wallet", maxOpenSel.value);
       fd.append("universe_limit", universeLimitEl ? universeLimitEl.value : "40");
       fd.append("aggressive", aggressiveEl && aggressiveEl.checked ? "true" : "false");
+      const styleSel = document.getElementById("live-trading-style");
+      fd.append("trading_style", styleSel ? styleSel.value : "hybrid");
       const res = await fetch("/training/session/start", { method: "POST", body: fd });
       const data = await res.json();
       if (!data.ok) {
@@ -448,6 +450,10 @@
       const posSize = data.position_size_usd != null ? Math.round(data.position_size_usd) : "?";
       const maxOpenVal = data.max_open_per_wallet != null ? data.max_open_per_wallet : "?";
       const uniLimit = data.universe_limit != null ? data.universe_limit : "?";
+      const styleVal = data.trading_style || (styleSel ? styleSel.value : "hybrid");
+      // Echo the server-confirmed style back into the dropdown so a reconnecting
+      // user sees the *actual* effective setting rather than a stale UI default.
+      if (styleSel && data.trading_style) styleSel.value = data.trading_style;
       
       renderLog({
         ts: Math.floor(Date.now() / 1000),
@@ -455,7 +461,8 @@
         category: "session",
         message:
           "Session started — tick " + tickSec + "s · floor " + minConf +
-          " · $" + posSize + "/trade · " + maxOpenVal + " open · universe " + uniLimit,
+          " · $" + posSize + "/trade · " + maxOpenVal + " open · universe " + uniLimit +
+          " · style " + styleVal,
       });
       // Collapse the settings card once running so the live feed has more room.
       if (settingsDetails) settingsDetails.open = false;

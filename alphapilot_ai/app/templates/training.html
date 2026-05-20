@@ -387,6 +387,15 @@ loadPnlStats('today');
       <label class="text-muted" style="font-size:0.74rem;">Universe size</label>
       <input id="live-universe-limit" type="number" min="10" max="200" value="100" class="input" style="width:80px;">
       <span class="text-dim" style="font-size:0.68rem;">Min 10. Higher = more crypto diversity.</span>
+
+      <label class="text-muted" style="font-size:0.74rem;margin-left:0.6rem;">Trading style</label>
+      <select id="live-trading-style" class="input" style="width:130px;font-size:0.78rem;">
+        <option value="hybrid">Hybrid (AI)</option>
+        <option value="scalper">Scalper</option>
+        <option value="swing">Swing</option>
+      </select>
+      <span class="text-dim" style="font-size:0.68rem;">Scalper = micro-profits · Swing = larger gains</span>
+
       <label class="flex items-center gap-1 text-muted" style="font-size:0.74rem;margin-left:0.6rem;cursor:pointer;">
         <input id="live-aggressive" type="checkbox">
         <span>Aggressive training mode</span>
