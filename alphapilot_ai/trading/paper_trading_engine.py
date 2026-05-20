@@ -55,7 +55,7 @@ class PaperTradingEngine:
         )
 
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
-        if not decision:
+        if not decision.approved:
             logger.warning(f"[OPEN_TRADE] REJECTED by risk manager: {decision.reason} (code={decision.code})")
             self._log("risk", f"Trade BLOCKED: {decision.reason} (code={decision.code})", wallet_id=wallet_id, level="warn")
             return {"ok": False, "reason": decision.reason, "code": decision.code}
