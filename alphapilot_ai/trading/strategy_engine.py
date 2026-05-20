@@ -947,9 +947,16 @@ def evaluate_entry_quality(
     swing_low = swings["swing_low"]
 
     if side == "BUY":
-        headroom = (swing_high - last) / last if last > 0 else 0.0
-        # Risk = distance to swing low (where our structural stop lives) + ATR buffer.
-        risk = ((last - swing_low) / last + atr_pct * 0.2) if last > 0 else 0.0
+        # Breakout case: no pivot above price in the lookback window. Treat
+        # this as a clear-room scenario and synthesize a target 3xATR above
+        # so the trade isn't penalised for trading at fresh highs.
+        if last >= swing_high:
+            headroom = max(atr_pct * 3.0, 0.02)
+            risk = ((last - swing_low) / last + atr_pct * 0.2) if last > 0 else 0.0
+        else:
+            headroom = (swing_high - last) / last if last > 0 else 0.0
+            # Risk = distance to swing low (where our structural stop lives) + ATR buffer.
+            risk = ((last - swing_low) / last + atr_pct * 0.2) if last > 0 else 0.0
         # Reject BUYs with less headroom than 1.0x ATR — that's barely room
         # to make 1R before hitting resistance. We need the target to be
         # reachable WITHIN visible market structure.
@@ -970,8 +977,13 @@ def evaluate_entry_quality(
                 "atr_pct": atr_pct,
             }
     elif side == "SELL":
-        headroom = (last - swing_low) / last if last > 0 else 0.0
-        risk = ((swing_high - last) / last + atr_pct * 0.2) if last > 0 else 0.0
+        # Breakdown case: no pivot below price in the lookback window.
+        if last <= swing_low:
+            headroom = max(atr_pct * 3.0, 0.02)
+            risk = ((swing_high - last) / last + atr_pct * 0.2) if last > 0 else 0.0
+        else:
+            headroom = (last - swing_low) / last if last > 0 else 0.0
+            risk = ((swing_high - last) / last + atr_pct * 0.2) if last > 0 else 0.0
         min_headroom = max(0.008, atr_pct * 1.0)
         if headroom < min_headroom:
             return {
@@ -1193,20 +1205,31 @@ def stop_take_levels(
 
 
 def swing_levels(candles: list[dict[str, Any]], lookback: int = 30) -> dict[str, float]:
-    """Return the most recent swing high / swing low over `lookback` bars.
+    """Return the relevant swing high / swing low over `lookback` bars.
 
-    A "swing" here is the conventional 3-bar pattern: a bar whose high (or
-    low) is more extreme than its two neighbours on each side. Returns dict
-    with `swing_low` / `swing_high` (latest within lookback) and falls back
-    to absolute high/low if no clean swing was found.
+    The structural resistance for a long-side setup is the absolute highest
+    high in the window — anything lower has already been broken through and
+    is no longer resistance. We additionally surface the *most recent*
+    confirmed 5-bar pivot when one exists ABOVE the current price, since
+    that's a more proximate ceiling than the window-extreme. If price is
+    already above every pivot in the window (a breakout), we keep the
+    absolute max so callers can detect that case via `last >= swing_high`.
+
+    A "swing" here is the conventional 5-bar pattern: a bar whose high (or
+    low) is more extreme than its two neighbours on each side.
     """
     if len(candles) < 7:
         return {}
     window = candles[-min(lookback, len(candles)):]
-    swing_high = max(float(c["high"]) for c in window)
-    swing_low = min(float(c["low"]) for c in window)
-    # Look for a more recent (closer to current bar) confirmed pivot. We
-    # walk backward from bar n-3 toward the start, checking 2-bar neighbours.
+    abs_high = max(float(c["high"]) for c in window)
+    abs_low = min(float(c["low"]) for c in window)
+    last_close = float(window[-1]["close"])
+
+    # Find the most recent pivot ABOVE current price (proximate resistance)
+    # and the most recent pivot BELOW current price (proximate support).
+    # Walk backward from the most recent confirmable pivot toward the start.
+    proximate_high: float | None = None
+    proximate_low: float | None = None
     n = len(window)
     for i in range(n - 3, 1, -1):
         h = float(window[i]["high"])
@@ -1223,10 +1246,17 @@ def swing_levels(candles: list[dict[str, Any]], lookback: int = 30) -> dict[str,
             and l < float(window[i + 1]["low"])
             and l < float(window[i + 2]["low"])
         )
-        if is_swing_high and h < swing_high * 1.0001:
-            swing_high = h
-        if is_swing_low and l > swing_low * 0.9999:
-            swing_low = l
+        if is_swing_high and proximate_high is None and h > last_close:
+            proximate_high = h
+        if is_swing_low and proximate_low is None and l < last_close:
+            proximate_low = l
+        if proximate_high is not None and proximate_low is not None:
+            break
+
+    # Resistance: prefer the closest pivot above price; fall back to abs max.
+    # Either way, never return a level BELOW current price as "resistance".
+    swing_high = proximate_high if proximate_high is not None else abs_high
+    swing_low = proximate_low if proximate_low is not None else abs_low
     return {"swing_high": swing_high, "swing_low": swing_low}
 
 
