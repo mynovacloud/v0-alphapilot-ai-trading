@@ -347,6 +347,15 @@ loadPnlStats('today');
     confidence floor for an aggressive training session, and watch executions stream in below. Stop any time.
   </p>
 
+  <!-- Background-run hint: shown only while the session is live so users know
+       it's safe to navigate away without killing the bot. -->
+  <div id="live-bg-hint" style="display:none;background:rgba(34,197,94,0.08);border:1px solid var(--good);border-radius:var(--radius-sm);padding:0.55rem 0.8rem;margin-bottom:0.75rem;font-size:0.78rem;color:var(--text);">
+    Session runs in the background — you can leave this page (including switching to the
+    <a href="/debug" style="color:var(--accent);text-decoration:underline;">Debug Console</a>)
+    and trading will continue. Failures stream to the Debug Console with timestamps in real time.
+    Use <strong>Stop Session</strong> to fully halt trading.
+  </div>
+
   <!-- Session Settings panel -->
   <details id="live-settings" open style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.75rem 0.9rem;margin-bottom:0.9rem;">
     <summary class="mono" style="cursor:pointer;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">
@@ -387,6 +396,15 @@ loadPnlStats('today');
       <label class="text-muted" style="font-size:0.74rem;">Universe size</label>
       <input id="live-universe-limit" type="number" min="10" max="200" value="100" class="input" style="width:80px;">
       <span class="text-dim" style="font-size:0.68rem;">Min 10. Higher = more crypto diversity.</span>
+
+      <label class="text-muted" style="font-size:0.74rem;margin-left:0.6rem;">Trading style</label>
+      <select id="live-trading-style" class="input" style="width:130px;font-size:0.78rem;">
+        <option value="hybrid">Hybrid (AI)</option>
+        <option value="scalper">Scalper</option>
+        <option value="swing">Swing</option>
+      </select>
+      <span class="text-dim" style="font-size:0.68rem;">Scalper = micro-profits · Swing = larger gains</span>
+
       <label class="flex items-center gap-1 text-muted" style="font-size:0.74rem;margin-left:0.6rem;cursor:pointer;">
         <input id="live-aggressive" type="checkbox">
         <span>Aggressive training mode</span>

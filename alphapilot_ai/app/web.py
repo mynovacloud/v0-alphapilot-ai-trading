@@ -894,9 +894,53 @@ def debug_clear_logs() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@router.post("/debug/log/push")
+def debug_log_push(
+    level: str = Form("info"),
+    category: str = Form("session_error"),
+    message: str = Form(...),
+    source: str = Form(""),
+) -> JSONResponse:
+    """
+    Client-side failure ingestion. The Training Center calls this whenever
+    the browser encounters a session-related error (poll failure, start/stop
+    failure, kill-switch event, unhandled JS exception, etc.) so the Debug
+    Console — which mirrors ActivityLog — can render it in real time with a
+    timestamp instead of silently swallowing the event in devtools.
+    """
+    lvl = (level or "info").strip().lower()
+    if lvl not in ("info", "warn", "warning", "error", "success", "debug"):
+        lvl = "info"
+    cat = (category or "session_error").strip().lower()[:50] or "session_error"
+    src = (source or "").strip()[:120]
+    msg = (message or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "error": "message required"}, status_code=400)
+    # Prefix with [source] so /debug/logs' parser surfaces it in the source column.
+    full = f"[{src}] {msg}" if src else msg
+    with session_scope() as s:
+        s.add(ActivityLog(category=cat, level=lvl, message=full[:2000]))
+    return JSONResponse({"ok": True})
+
+
 @router.get("/debug/diagnostics")
 def debug_run_diagnostics() -> JSONResponse:
-    """Run system diagnostics and return results."""
+    """Run system diagnostics and return results.
+    Wrapped in a top-level try/except so a single broken check still returns
+    a structured 200 — otherwise FastAPI raises 500 and the Debug Console
+    shows nothing, which is exactly the symptom we hit before."""
+    import traceback as _tb
+    try:
+        return _run_diagnostics_inner()
+    except Exception as e:
+        return JSONResponse({
+            "ok": False,
+            "error": str(e) or "Unknown diagnostics error",
+            "traceback": _tb.format_exc(),
+        })
+
+
+def _run_diagnostics_inner() -> JSONResponse:
     from config.bot_config import BotConfig
     import os
     
@@ -1262,6 +1306,7 @@ def training_session_start(
     max_open_per_wallet: int = Form(5),
     universe_limit: int = Form(40),
     aggressive: str = Form("false"),
+    trading_style: str = Form("hybrid"),
 ) -> JSONResponse:
     import logging
     import traceback
@@ -1279,6 +1324,14 @@ def training_session_start(
             pos_usd = float(cfg_get("bot_position_size_usd") or 100)
             max_open = int(float(cfg_get("bot_max_open_per_wallet") or 5))
             uni_limit = int(float(cfg_get("bot_universe_limit") or 40))
+            current_style = "hybrid"
+            try:
+                with session_scope() as s:
+                    w = s.query(Wallet).first()
+                    if w and getattr(w, "trading_style", None):
+                        current_style = w.trading_style
+            except Exception:
+                pass
             return JSONResponse({
                 "ok": True, 
                 "already_running": True,
@@ -1287,6 +1340,7 @@ def training_session_start(
                 "position_size_usd": pos_usd,
                 "max_open_per_wallet": max_open,
                 "universe_limit": uni_limit,
+                "trading_style": current_style,
                 "claude_configured": claude_is_configured(),
             })
 
@@ -1352,6 +1406,12 @@ def training_session_start(
             }
         )
 
+        # Validate trading_style — fall back to "hybrid" silently rather than 400ing,
+        # since this comes from a UI dropdown that can't really send anything else.
+        style = (trading_style or "hybrid").strip().lower()
+        if style not in ("scalper", "swing", "hybrid"):
+            style = "hybrid"
+
         # CRITICAL: Also update the actual Wallet objects so the risk manager sees the new limits.
         # The risk manager checks wallet.max_open_positions, NOT the config setting.
         with session_scope() as s:
@@ -1364,6 +1424,7 @@ def training_session_start(
                         w.meta = {}
                     w.meta["_session_prev_max_open"] = w.max_open_positions
                     w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                    w.meta["_session_prev_trading_style"] = getattr(w, "trading_style", None)
                 except Exception:
                     # meta column may not exist in older schema - skip the backup
                     pass
@@ -1371,7 +1432,15 @@ def training_session_start(
                 w.max_open_positions = max_open
                 w.max_position_usd = pos_usd
                 w.bot_paused = False  # Unpause all wallets for training
-            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}")
+                # Force the trading style for the duration of the session so the
+                # autonomous engine and exit loop both honor what the user picked
+                # in the Session Settings card — not whatever was last saved on
+                # the Active Positions / Trading Style preset.
+                try:
+                    w.trading_style = style
+                except Exception:
+                    pass
+            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}, trading_style={style}")
 
         bot_scheduler.reload()  # pick up the new tick interval
 
@@ -1398,7 +1467,7 @@ def training_session_start(
                     message=(
                         f"Live training session started — tick={tick}s, "
                         f"min_conf={min_conf:.2f}, size=${pos_usd:.0f}, "
-                        f"max_open={max_open}, universe={uni_limit}, "
+                        f"max_open={max_open}, universe={uni_limit}, style={style}, "
                         f"claude={'on' if claude_is_configured() else 'off (technical fallback)'}"
                     ),
                 )
@@ -1411,6 +1480,7 @@ def training_session_start(
                 "position_size_usd": pos_usd,
                 "max_open_per_wallet": max_open,
                 "universe_limit": uni_limit,
+                "trading_style": style,
                 "claude_configured": claude_is_configured(),
             }
         )
@@ -1545,6 +1615,14 @@ def training_session_stop() -> JSONResponse:
                         # Clean up the temporary keys
                         w.meta.pop("_session_prev_max_open", None)
                         w.meta.pop("_session_prev_max_position_usd", None)
+                    if w.meta and "_session_prev_trading_style" in w.meta:
+                        prev_style = w.meta.get("_session_prev_trading_style")
+                        if prev_style:
+                            try:
+                                w.trading_style = prev_style
+                            except Exception:
+                                pass
+                        w.meta.pop("_session_prev_trading_style", None)
                 except Exception:
                     # meta column may not exist in older schema - skip the restore
                     pass

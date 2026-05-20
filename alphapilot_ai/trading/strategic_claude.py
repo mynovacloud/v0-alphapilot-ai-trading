@@ -378,8 +378,12 @@ class StrategicRouter:
         logger.debug(f"[AUTONOMOUS] {symbol}: {side} conf={adjusted_confidence:.2f} "
                     f"size={size_multiplier:.1f}x - {autonomous_decision.reasoning[:50]}")
         
+        # Pass through the side - the bot engine's min_confidence floor will filter
+        # low-confidence trades. Using a hard floor here would override the user's
+        # configured floor and cause the wallet summary to show "no signals" even
+        # when the user lowered the floor in the UI to encourage paper trades.
         return TradeDecision(
-            action=side if adjusted_confidence >= 0.45 else "HOLD",
+            action=side if adjusted_confidence >= 0.30 else "HOLD",
             confidence=adjusted_confidence,
             size_multiplier=size_multiplier,
             stop_loss_pct=autonomous_decision.stop_loss_pct,
