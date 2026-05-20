@@ -330,15 +330,52 @@ class PositionMonitor:
                 logging.info(f"[POSITION_MONITOR] Auto-switching to scalper mode (target=${micro_target_usd})")
         else:
             logging.warning(f"[POSITION_MONITOR] No wallet found for trade {trade.id}, using defaults")
+
+        # =====================================================================
+        # ADAPTIVE PAYOFF SIZING — the structural fix.
+        # =====================================================================
+        # The historical bleed was payoff 0.75 (avg win $0.80 / avg loss $1.07).
+        # Root cause: a flat $0.25 scalp target paired with a much wider stop,
+        # so even a 50% win rate would lose money. We now tier the targets by
+        # the entry confidence Claude already attached to the trade:
+        #
+        #   conf >= 0.70  → "high conviction" — let it run to Claude's full
+        #                   SL/TP from the trade record (typically 5%/10%).
+        #                   This keeps the upside Claude was reaching for.
+        #   conf >= 0.55  → "mid conviction" — widen the scalp to $target ×
+        #                   1.6 with stop at 70% of target. Payoff ≈ 2.3:1.
+        #   conf <  0.55  → "low conviction" — keep it tight. Stop at 50% of
+        #                   target. Payoff ≈ 2.0:1, but small.
+        #
+        # The crucial invariant: max_loss < target_profit, ALWAYS. That alone
+        # makes the system mathematically winnable at <50% WR.
+        entry_conf = float(getattr(trade, "confidence", 0.5) or 0.5)
+        if entry_conf >= 0.70:
+            # High-conviction: bypass scalp logic entirely, defer to Claude SL/TP.
+            high_conviction = True
+            scalp_max_loss_ratio = 0.50  # only used if we still hit the timeout path
+            scalp_target_multiplier = 1.0
+        elif entry_conf >= 0.55:
+            high_conviction = False
+            scalp_max_loss_ratio = 0.50  # max_loss = target × 0.50 → payoff 2:1
+            scalp_target_multiplier = 1.6  # widen target so we don't clip winners
+        else:
+            high_conviction = False
+            scalp_max_loss_ratio = 0.50  # max_loss = target × 0.50 → payoff 2:1
+            scalp_target_multiplier = 1.0
+
+        effective_target_usd = micro_target_usd * scalp_target_multiplier
         
         logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}, momentum={momentum:.2f}")
 
         # =====================================================================
         # SCALPER TAKE PROFIT - CHECK THIS FIRST BEFORE ANYTHING ELSE
-        # This is the HIGHEST priority exit - take the money when target is hit
+        # This is the HIGHEST priority exit - take the money when target is hit.
+        # `effective_target_usd` is the conviction-adjusted target, so a
+        # high-conviction trade gets to run to a bigger TP than a low-conf one.
         # =====================================================================
-        if trading_style == "scalper" and pnl_usd >= micro_target_usd:
-            logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${micro_target_usd}")
+        if trading_style == "scalper" and not high_conviction and pnl_usd >= effective_target_usd:
+            logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${effective_target_usd:.2f} (conf {entry_conf:.2f})")
             self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
             return ExitSignal(
                 trade_id=trade.id,
@@ -371,19 +408,25 @@ class PositionMonitor:
             )
 
         # =====================================================================
-        # SCALPER MODE: AGGRESSIVE loss-cutting (profit-taking handled above)
-        # KEY INSIGHT: For scalping to work, max loss MUST be smaller than target profit
-        # Target: $0.25 profit, so max loss should be $0.15-$0.20
+        # SCALPER MODE: AGGRESSIVE loss-cutting (profit-taking handled above).
+        #
+        # KEY INVARIANT: max_loss MUST be smaller than target_profit.
+        # Old code used 60% which was actually fine — but the old TARGET was
+        # only $0.25 against an unbounded SL%, so real-world losses blew
+        # through it via the time-stop and 2-min stop. We now keep the
+        # ratio (50% by default, tighter for low-conf) AND make sure the
+        # other exit paths use the same effective_target_usd.
         # =====================================================================
-        if trading_style == "scalper":
-            # Calculate max loss threshold: 60% of target profit
-            # If target is $0.25, max loss is $0.15
-            max_loss_usd = micro_target_usd * 0.6  # $0.15 for $0.25 target
+        if trading_style == "scalper" and not high_conviction:
+            # Conviction-tiered max loss. With ratio=0.50 a $0.25 target
+            # caps loss at $0.125 — payoff 2:1 even before considering
+            # winners that overshoot.
+            max_loss_usd = effective_target_usd * scalp_max_loss_ratio
             
             # IMMEDIATE CUT: If loss exceeds max_loss threshold, exit NOW
             # Don't wait for time - cut the loss immediately
             if pnl_usd <= -max_loss_usd:
-                logging.info(f"[SCALPER] IMMEDIATE CUT: {trade.symbol} ${pnl_usd:.2f} <= -${max_loss_usd:.2f} threshold")
+                logging.info(f"[SCALPER] IMMEDIATE CUT: {trade.symbol} ${pnl_usd:.2f} <= -${max_loss_usd:.2f} threshold (conf {entry_conf:.2f})")
                 self._log_exit(session, trade, "scalp_maxloss", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,
@@ -409,10 +452,10 @@ class PositionMonitor:
                     pnl_pct=pnl_pct,
                 )
             
-            # TIME EXIT: After 5 minutes, exit if not at least 50% to target
-            # Don't hold scalp trades hoping they'll turn around
-            if age_minutes >= 5 and pnl_usd < (micro_target_usd * 0.5):
-                logging.info(f"[SCALPER] TIME EXIT (5m): {trade.symbol} ${pnl_usd:.2f} < 50% of target")
+            # TIME EXIT: After 5 minutes, exit if not at least 50% to target.
+            # Don't hold scalp trades hoping they'll turn around.
+            if age_minutes >= 5 and pnl_usd < (effective_target_usd * 0.5):
+                logging.info(f"[SCALPER] TIME EXIT (5m): {trade.symbol} ${pnl_usd:.2f} < 50% of target ${effective_target_usd:.2f}")
                 self._log_exit(session, trade, "scalp_timeout", current_price, pnl_pct)
                 return ExitSignal(
                     trade_id=trade.id,

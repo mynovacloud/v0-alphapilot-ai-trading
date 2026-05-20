@@ -688,11 +688,33 @@ class BotEngine:
             if side not in {"BUY", "SELL"}:
                 continue
             
-            # Use a higher threshold if circuit breaker is active (be more selective after losses)
-            effective_min_conf = cfg.min_confidence
+            # ---- Risk gating -------------------------------------------------
+            # Two layers gate every entry:
+            #
+            #   1. Adaptive confidence floor. The user's `bot_min_confidence`
+            #      is the FLOOR — adaptive_risk can raise it in real time
+            #      when rolling WR drops, but never lowers it below the
+            #      user's setting. This is what was missing: the static
+            #      0.45/0.60 floor never reacted to the bot bleeding all
+            #      night, even though the learning engine "knew".
+            #
+            #   2. P&L-based circuit breaker. The legacy consecutive-loss
+            #      counter is still here for fast reaction (3 instant
+            #      losses → tighten), but the new rolling-P&L breaker
+            #      catches the slow bleed that scalp wins were hiding.
+            #
+            # Both also respect a per-symbol blacklist that auto-engages
+            # for symbols with sustained <25% WR in this session.
+            from trading.adaptive_risk import AdaptiveRiskManager
+            effective_min_conf = AdaptiveRiskManager.effective_floor(cfg.min_confidence)
             if circuit_breaker_active:
-                effective_min_conf = min(0.60, cfg.min_confidence + 0.10)  # Require 10% more confidence
-            
+                # Stack the legacy fast-reaction bump on top.
+                effective_min_conf = min(0.85, effective_min_conf + 0.05)
+            pnl_breaker_active, _ = AdaptiveRiskManager.is_breaker_active()
+            if pnl_breaker_active:
+                # Rolling P&L is bleeding — demand strong conviction only.
+                effective_min_conf = max(effective_min_conf, 0.75)
+
             if confidence < effective_min_conf:
                 below_conf += 1
                 # Log blocked trades so user knows WHY nothing is executing
@@ -703,6 +725,16 @@ class BotEngine:
                         wallet_id=wallet["id"],
                         level="debug",
                     )
+                continue
+
+            # Per-symbol auto-blacklist (session-scoped, auto-expires).
+            if AdaptiveRiskManager.is_symbol_blocked(symbol):
+                self._log(
+                    "bot",
+                    f"[BLOCKED] {symbol} {side}: symbol auto-blacklisted (sustained low WR)",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
                 continue
 
             # =====================================================================
@@ -1087,6 +1119,23 @@ class BotEngine:
                         # Update circuit breaker with trade result
                         pnl = outcome.get("realized_pnl", 0) or 0
                         self.record_trade_result(pnl)
+                        # Feed the adaptive risk manager. This is the loop
+                        # that closes the gap between "the learning engine
+                        # noticed losses" and "the bot stopped taking the
+                        # same kind of trades": rolling-WR drives the
+                        # confidence floor, rolling-P&L drives the breaker,
+                        # symbol stats drive the blacklist.
+                        try:
+                            from trading.adaptive_risk import AdaptiveRiskManager
+                            AdaptiveRiskManager.record_trade(
+                                symbol=exit_signal.symbol,
+                                pnl=float(pnl),
+                            )
+                        except Exception as exc:
+                            # A logging failure here must NEVER prevent the
+                            # close from being committed — adaptive state
+                            # is best-effort.
+                            self._log("bot", f"[ADAPTIVE] record_trade failed: {exc}", level="warn")
                         # Update the exit_reason on the trade record
                         with session_scope() as s:
                             trade = s.query(PaperTrade).filter(PaperTrade.id == exit_signal.trade_id).first()

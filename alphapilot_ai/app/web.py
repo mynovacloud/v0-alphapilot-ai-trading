@@ -1042,16 +1042,37 @@ def _run_diagnostics_inner() -> JSONResponse:
         with session_scope() as s:
             wallet = s.query(Wallet).first()
             if wallet:
-                # Check if circuit breaker is active
-                if rm._check_daily_loss_breaker(wallet.id):
-                    risk_checks.append({"status": "warn", "message": "Daily loss circuit breaker is ACTIVE"})
+                # Daily-loss circuit breaker. The internal API is
+                # `_daily_loss_tripped(session, wallet, is_paper)` returning
+                # (tripped: bool, loss: float) — there is no public
+                # `_check_daily_loss_breaker`, so call the real one and
+                # surface the actual loss number when it has tripped.
+                is_paper = bool(getattr(wallet, "is_paper", True))
+                try:
+                    tripped, day_loss = rm._daily_loss_tripped(s, wallet, is_paper=is_paper)
+                except TypeError:
+                    # Older signatures didn't take is_paper; fall back.
+                    tripped, day_loss = rm._daily_loss_tripped(s, wallet)
+                if tripped:
+                    risk_checks.append({
+                        "status": "warn",
+                        "message": f"Daily loss circuit breaker ACTIVE (${day_loss:,.2f} today)",
+                    })
                 else:
                     risk_checks.append({"status": "ok", "message": "Circuit breaker not triggered"})
-                
-                # Check cooldown
-                cooldown_status, msg = rm._check_cooldown(wallet.id)
-                if not cooldown_status:
-                    risk_checks.append({"status": "warn", "message": f"Cooldown active: {msg}"})
+
+                # Cooldown after consecutive losses. The real API is
+                # `_cooldown_until(session, wallet, is_paper)` and returns
+                # a datetime or None — not a (bool, msg) tuple.
+                try:
+                    cooldown_until = rm._cooldown_until(s, wallet, is_paper=is_paper)
+                except TypeError:
+                    cooldown_until = rm._cooldown_until(s, wallet)
+                if cooldown_until is not None:
+                    risk_checks.append({
+                        "status": "warn",
+                        "message": f"Cooldown active until {cooldown_until.isoformat()}",
+                    })
                 else:
                     risk_checks.append({"status": "ok", "message": "No cooldown active"})
     except Exception as e:
