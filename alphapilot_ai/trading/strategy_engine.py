@@ -264,6 +264,86 @@ class Signal:
 # ---------------------------------------------------------------------------- #
 
 
+# ---------------------------------------------------------------------------- #
+# Velocity / freshness helpers
+# ---------------------------------------------------------------------------- #
+# These guards exist because the bot was firing low-confidence BUYs on stale
+# signals (e.g. an EMA crossover that happened 50 bars ago, or a price sitting
+# at a Bollinger lower band without bouncing). The result was many trades that
+# went nowhere then drifted slightly negative before exiting on stop. We now
+# require the price to actually be moving in our direction RIGHT NOW before
+# committing capital.
+
+
+def _short_velocity(closes: list[float], bars: int = 3) -> float:
+    """Percent change over the last `bars` closes — our 'is it moving now' check.
+
+    Returns 0.0 if we don't have enough data. Positive = price is rising in
+    the last few bars, negative = falling. We use this as a freshness gate
+    on every entry: a BUY signal that doesn't have positive short-velocity
+    is buying into stagnation or a falling knife.
+    """
+    if not closes or len(closes) < bars + 1:
+        return 0.0
+    base = closes[-bars - 1]
+    if not base:
+        return 0.0
+    return (closes[-1] - base) / base
+
+
+def _ema_cross_freshness(closes: list[float], fast_n: int, slow_n: int) -> int:
+    """How many bars ago did EMA_fast cross EMA_slow?
+
+    Returns the number of bars since the last sign-flip of (fast - slow).
+    Higher numbers mean the cross is stale — and a stale cross is exactly
+    the kind of signal that produces "buy then sit at 0.00". We cap the
+    search at 30 bars; anything older is essentially "no fresh cross".
+    """
+    if len(closes) < slow_n + 5:
+        return 99
+    fast = ema(closes, fast_n)
+    slow = ema(closes, slow_n)
+    if not fast or not slow:
+        return 99
+    n = min(len(fast), len(slow))
+    if n < 3:
+        return 99
+    cur_sign = 1 if (fast[-1] - slow[-1]) >= 0 else -1
+    for i in range(2, min(31, n)):
+        prev_sign = 1 if (fast[-i] - slow[-i]) >= 0 else -1
+        if prev_sign != cur_sign:
+            return i - 1
+    return 30
+
+
+def _bar_body_direction(candles: list[dict[str, Any]]) -> float:
+    """Sum of bullish-body fraction over the last 3 bars.
+
+    Returns a value in [-3, 3]. Positive = recent bars are closing near their
+    highs (buyers in control), negative = closing near their lows. Used to
+    confirm that the most recent price action agrees with the entry side.
+    """
+    if not candles or len(candles) < 3:
+        return 0.0
+    total = 0.0
+    for c in candles[-3:]:
+        try:
+            o = float(c.get("open", 0))
+            h = float(c.get("high", 0))
+            l = float(c.get("low", 0))
+            cl = float(c.get("close", 0))
+            rng = h - l
+            if rng <= 0:
+                continue
+            # +1 if close > open (bullish body), scaled by where in the range
+            # the close lands. Closes near the high count more than mid-range.
+            pos = (cl - l) / rng  # 0..1
+            total += (pos - 0.5) * 2.0  # -1..1
+        except (TypeError, ValueError, ZeroDivisionError):
+            continue
+    return total
+
+
 def momentum_signal(
     candles: list[dict[str, Any]],
     *,
@@ -272,11 +352,16 @@ def momentum_signal(
     lookback: int = 6,
 ) -> Signal:
     """
-    Enhanced EMA-cross momentum with RSI, MACD, and volume confirmation:
-      BUY  when EMA_fast > EMA_slow AND RSI not overbought AND volume confirms
-      SELL when EMA_fast < EMA_slow AND RSI not oversold AND volume confirms
+    Enhanced EMA-cross momentum with RSI, MACD, volume AND velocity confirmation.
 
-    Confidence scales with indicator alignment and volume confirmation.
+    A trade only fires when:
+      * EMA / MACD / RSI / volume factors agree on a direction (>=3 of 5)
+      * The price is ACTUALLY moving in that direction over the last few bars
+        (short-velocity check — eliminates "buy then drift sideways" trades)
+      * The recent bars confirm with body direction (closes near highs for BUY,
+        closes near lows for SELL)
+      * The EMA cross is reasonably fresh (<= 12 bars old) — we don't chase
+        ancient crosses
     """
     closes = _closes(candles)
     if len(closes) < max(slow, lookback + 2, 26):
@@ -293,7 +378,14 @@ def momentum_signal(
     rsi_val = rsi(closes, 14) or 50.0
     macd_data = macd_indicator(closes)
     vol_data = volume_analysis(candles)
-    
+
+    # Live-velocity guards — these are what separate "the EMA crossed
+    # weeks ago" signals from "price is moving up RIGHT NOW" signals.
+    velocity_3 = _short_velocity(closes, 3)
+    velocity_1 = _short_velocity(closes, 1)
+    cross_age = _ema_cross_freshness(closes, fast, slow)
+    body_dir = _bar_body_direction(candles)
+
     indicators = {
         "ema_fast": ema_fast,
         "ema_slow": ema_slow,
@@ -303,81 +395,144 @@ def momentum_signal(
         "macd_histogram": macd_data["histogram"],
         "relative_volume": vol_data["relative_volume"],
         "buying_pressure": vol_data["buying_pressure"],
+        "velocity_3bar": velocity_3,
+        "velocity_1bar": velocity_1,
+        "cross_age_bars": cross_age,
+        "body_direction": body_dir,
     }
 
     # Multi-factor signal generation
     bullish_factors = 0
     bearish_factors = 0
-    
-    # EMA cross
-    if ema_fast > ema_slow:
+
+    # EMA cross — only counts if it's fresh (<= 12 bars old). A 50-bar-old
+    # cross is not actionable; the move it predicted has already happened.
+    if ema_fast > ema_slow and cross_age <= 12:
         bullish_factors += 1
-    else:
+    elif ema_fast < ema_slow and cross_age <= 12:
         bearish_factors += 1
-    
-    # Return direction
-    if ret > 0.002:  # 0.2% threshold
+
+    # Lookback return direction
+    if ret > 0.002:
         bullish_factors += 1
     elif ret < -0.002:
         bearish_factors += 1
-    
-    # RSI
-    if rsi_val < 30:
-        bullish_factors += 1  # Oversold = potential buy
-    elif rsi_val > 70:
-        bearish_factors += 1  # Overbought = potential sell
+
+    # RSI — but ONLY count oversold-bounce when velocity confirms a bounce,
+    # not when price is still falling. This was a major source of bad
+    # trades: buying RSI<30 mid-collapse.
+    if rsi_val < 30 and velocity_3 > 0:
+        bullish_factors += 1
+    elif rsi_val > 70 and velocity_3 < 0:
+        bearish_factors += 1
     elif rsi_val < 45:
         bullish_factors += 0.5
     elif rsi_val > 55:
         bearish_factors += 0.5
-    
+
     # MACD histogram
     if macd_data["histogram"] > 0:
         bullish_factors += 1
     else:
         bearish_factors += 1
-    
+
     # Volume confirmation
     if vol_data["relative_volume"] > 1.2:
         if vol_data["buying_pressure"] > 0.6:
             bullish_factors += 1
         elif vol_data["buying_pressure"] < 0.4:
             bearish_factors += 1
-    
-    # Decision logic - relaxed thresholds for more signals
-    # Require at least 2 factors with a clear edge, not 3
-    if bullish_factors >= 2 and bullish_factors > bearish_factors:
+
+    # ----- Decision logic -----
+    # Tightened: require >=3 factors AND a clear edge (>= 1.5 over the
+    # opposite side). The previous 2-factor / 0.5-edge thresholds were the
+    # main reason the bot kept buying coins that then went sideways.
+    if bullish_factors >= 3 and bullish_factors >= bearish_factors + 1.5:
         side = "BUY"
         strength = bullish_factors
-    elif bearish_factors >= 2 and bearish_factors > bullish_factors:
-        side = "SELL"
-        strength = bearish_factors
-    elif bullish_factors > bearish_factors + 0.5:
-        side = "BUY"
-        strength = bullish_factors
-    elif bearish_factors > bullish_factors + 0.5:
+    elif bearish_factors >= 3 and bearish_factors >= bullish_factors + 1.5:
         side = "SELL"
         strength = bearish_factors
     else:
-        # Even mixed signals get a weak directional bias based on EMA
-        if ema_fast > ema_slow:
-            return Signal("BUY", 0.35, f"Weak bullish bias: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
-        elif ema_fast < ema_slow:
-            return Signal("SELL", 0.35, f"Weak bearish bias: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
-        return Signal("HOLD", 0.20, f"No clear direction: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}", "Momentum", indicators)
+        return Signal(
+            "HOLD",
+            0.20,
+            (
+                f"No edge: bull={bullish_factors:.1f}, bear={bearish_factors:.1f}, "
+                f"v3={velocity_3:+.2%}, cross_age={cross_age}b"
+            ),
+            "Momentum",
+            indicators,
+        )
 
-    # Confidence based on factor alignment (max factors = 5)
-    # More generous confidence scaling
-    confidence = min(0.95, 0.50 + (strength / 5.0) * 0.45)
-    
-    # Volume boost
+    # ----- Velocity confirmation gate -----
+    # The trade direction must agree with what price is ACTUALLY doing in
+    # the last 1-3 bars. If we want to BUY but price is flat or falling
+    # right now, this is a stale signal — bail out. This is the single
+    # most important fix for "buy and watch nothing happen".
+    MIN_VEL_3 = 0.0008  # 0.08% over 3 bars — small but non-zero
+    if side == "BUY":
+        if velocity_3 < MIN_VEL_3:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"BUY signal rejected — price not moving up (v3={velocity_3:+.2%})",
+                "Momentum",
+                indicators,
+            )
+        if body_dir < -0.5:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"BUY signal rejected — recent bars closing weak (body={body_dir:+.2f})",
+                "Momentum",
+                indicators,
+            )
+    else:  # SELL
+        if velocity_3 > -MIN_VEL_3:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"SELL signal rejected — price not moving down (v3={velocity_3:+.2%})",
+                "Momentum",
+                indicators,
+            )
+        if body_dir > 0.5:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"SELL signal rejected — recent bars closing strong (body={body_dir:+.2f})",
+                "Momentum",
+                indicators,
+            )
+
+    # ----- Confidence -----
+    # Base from factor alignment (0.50 .. 0.85), then bonuses for fresh
+    # velocity, fresh cross, and volume confirmation.
+    confidence = 0.50 + (strength / 5.0) * 0.35
+
+    # Velocity bonus — strong recent move in our direction adds conviction.
+    vel_aligned = velocity_3 if side == "BUY" else -velocity_3
+    if vel_aligned > 0.005:
+        confidence += 0.08
+    elif vel_aligned > 0.002:
+        confidence += 0.04
+
+    # Fresh cross bonus
+    if cross_age <= 3:
+        confidence += 0.04
+
+    # Volume bonus
     if vol_data["relative_volume"] > 1.5:
-        confidence = min(0.98, confidence + 0.05)
-    
+        confidence += 0.04
+
+    confidence = min(0.95, confidence)
+
     reasoning = (
-        f"EMA{fast}={ema_fast:.4f} vs EMA{slow}={ema_slow:.4f} ({gap:+.2%}); "
-        f"RSI={rsi_val:.1f}; MACD_hist={macd_data['histogram']:.4f}; "
-        f"Vol={vol_data['relative_volume']:.1f}x; {lookback}-bar ret {ret:+.2%}"
+        f"EMA{fast}={ema_fast:.4f} vs EMA{slow}={ema_slow:.4f} ({gap:+.2%}, "
+        f"cross_age={cross_age}b); RSI={rsi_val:.1f}; "
+        f"MACD_h={macd_data['histogram']:.4f}; Vol={vol_data['relative_volume']:.1f}x; "
+        f"v3={velocity_3:+.2%}, body={body_dir:+.2f}"
     )
     return Signal(side, confidence, reasoning, "Momentum", indicators)
 
@@ -420,7 +575,12 @@ def mean_reversion_signal(
         )
 
     z = (last - mean) / sd if sd > 0 else 0.0
-    indicators = {"sma": mean, "stdev": sd, "z": z, "vol_pct": vol_pct}
+    velocity_2 = _short_velocity(closes, 2)
+    body_dir = _bar_body_direction(candles)
+    indicators = {
+        "sma": mean, "stdev": sd, "z": z, "vol_pct": vol_pct,
+        "velocity_2bar": velocity_2, "body_direction": body_dir,
+    }
 
     if z <= -z_entry:
         side = "BUY"
@@ -429,12 +589,33 @@ def mean_reversion_signal(
     else:
         return Signal("HOLD", 0.0, f"|z|={abs(z):.2f} below entry {z_entry}", "Mean Reversion", indicators)
 
+    # Reversal-confirmation gate. A 2-sigma stretch is meaningless if price
+    # is still racing in that direction — we'd be catching a knife. Require
+    # the most recent bars to be turning back toward the mean before
+    # committing to a reversion trade.
+    if side == "BUY" and (velocity_2 <= 0 or body_dir < 0):
+        return Signal(
+            "HOLD",
+            0.20,
+            f"MR BUY rejected — no reversal yet (z={z:+.2f}, v2={velocity_2:+.2%}, body={body_dir:+.2f})",
+            "Mean Reversion",
+            indicators,
+        )
+    if side == "SELL" and (velocity_2 >= 0 or body_dir > 0):
+        return Signal(
+            "HOLD",
+            0.20,
+            f"MR SELL rejected — no reversal yet (z={z:+.2f}, v2={velocity_2:+.2%}, body={body_dir:+.2f})",
+            "Mean Reversion",
+            indicators,
+        )
+
     # Confidence: how far past the threshold are we?
     excess = abs(z) - z_entry  # >= 0
     raw = min(1.0, excess / 1.5)  # full confidence at z = entry + 1.5
     confidence = max(0.0, min(0.99, 0.55 + 0.4 * raw))
 
-    reasoning = f"Z={z:+.2f} vs SMA{period}; vol={vol_pct:.2%}"
+    reasoning = f"Z={z:+.2f} vs SMA{period}; vol={vol_pct:.2%}; v2={velocity_2:+.2%}, body={body_dir:+.2f}"
     return Signal(side, confidence, reasoning, "Mean Reversion", indicators)
 
 
@@ -446,10 +627,11 @@ def scalping_signal(
 ) -> Signal:
     """
     Scalping strategy using Bollinger Bands and fast RSI:
-      BUY  when price near lower band AND RSI oversold (<25)
-      SELL when price near upper band AND RSI overbought (>75)
+      BUY  when price near lower band AND RSI oversold (<25) AND BOUNCING
+      SELL when price near upper band AND RSI overbought (>75) AND ROLLING OVER
     
-    Designed for quick entries and exits with tight stops.
+    The "bouncing / rolling over" check is critical — without it, the bot
+    buys falling knives at the lower band and watches them keep falling.
     """
     closes = _closes(candles)
     if len(closes) < max(bb_period, rsi_period + 1):
@@ -458,38 +640,77 @@ def scalping_signal(
     bb = bollinger_bands(closes, bb_period)
     rsi_val = rsi(closes, rsi_period) or 50.0
     vol_data = volume_analysis(candles, 10)  # Shorter volume lookback
+    velocity_2 = _short_velocity(closes, 2)
+    velocity_1 = _short_velocity(closes, 1)
+    body_dir = _bar_body_direction(candles)
     
-    current_price = closes[-1]
     indicators = {
         "bb_percent_b": bb["percent_b"],
         "bb_upper": bb["upper"],
         "bb_lower": bb["lower"],
         "rsi_fast": rsi_val,
         "relative_volume": vol_data["relative_volume"],
+        "velocity_2bar": velocity_2,
+        "body_direction": body_dir,
     }
     
-    # Scalp BUY: price near lower band + oversold RSI
+    # Scalp BUY: price near lower band + oversold RSI + ACTIVE BOUNCE
+    # The bounce gate is the difference between catching a reversal and
+    # catching a falling knife. We require the very last bar to be up
+    # AND the recent body direction to lean bullish.
     if bb["percent_b"] < 0.15 and rsi_val < 25:
-        confidence = 0.70 + min(0.25, (25 - rsi_val) / 50)
+        if velocity_1 <= 0 or velocity_2 <= 0:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"Scalp BUY setup but no bounce yet: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, v1={velocity_1:+.2%}",
+                "Scalping",
+                indicators,
+            )
+        if body_dir < 0:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"Scalp BUY setup but bars closing weak: body={body_dir:+.2f}",
+                "Scalping",
+                indicators,
+            )
+        confidence = 0.70 + min(0.20, (25 - rsi_val) / 50)
         if vol_data["relative_volume"] > 1.3:
             confidence = min(0.95, confidence + 0.05)
         return Signal(
             "BUY",
             confidence,
-            f"Scalp BUY: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, Vol={vol_data['relative_volume']:.1f}x",
+            f"Scalp BUY: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, v2={velocity_2:+.2%}, Vol={vol_data['relative_volume']:.1f}x",
             "Scalping",
             indicators
         )
     
-    # Scalp SELL: price near upper band + overbought RSI
+    # Scalp SELL: price near upper band + overbought RSI + ACTIVE ROLL-OVER
     if bb["percent_b"] > 0.85 and rsi_val > 75:
-        confidence = 0.70 + min(0.25, (rsi_val - 75) / 50)
+        if velocity_1 >= 0 or velocity_2 >= 0:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"Scalp SELL setup but no roll-over yet: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, v1={velocity_1:+.2%}",
+                "Scalping",
+                indicators,
+            )
+        if body_dir > 0:
+            return Signal(
+                "HOLD",
+                0.20,
+                f"Scalp SELL setup but bars closing strong: body={body_dir:+.2f}",
+                "Scalping",
+                indicators,
+            )
+        confidence = 0.70 + min(0.20, (rsi_val - 75) / 50)
         if vol_data["relative_volume"] > 1.3:
             confidence = min(0.95, confidence + 0.05)
         return Signal(
             "SELL",
             confidence,
-            f"Scalp SELL: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, Vol={vol_data['relative_volume']:.1f}x",
+            f"Scalp SELL: %B={bb['percent_b']:.2f}, RSI={rsi_val:.1f}, v2={velocity_2:+.2%}, Vol={vol_data['relative_volume']:.1f}x",
             "Scalping",
             indicators
         )
