@@ -224,6 +224,25 @@ class PaperTradingEngine:
             record_trade_outcome(trade_id)
         except Exception:
             logger.exception("Reflection failed for trade %s", trade_id)
+        
+        # Also update the adaptive learning engine with the trade outcome
+        # This feeds into pattern recognition and strategy optimization
+        try:
+            from ai.adaptive_learning_engine import learn_from_trade
+            learn_from_trade(
+                trade_id=trade_id,
+                symbol=symbol,
+                side=side,
+                entry_price=entry_price,
+                exit_price=exit_price,
+                pnl=pnl,
+                pnl_pct=return_pct / 100,  # Convert to decimal
+                duration_minutes=duration_minutes,
+                exit_reason=exit_reason,
+            )
+            logger.debug(f"[LEARN] Adaptive learning updated for trade {trade_id}")
+        except Exception:
+            logger.debug("Adaptive learning update failed for trade %s", trade_id)
 
         return {"ok": True, "pnl": round(pnl, 2), "exit_reason": exit_reason}
     

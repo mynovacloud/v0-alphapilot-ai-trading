@@ -48,6 +48,7 @@ from trading.advanced_position_sizer import get_position_sizer
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from trading.market_intelligence import get_market_intelligence
 from trading.strategic_claude import get_strategic_router
+from trading.trade_filter import get_trade_filter, FilterResult
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -542,6 +543,43 @@ class BotEngine:
                 )
             
             confidence = adjusted_confidence
+            
+            # =====================================================================
+            # TRADE QUALITY FILTER
+            # Final checks before entry:
+            # - Time-of-day (avoid low-volume hours)
+            # - Position correlation (avoid overexposure)
+            # - Market regime alignment
+            # - Session awareness
+            # =====================================================================
+            trade_filter = get_trade_filter()
+            
+            # Get current positions for correlation check
+            current_positions = [
+                {"symbol": p["symbol"], "side": p["side"]}
+                for p in wallet.get("open_positions", [])
+            ]
+            
+            filter_result = trade_filter.apply_filters(
+                symbol=symbol,
+                side=side,
+                confidence=confidence,
+                current_positions=current_positions,
+                market_regime=market_ctx.regime if market_ctx else None,
+                signal_strategy=advanced_signal.strategy if advanced_signal else None,
+            )
+            
+            if not filter_result.should_trade:
+                self._log(
+                    "bot",
+                    f"[FILTER] {symbol} {side} rejected: {', '.join(filter_result.reasons)}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+            
+            # Apply filter adjustments
+            confidence *= filter_result.confidence_adjustment
 
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
