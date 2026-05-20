@@ -86,6 +86,13 @@ def _migrate_schema() -> None:
             ("liquidation_buffer_pct", "FLOAT DEFAULT 0.10"),
             # Metadata column for session settings backup/restore
             ("meta", "JSON DEFAULT '{}'"),
+            # Bankroll-reset cursor: stamped when the operator hits "Reset
+            # Paper Balance" in Settings. The training-page money strip uses
+            # these to scope "this session" P&L without ever touching the
+            # underlying trade history. NULL on wallets that have never been
+            # reset.
+            ("bankroll_reset_at", "DATETIME"),
+            ("session_starting_bankroll", "FLOAT"),
         ],
         "paper_trades": [
             ("is_perp", "BOOLEAN DEFAULT 0"),

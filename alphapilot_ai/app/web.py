@@ -1121,15 +1121,49 @@ def training_page(request: Request) -> HTMLResponse:
 
         # Portfolio P&L roll-up across every paper trade (powers the bold
         # money-strip at the top of the Training Center).
+        #
+        # "Session" scoping: when Settings → Paper Trading Reset has fired,
+        # each wallet carries a bankroll_reset_at cursor + session starting
+        # bankroll. The money strip then shows P&L SINCE that point, while
+        # the underlying PaperTrade rows are untouched (the playbook,
+        # reflections, autonomous-engine fingerprints all still see them).
+        # Trades closed before the cursor are excluded from realized P&L
+        # so the operator sees "new profits/losses against the new $10K"
+        # without losing any history.
         all_trades = s.query(PaperTrade).all()
-        starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
+        # Pick the most recent reset across wallets as the session cutoff.
+        # If no wallet has ever been reset, cutoff is None and the math
+        # collapses to "all-time" (the legacy behavior).
+        wallet_rows = s.query(Wallet).all()
+        reset_cutoff = None
+        for w in wallet_rows:
+            if w.bankroll_reset_at is not None:
+                if reset_cutoff is None or w.bankroll_reset_at > reset_cutoff:
+                    reset_cutoff = w.bankroll_reset_at
+        # Starting bankroll: prefer the session-starting value when a reset
+        # has stamped one, else the live paper_balance (legacy behavior).
+        if reset_cutoff is not None:
+            starting = sum(
+                float(w.session_starting_bankroll or w.paper_balance or 0.0)
+                for w in wallet_rows
+            )
+        else:
+            starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
         realized = 0.0
         unrealized = 0.0
         invested_open = 0.0
         wins = 0
         losses = 0
+        excluded_pre_reset = 0
         for t in all_trades:
             if t.status == "closed":
+                # Trades closed before the cutoff belong to the OLD session.
+                # Keep them in the DB (they feed learning) but don't count
+                # them in this session's money strip.
+                closed_at = t.closed_at
+                if reset_cutoff is not None and closed_at is not None and closed_at < reset_cutoff:
+                    excluded_pre_reset += 1
+                    continue
                 pnl = t.realized_pnl or 0.0
                 realized += pnl
                 if pnl > 0:
@@ -1137,6 +1171,8 @@ def training_page(request: Request) -> HTMLResponse:
                 elif pnl < 0:
                     losses += 1
             else:
+                # All currently-open trades count toward unrealized P&L
+                # regardless of when they opened — they're live capital now.
                 unrealized += (t.unrealized_pnl or 0.0)
                 invested_open += (t.entry_price or 0.0) * (t.qty or 0.0)
         closed_count = wins + losses
@@ -1148,11 +1184,13 @@ def training_page(request: Request) -> HTMLResponse:
             "total_pl": realized + unrealized,
             "total_pl_pct": ((realized + unrealized) / starting * 100.0) if starting else 0.0,
             "invested_open": invested_open,
-            "open_trades": len(all_trades) - closed_count,
+            "open_trades": sum(1 for t in all_trades if t.status != "closed"),
             "closed_trades": closed_count,
             "wins": wins,
             "losses": losses,
             "win_rate": (wins / closed_count) if closed_count else 0.0,
+            "session_reset_at": reset_cutoff.isoformat() if reset_cutoff else None,
+            "excluded_pre_reset_trades": excluded_pre_reset,
         }
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
@@ -1794,13 +1832,32 @@ def training_session_feed(
         # ---- Live portfolio mark-to-market ----
         # Query wallets directly from database to ensure we get fresh data
         wallets_db = s.query(Wallet).all()
-        starting = sum(float(w.paper_balance or 0) for w in wallets_db)
+        # Session-scoped money strip. See training_page() for the full
+        # rationale: when a Paper Trading Reset has been performed, P&L is
+        # computed only from trades closed AFTER the reset cutoff so the
+        # operator sees "since the new $10K" instead of all-time numbers.
+        # Trade history is never deleted — this is purely a display filter.
+        reset_cutoff = None
+        for w in wallets_db:
+            if w.bankroll_reset_at is not None:
+                if reset_cutoff is None or w.bankroll_reset_at > reset_cutoff:
+                    reset_cutoff = w.bankroll_reset_at
+        if reset_cutoff is not None:
+            starting = sum(
+                float(w.session_starting_bankroll or w.paper_balance or 0.0)
+                for w in wallets_db
+            )
+        else:
+            starting = sum(float(w.paper_balance or 0) for w in wallets_db)
         wallet_count = len(wallets_db)
-        
-        logging.info(f"[SESSION_FEED] Wallets: {wallet_count} found, starting balance=${starting}")
+
+        logging.info(
+            f"[SESSION_FEED] Wallets: {wallet_count} found, starting=${starting}, "
+            f"session_reset_at={reset_cutoff.isoformat() if reset_cutoff else 'never'}"
+        )
         for w in wallets_db:
             logging.info(f"[SESSION_FEED]   - {w.name}: paper_balance=${w.paper_balance}")
-        
+
         # If no starting balance, use a default seed amount for display
         if starting == 0:
             starting = 10000.0  # Default seed for display purposes
@@ -1824,8 +1881,16 @@ def training_session_feed(
         
         logging.info(f"[SESSION_FEED] Fetched prices for {len(symbol_prices)} symbols")
         
+        excluded_pre_reset = 0
         for t in all_trades:
             if t.status == "closed":
+                # Trades closed BEFORE the bankroll reset don't count toward
+                # session P&L (but stay in the DB — the autonomous engine,
+                # playbook, and reflections all still see them).
+                closed_at = t.closed_at
+                if reset_cutoff is not None and closed_at is not None and closed_at < reset_cutoff:
+                    excluded_pre_reset += 1
+                    continue
                 pnl = float(t.realized_pnl or 0)
                 realized += pnl
                 if pnl > 0:
@@ -1862,6 +1927,12 @@ def training_session_feed(
             "wins": wins,
             "losses": losses,
             "win_rate": round((wins / closed_count) if closed_count else 0.0, 4),
+            # When a bankroll reset has fired, these tell the UI we're
+            # showing P&L "since X" instead of all-time. UI can render a
+            # subtle banner like: "Showing 12 trades since reset at HH:MM.
+            # Full history preserved in Recent Decisions / Playbook."
+            "session_reset_at": reset_cutoff.isoformat() if reset_cutoff else None,
+            "excluded_pre_reset_trades": excluded_pre_reset,
         }
 
         # ---- Compute the session-start cutoff ONCE, used to scope every
@@ -2749,10 +2820,18 @@ def settings_reset_paper_balance(
             deleted_count = s.query(PaperTrade).delete()
             logging.info(f"[RESET_PAPER] Deleted {deleted_count} trade records")
         
-        # Step 3: Reset all wallet balances
+        # Step 3: Reset all wallet balances AND stamp the bankroll-reset
+        # cursor so the training-page money strip can scope "this session"
+        # without erasing any history. paper_balance is the LIVE cash; the
+        # new session_starting_bankroll preserves the post-reset starting
+        # amount for the % return math, and bankroll_reset_at is the cutoff
+        # the money-strip query uses to filter closed-trade realized P&L.
+        reset_now = utcnow()
         for w in wallets:
             w.paper_balance = new_balance
-        
+            w.session_starting_bankroll = float(new_balance)
+            w.bankroll_reset_at = reset_now
+
         # Log the action
         s.add(
             ActivityLog(
@@ -2760,7 +2839,8 @@ def settings_reset_paper_balance(
                 level="info",
                 message=f"Paper balance reset to ${new_balance:,.2f} for {wallet_count} wallet(s). "
                         f"Closed {closed_count} positions. "
-                        f"{'Cleared trade history.' if should_clear else 'Trade history preserved.'}",
+                        f"{'Cleared trade history.' if should_clear else 'Trade history preserved.'} "
+                        f"Session P&L now counts from this point; full history retained.",
             )
         )
     

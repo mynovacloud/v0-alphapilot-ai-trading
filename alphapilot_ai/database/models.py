@@ -71,6 +71,15 @@ class Wallet(Base):
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
     created_at = Column(DateTime, default=utcnow)
+    # Bankroll-reset markers. NULL on a wallet that has never been reset.
+    # When the Paper Trading Reset action fires, we stamp utcnow() here and
+    # remember the value paper_balance was reset to. The training-page money
+    # strip filters realized P&L to trades closed AFTER this timestamp, so
+    # the operator sees performance "since the new $10K" instead of all-time
+    # numbers that mix the old and new sessions. Trade history is NEVER
+    # deleted — these columns are purely a display-filter cursor.
+    bankroll_reset_at = Column(DateTime, nullable=True)
+    session_starting_bankroll = Column(Float, nullable=True)
     # Metadata for session settings backup/restore
     meta = Column(JSON, default=dict)
 
