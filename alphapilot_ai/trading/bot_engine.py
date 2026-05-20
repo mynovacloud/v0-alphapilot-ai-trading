@@ -215,9 +215,13 @@ class BotEngine:
         # before evaluating new entries. This ensures SL/TP/trailing stops
         # are processed at the same frequency as new entry signals.
         # -----------------------------------------------------------------
-        auto_exits = self._monitor_positions(cfg, universe, result, price_map)
-        if auto_exits > 0:
-            result.notes.append(f"auto_exits={auto_exits}")
+        try:
+            auto_exits = self._monitor_positions(cfg, universe, result, price_map)
+            if auto_exits > 0:
+                result.notes.append(f"auto_exits={auto_exits}")
+        except Exception as e:
+            self._log("bot", f"Position monitoring error: {e}", level="warn")
+            result.errors += 1
 
         # -----------------------------------------------------------------
         # PORTFOLIO INTELLIGENCE: Proactive portfolio management.
@@ -228,9 +232,13 @@ class BotEngine:
         #   3. Open offset trades to balance underwater positions
         # This runs EVERY tick, regardless of slot availability.
         # -----------------------------------------------------------------
-        intel_actions = self._run_portfolio_intelligence(cfg, universe, result)
-        if intel_actions > 0:
-            result.notes.append(f"portfolio_intel_actions={intel_actions}")
+        try:
+            intel_actions = self._run_portfolio_intelligence(cfg, universe, result, price_map)
+            if intel_actions > 0:
+                result.notes.append(f"portfolio_intel_actions={intel_actions}")
+        except Exception as e:
+            self._log("bot", f"Portfolio intelligence error: {e}", level="warn")
+            result.errors += 1
 
         # Walk every active wallet.
         with session_scope() as s:
@@ -764,6 +772,7 @@ class BotEngine:
         cfg: BotConfig,
         universe: list[dict[str, Any]],
         result: TickResult,
+        price_map: dict[str, float] | None = None,
     ) -> int:
         """
         Proactive portfolio management - DCA, scale-in, offset trades.
@@ -774,13 +783,16 @@ class BotEngine:
         
         Returns the number of actions executed.
         """
-        # Build price map
-        price_map: dict[str, float] = {}
-        for product in universe:
-            symbol = product["product_id"]
-            price_payload = get_price(symbol)
-            if price_payload.get("ok"):
-                price_map[symbol] = float(price_payload["price"])
+        # Use the prefetched price_map if provided, otherwise build one minimally
+        if not price_map:
+            price_map = {}
+            # Only fetch prices for symbols we actually need (open positions)
+            with session_scope() as s:
+                open_symbols = [p[0] for p in s.query(PaperTrade.symbol).filter(PaperTrade.status == "open").distinct().all()]
+            for symbol in open_symbols:
+                price_payload = get_price(symbol)
+                if price_payload.get("ok"):
+                    price_map[symbol] = float(price_payload["price"])
         
         if not price_map:
             return 0
