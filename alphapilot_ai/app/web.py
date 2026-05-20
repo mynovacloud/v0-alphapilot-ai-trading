@@ -784,7 +784,7 @@ def strategies_backtest(request: Request, strategy_id: int, n_trades: int = Form
 @router.get("/debug", response_class=HTMLResponse)
 def debug_console_page(request: Request) -> HTMLResponse:
     """Debug console page - shows all system errors, warnings, and execution logs."""
-    return templates.TemplateResponse("debug_console.html", _ctx(request))
+    return templates.TemplateResponse(request=request, name="debug_console.html", context=_ctx(request, active="debug"))
 
 
 @router.get("/debug/logs")
@@ -1022,6 +1022,7 @@ def debug_run_diagnostics() -> JSONResponse:
 
 # ----------------------------------------------------------------------
 # TRAINING CENTER
+@router.get("/training", response_class=HTMLResponse)
 def training_page(request: Request) -> HTMLResponse:
     from ai.claude_learning import (
         get_playbook_with_metadata,
