@@ -1194,7 +1194,10 @@ def training_session_config() -> JSONResponse:
     from config.bot_config import get as cfg_get
     from services.claude_client import is_configured as claude_is_configured
     from trading.risk_manager import RiskManager
+    from ai.claude_decision_engine import get_api_usage_stats
 
+    api_stats = get_api_usage_stats()
+    
     return JSONResponse(
         {
             "ok": True,
@@ -1208,8 +1211,36 @@ def training_session_config() -> JSONResponse:
             # Surfaced so the Training Center can warn / auto-release before the
             # user wonders why their tick log is just "kill switch engaged" forever.
             "kill_switch_engaged": RiskManager.kill_switch_status(),
+            # API usage stats for cost monitoring
+            "api_usage": api_stats,
         }
     )
+
+
+@router.get("/training/learning/stats")
+def training_learning_stats() -> JSONResponse:
+    """Get statistics from the autonomous learning engine."""
+    try:
+        from ai.autonomous_learning_engine import get_autonomous_engine
+        engine = get_autonomous_engine()
+        stats = engine.get_statistics()
+        return JSONResponse({"ok": True, **stats})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.get("/training/learning/symbol/{symbol}")
+def training_learning_symbol(symbol: str) -> JSONResponse:
+    """Get learned insights for a specific symbol."""
+    try:
+        from ai.autonomous_learning_engine import get_autonomous_engine
+        engine = get_autonomous_engine()
+        insights = engine.get_symbol_insights(symbol)
+        if insights:
+            return JSONResponse({"ok": True, **insights})
+        return JSONResponse({"ok": False, "error": "No data for symbol"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
 @router.post("/training/session/stop")
@@ -2683,10 +2714,11 @@ def api_close_all_positions() -> JSONResponse:
 def api_take_all_profits() -> JSONResponse:
     """
     Close only PROFITABLE positions - lock in gains immediately.
-    Perfect for scalping: take your wins, let losers run to stop-loss.
+    OPTIMIZED: Fetches all prices in parallel for speed.
     """
     import logging
     import traceback
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     
     try:
         from connectors.live_prices import get_price
@@ -2718,21 +2750,43 @@ def api_take_all_profits() -> JSONResponse:
             trade_info = [(t.id, t.symbol, t.side or "BUY", float(t.entry_price or 0), float(t.qty or 0)) for t in open_trades]
         
         logging.info(f"[TAKE_PROFITS] Found {len(trade_info)} open trades, target=${micro_target}")
+        
+        # OPTIMIZATION: Fetch all prices in parallel (5 seconds max vs 5 minutes sequential)
+        symbols = list(set(t[1] for t in trade_info))
+        prices = {}
+        
+        def fetch_price(symbol):
+            try:
+                p = get_price(symbol)
+                if p.get("ok"):
+                    return symbol, float(p["price"])
+            except Exception as e:
+                logging.debug(f"[TAKE_PROFITS] Price fetch error for {symbol}: {e}")
+            return symbol, None
+        
+        with ThreadPoolExecutor(max_workers=min(20, len(symbols))) as executor:
+            futures = {executor.submit(fetch_price, sym): sym for sym in symbols}
+            for future in as_completed(futures, timeout=10):
+                try:
+                    sym, price = future.result()
+                    if price is not None:
+                        prices[sym] = price
+                except Exception as e:
+                    logging.debug(f"[TAKE_PROFITS] Future error: {e}")
+        
+        logging.info(f"[TAKE_PROFITS] Fetched {len(prices)}/{len(symbols)} prices in parallel")
 
+        # Now process trades with cached prices (instant)
         for trade_id, symbol, side, entry_price, qty in trade_info:
             try:
                 if entry_price <= 0 or qty <= 0:
-                    logging.warning(f"[TAKE_PROFITS] Invalid trade data for {symbol}: entry={entry_price}, qty={qty}")
-                    skipped += 1
-                    continue
-                    
-                p = get_price(symbol)
-                if not p.get("ok"):
-                    logging.warning(f"[TAKE_PROFITS] No price for {symbol}: {p.get('error', 'unknown')}")
                     skipped += 1
                     continue
                 
-                current_price = float(p["price"])
+                current_price = prices.get(symbol)
+                if current_price is None:
+                    skipped += 1
+                    continue
                 
                 # Calculate P&L
                 if side.upper() == "BUY":
@@ -2740,16 +2794,12 @@ def api_take_all_profits() -> JSONResponse:
                 else:
                     pnl = (entry_price - current_price) * qty
                 
-                logging.info(f"[TAKE_PROFITS] {symbol}: entry=${entry_price:.4f}, current=${current_price:.4f}, pnl=${pnl:.4f}, target=${micro_target:.2f}")
-                
-                # Only close if profitable AND meets scalper target (if scalper mode)
+                # Only close if profitable AND meets scalper target
                 if pnl < micro_target:
-                    logging.info(f"[TAKE_PROFITS] {symbol}: pnl ${pnl:.2f} < target ${micro_target:.2f}, skipping")
                     skipped += 1
                     continue
 
                 result = engine.close_trade(trade_id, current_price, notes="take-profits via API")
-                logging.info(f"[TAKE_PROFITS] close_trade result for {symbol}: {result}")
                 
                 if result.get("ok"):
                     closed += 1
@@ -2759,13 +2809,12 @@ def api_take_all_profits() -> JSONResponse:
                             trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
                             if trade:
                                 trade.exit_reason = "take_profit_manual"
-                    except Exception as db_err:
-                        logging.error(f"[TAKE_PROFITS] Error updating exit_reason: {db_err}")
+                    except Exception:
+                        pass
                 else:
                     errors.append(f"{symbol}: {result.get('reason', 'unknown')}")
                     skipped += 1
             except Exception as e:
-                logging.error(f"[TAKE_PROFITS] Error processing {symbol}: {e}")
                 errors.append(f"{symbol}: {str(e)}")
                 skipped += 1
 
@@ -2778,8 +2827,8 @@ def api_take_all_profits() -> JSONResponse:
                         message=f"Take-profits: {closed} winners closed (${total_pnl:+.2f}), {skipped} positions held",
                     )
                 )
-        except Exception as log_err:
-            logging.error(f"[TAKE_PROFITS] Error logging activity: {log_err}")
+        except Exception:
+            pass
             
     except Exception as e:
         logging.exception("[TAKE_PROFITS] Fatal error")

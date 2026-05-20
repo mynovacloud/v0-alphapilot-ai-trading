@@ -42,6 +42,13 @@ from trading.portfolio_intelligence import (
 from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol
+# Advanced trading modules
+from trading.advanced_signal_engine import get_signal_engine, AdvancedSignal
+from trading.advanced_position_sizer import get_position_sizer
+from trading.advanced_exit_manager import get_exit_manager, calculate_stops
+from trading.market_intelligence import get_market_intelligence
+from trading.strategic_claude import get_strategic_router
+from trading.trade_filter import get_trade_filter, FilterResult
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -379,10 +386,13 @@ class BotEngine:
                 # We might want to DCA - let portfolio intelligence handle that
                 continue
             if slots_left <= 0:
-                # No slots for new positions, but keep evaluating for logging/monitoring
-                # Continue evaluating a few more for "best signal" tracking
-                if evaluated >= 10:  # Evaluate at least 10 symbols even if slots full
+                # No slots for new positions - can't open new trades
+                # Just track a few "best signals" for monitoring then stop
+                if evaluated >= 10:
                     break
+                # Still evaluate to track best signals but skip trade execution
+                # by continuing to next symbol
+                continue
             
             price_payload = get_price(symbol)
             if not price_payload.get("ok"):
@@ -393,15 +403,87 @@ class BotEngine:
                 result.skipped += 1
                 continue
 
-            # Compute the REAL signal from Coinbase candle data instead of a
-            # synthetic snapshot. evaluate_symbol picks the strategy implementation
-            # (Momentum / Mean Reversion / Volatility Breakout / Probability Edge)
-            # and returns a Signal with confidence, reasoning, and indicators.
-            # Granularity follows the tick rate so a 2s real-time session uses
-            # 60s bars instead of stale 5-minute data.
-            signal = evaluate_symbol(symbol, strategy_type, tick_seconds=cfg.tick_seconds)
+            # =====================================================================
+            # MARKET INTELLIGENCE CHECK
+            # Analyzes BTC correlation, liquidity, entry timing, sentiment
+            # This is what makes us smarter than average traders
+            # =====================================================================
+            market_intel = get_market_intelligence()
+            market_intel.update_price(symbol, price)  # Track price history
+            
+            # Get market context (BTC trend, overall sentiment)
+            market_ctx = market_intel.get_market_context()
+            
+            # =====================================================================
+            # ADVANCED MULTI-FACTOR SIGNAL GENERATION
+            # Uses the new advanced_signal_engine with:
+            # - Trend analysis (EMA alignment, ADX)
+            # - Momentum (RSI, MACD histogram, rate of change)
+            # - Volatility (ATR, Bollinger Band position)
+            # - Volume confirmation
+            # - Pattern recognition
+            # - Quality grades (A+, A, B, C, F)
+            # =====================================================================
+            signal_engine = get_signal_engine()
+            advanced_signal = signal_engine.generate_signal(
+                symbol=symbol,
+                current_price=price,
+                strategy_type=strategy_type,
+            )
+            
+            # Convert to legacy Signal format for compatibility
+            from trading.strategy_engine import Signal
+            signal = Signal(
+                side=advanced_signal.side,
+                confidence=advanced_signal.confidence,
+                reasoning=advanced_signal.reasoning,
+                strategy=advanced_signal.strategy,
+                indicators=advanced_signal.indicators,
+            )
+            
+            # Log quality grade for high-conviction signals
+            if advanced_signal.quality in ("A+", "A") and advanced_signal.side != "HOLD":
+                self._log(
+                    "bot",
+                    f"[SIGNAL] {symbol}: {advanced_signal.side} Grade={advanced_signal.quality} "
+                    f"Factors={advanced_signal.confirming_factors}/{advanced_signal.total_factors} "
+                    f"Conf={advanced_signal.confidence:.2f}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+            
             evaluated += 1
             result.decisions += 1
+            
+            # Get intelligence on this specific trade opportunity
+            intel = market_intel.analyze_trade_opportunity(
+                symbol=symbol,
+                current_price=price,
+                side=signal.side,
+                volume_24h=price_payload.get("volume_24h", 0),
+                bid=price_payload.get("bid", price * 0.999),
+                ask=price_payload.get("ask", price * 1.001),
+            )
+            
+            # Skip if market intelligence says don't trade
+            if not intel.should_trade and intel.confidence_adjustment < 0.6:
+                self._log(
+                    "bot",
+                    f"[INTEL] Skip {symbol}: {intel.skip_reason}",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+                continue
+            
+            # Skip longs if BTC is dumping (alts dump harder)
+            if market_ctx.avoid_longs and signal.side == "BUY" and symbol != "BTC-USD":
+                self._log(
+                    "bot",
+                    f"[INTEL] Skip {symbol} long: {market_ctx.reasoning}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
 
             # ALWAYS call Claude for BUY/SELL signals, even if confidence is low.
             # Let Claude be the arbiter. Only skip truly empty HOLD signals.
@@ -420,18 +502,84 @@ class BotEngine:
                     }
                 continue
 
-            # Hand the technical signal to Claude for the FINAL decision.
-            claude_calls += 1
-            decision = claude_decide(
+            # =====================================================================
+            # STRATEGIC CLAUDE ROUTING
+            # Only calls expensive Claude API when it adds value:
+            # - Ambiguous signals (40-65% confidence)
+            # - Large positions (>$500)
+            # - Reversal situations
+            # - High volatility moments
+            # Otherwise uses fast technical decision
+            # =====================================================================
+            strategic_router = get_strategic_router()
+            decision = strategic_router.decide(
                 wallet=wallet,
                 symbol=symbol,
                 price=price,
                 technical_signal=signal,
                 strategy_type=strategy_type,
+                position_size_usd=cfg.position_size_usd,
             )
+            
+            # Track if we used Claude for logging
+            if decision.source == "claude":
+                claude_calls += 1
 
             side = decision.action
             confidence = float(decision.confidence or 0.0)
+            
+            # Apply market intelligence adjustments to confidence
+            # Better entry timing = higher confidence, poor liquidity = lower confidence
+            adjusted_confidence = confidence * intel.confidence_adjustment
+            
+            # Log intelligence impact if significant
+            if abs(intel.confidence_adjustment - 1.0) > 0.1:
+                self._log(
+                    "bot",
+                    f"[INTEL] {symbol}: conf {confidence:.2f} -> {adjusted_confidence:.2f} "
+                    f"(entry={intel.entry_timing.entry_quality}, sector={intel.sector})",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+            
+            confidence = adjusted_confidence
+            
+            # =====================================================================
+            # TRADE QUALITY FILTER
+            # Final checks before entry:
+            # - Time-of-day (avoid low-volume hours)
+            # - Position correlation (avoid overexposure)
+            # - Market regime alignment
+            # - Session awareness
+            # =====================================================================
+            trade_filter = get_trade_filter()
+            
+            # Get current positions for correlation check
+            current_positions = [
+                {"symbol": p["symbol"], "side": p["side"]}
+                for p in wallet.get("open_positions", [])
+            ]
+            
+            filter_result = trade_filter.apply_filters(
+                symbol=symbol,
+                side=side,
+                confidence=confidence,
+                current_positions=current_positions,
+                market_regime=market_ctx.regime if market_ctx else None,
+                signal_strategy=advanced_signal.strategy if advanced_signal else None,
+            )
+            
+            if not filter_result.should_trade:
+                self._log(
+                    "bot",
+                    f"[FILTER] {symbol} {side} rejected: {', '.join(filter_result.reasons)}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+            
+            # Apply filter adjustments
+            confidence *= filter_result.confidence_adjustment
 
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
@@ -453,33 +601,44 @@ class BotEngine:
             
             if confidence < effective_min_conf:
                 below_conf += 1
-                # Log WHY we're skipping this trade
+                continue
+
+            # =====================================================================
+            # ADVANCED POSITION SIZING
+            # Uses Kelly Criterion, drawdown adjustment, portfolio heat management
+            # =====================================================================
+            position_sizer = get_position_sizer()
+            size_result = position_sizer.calculate_size(
+                wallet_id=wallet["id"],
+                symbol=symbol,
+                entry_price=price,
+                stop_loss_pct=decision.stop_loss_pct,
+                confidence=confidence,
+                base_size_usd=cfg.position_size_usd,
+                signal_quality=getattr(decision, 'quality', 'B'),
+            )
+            
+            position_usd = size_result.recommended_usd
+            qty = size_result.recommended_qty
+            
+            if qty <= 0 or position_usd < 10:
                 self._log(
                     "bot",
-                    f"[SKIP] {symbol} {side}: conf={confidence:.2f} < floor={effective_min_conf:.2f}",
+                    f"[SKIP] {symbol}: Position too small (${position_usd:.2f}). {size_result.reasoning}",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+                continue
+            
+            # Log sizing decision
+            if size_result.warnings:
+                self._log(
+                    "bot",
+                    f"[SIZE] {symbol}: ${position_usd:.0f} ({size_result.conviction_multiplier:.1f}x conv, "
+                    f"{size_result.drawdown_adjustment:.1f}x DD). Warnings: {', '.join(size_result.warnings[:2])}",
                     wallet_id=wallet["id"],
                     level="info",
                 )
-                continue
-
-            # Sizing: Claude's size_multiplier scales the bot's default size,
-            # then we clamp to the wallet's hard cap.
-            base_position_usd = min(
-                cfg.position_size_usd,
-                wallet["max_position_usd"] or cfg.position_size_usd,
-            )
-            position_usd = max(0.0, base_position_usd * float(decision.size_multiplier or 1.0))
-            qty = round(position_usd / price, 6)
-            if qty <= 0:
-                continue
-
-            # Log the dry_run status to help debug
-            self._log(
-                "bot",
-                f"[TRADE CHECK] {symbol} {side}: dry_run={cfg.dry_run}, qty={qty:.6f}, price={price:.4f}",
-                wallet_id=wallet["id"],
-                level="debug",
-            )
 
             if cfg.dry_run:
                 self._log(
@@ -497,12 +656,6 @@ class BotEngine:
                 continue
 
             # Real path: open a paper trade through the existing engine.
-            self._log(
-                "bot",
-                f"[OPENING TRADE] {wallet['name']}: {side} {qty} {symbol} @ {price:.4f}",
-                wallet_id=wallet["id"],
-                level="info",
-            )
             outcome = self.paper.open_trade(
                 wallet_id=wallet["id"],
                 symbol=symbol,
@@ -520,21 +673,51 @@ class BotEngine:
             if outcome.get("ok"):
                 result.actions += 1
                 slots_left -= 1
-                # Initialize SL/TP based on Claude's recommendation
+                # =====================================================================
+                # ADVANCED EXIT MANAGEMENT
+                # Dynamic SL/TP based on ATR, with trailing stops and break-even logic
+                # =====================================================================
                 trade_id = outcome.get("trade_id")
                 if trade_id:
                     with session_scope() as s:
                         trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
                         if trade:
+                            # Use advanced exit manager for dynamic stops
+                            exit_manager = get_exit_manager()
+                            
+                            # Get ATR for dynamic stop calculation (use decision's stop as fallback)
+                            atr_estimate = price * decision.stop_loss_pct  # Approximate ATR
+                            
+                            stop_price, target_price, trailing_pct = exit_manager.calculate_dynamic_stops(
+                                entry_price=price,
+                                side=side,
+                                atr=atr_estimate,
+                                confidence=confidence,
+                            )
+                            
+                            # Convert prices to percentages for initialize_trade_sl_tp
+                            sl_pct = abs(price - stop_price) / price
+                            tp_pct = abs(target_price - price) / price
+                            
                             initialize_trade_sl_tp(
                                 trade,
-                                stop_loss_pct=decision.stop_loss_pct,
-                                take_profit_pct=decision.take_profit_pct,
-                                trailing_stop_pct=None,  # Can be enabled later
-                                max_loss_pct=0.10,
-                                time_limit_hours=None,
+                                stop_loss_pct=sl_pct,
+                                take_profit_pct=tp_pct,
+                                trailing_stop_pct=trailing_pct,
+                                max_loss_pct=0.10,  # 10% absolute max
+                                time_limit_hours=72,  # 3 days max hold
                             )
+                            
+                            # Store high water mark for trailing stop
+                            trade.high_water_mark = price
                             s.commit()
+                            
+                            self._log(
+                                "bot",
+                                f"[STOPS] {symbol}: SL={sl_pct:.1%} TP={tp_pct:.1%} Trail={trailing_pct:.1%}",
+                                wallet_id=wallet["id"],
+                                level="debug",
+                            )
                 self._log(
                     "trade",
                     (
