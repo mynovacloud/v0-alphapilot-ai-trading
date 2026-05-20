@@ -678,19 +678,33 @@ class BotEngine:
                 level="info",
             )
             
-            outcome = self.paper.open_trade(
-                wallet_id=wallet["id"],
-                symbol=symbol,
-                side=side,
-                qty=qty,
-                entry_price=price,
-                confidence=confidence,
-                market_type="Crypto",
-                strategy_id=strategy_id,
-                notes=(
-                    f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
-                ),
-            )
+            try:
+                outcome = self.paper.open_trade(
+                    wallet_id=wallet["id"],
+                    symbol=symbol,
+                    side=side,
+                    qty=qty,
+                    entry_price=price,
+                    confidence=confidence,
+                    market_type="Crypto",
+                    strategy_id=strategy_id,
+                    notes=(
+                        f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
+                    ),
+                )
+            except Exception as e:
+                # A single bad trade (attribute error, DB hiccup, etc.) must
+                # NOT abort the whole wallet's tick. Log it and continue so
+                # the rest of the universe still gets a chance.
+                import traceback
+                self._log(
+                    "bot",
+                    f"[OPEN_TRADE ERROR] {symbol} {side}: {e}\n{traceback.format_exc()[:500]}",
+                    wallet_id=wallet["id"],
+                    level="warn",
+                )
+                result.errors += 1
+                continue
 
             if outcome.get("ok"):
                 self._log(
