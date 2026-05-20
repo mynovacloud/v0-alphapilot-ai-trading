@@ -846,9 +846,7 @@ def debug_get_logs() -> JSONResponse:
         ).count()
         
         # Check if session is active
-        from config.bot_config import BotConfig
-        cfg = BotConfig.load()
-        session_active = cfg.get_bool("training_session_active")
+        session_active = str(bot_config.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
         
         log_list = []
         for log in logs:
@@ -1845,18 +1843,34 @@ def training_session_feed(
             "win_rate": round((wins / closed_count) if closed_count else 0.0, 4),
         }
 
+        # ---- Compute the session-start cutoff ONCE, used to scope every
+        # ---- live feed (logs, decisions, fills) so the console and the
+        # ---- decision/fill panels never preload stale data from prior runs.
+        from datetime import datetime as _dt, timezone as _tz
+        session_start_naive = None
+        if started_at:
+            try:
+                _parsed = _dt.fromisoformat(str(started_at).replace("Z", "+00:00"))
+                if _parsed.tzinfo is not None:
+                    _parsed = _parsed.astimezone(_tz.utc).replace(tzinfo=None)
+                session_start_naive = _parsed
+            except Exception:
+                session_start_naive = None
+
         # ---- New Claude decisions since the client's last cursor ----
-        new_decisions = (
-            s.query(ClaudeDecision)
-            .filter(ClaudeDecision.id > since_decision_id)
-            .order_by(ClaudeDecision.id.asc())
-            .limit(50)
-            .all()
-        )
+        decisions_q = s.query(ClaudeDecision).filter(ClaudeDecision.id > since_decision_id)
+        if session_start_naive is not None:
+            decisions_q = decisions_q.filter(ClaudeDecision.created_at >= session_start_naive)
+        new_decisions = decisions_q.order_by(ClaudeDecision.id.asc()).limit(50).all()
         decisions_payload = [
             {
                 "id": d.id,
-                "ts": int(d.created_at.timestamp()) if d.created_at else None,
+                # created_at is naive UTC — tag it as UTC before .timestamp()
+                # so the browser receives a real epoch and renders local time.
+                "ts": (
+                    int(d.created_at.replace(tzinfo=_tz.utc).timestamp())
+                    if d.created_at else None
+                ),
                 "created_at": d.created_at.isoformat() if d.created_at else None,
                 "wallet_id": d.wallet_id,
                 "symbol": d.symbol,
@@ -1876,13 +1890,12 @@ def training_session_feed(
 
         # ---- Newly opened or closed paper trades ----
         # Use a max(opened_id, closed_id) cursor so the client gets both events.
-        new_trades = (
-            s.query(PaperTrade)
-            .filter(PaperTrade.id > since_trade_id)
-            .order_by(PaperTrade.id.asc())
-            .limit(40)
-            .all()
-        )
+        trades_q = s.query(PaperTrade).filter(PaperTrade.id > since_trade_id)
+        if session_start_naive is not None:
+            # A trade opened before the session began but still open during the
+            # session is *not* part of this session's activity feed — skip it.
+            trades_q = trades_q.filter(PaperTrade.opened_at >= session_start_naive)
+        new_trades = trades_q.order_by(PaperTrade.id.asc()).limit(40).all()
         fills_payload = []
         for t in new_trades:
             mark = symbol_prices.get(t.symbol)
@@ -1910,17 +1923,23 @@ def training_session_feed(
             )
 
         # ---- Activity logs (the live console) ----
-        new_logs = (
-            s.query(ActivityLog)
-            .filter(ActivityLog.id > since_log_id)
-            .order_by(ActivityLog.id.asc())
-            .limit(80)
-            .all()
-        )
+        # Reuse the session_start_naive cutoff computed above so the console
+        # never preloads pre-session log entries (e.g. old "kill switch
+        # engaged" ticks from a previous day).
+        logs_q = s.query(ActivityLog).filter(ActivityLog.id > since_log_id)
+        if session_start_naive is not None:
+            logs_q = logs_q.filter(ActivityLog.created_at >= session_start_naive)
+        new_logs = logs_q.order_by(ActivityLog.id.asc()).limit(80).all()
         logs_payload = [
             {
                 "id": l.id,
-                "ts": int(l.created_at.timestamp()) if l.created_at else None,
+                # created_at is naive UTC in the DB; force-tag it as UTC so the
+                # epoch we send to the browser is correct and JS can format it
+                # in the user's local time zone.
+                "ts": (
+                    int(l.created_at.replace(tzinfo=_tz.utc).timestamp())
+                    if l.created_at else None
+                ),
                 "category": l.category,
                 "level": l.level,
                 "wallet_id": l.wallet_id,
