@@ -601,6 +601,14 @@ class BotEngine:
             
             if confidence < effective_min_conf:
                 below_conf += 1
+                # Log blocked trades so user knows WHY nothing is executing
+                if side in {"BUY", "SELL"} and confidence >= 0.40:
+                    self._log(
+                        "bot",
+                        f"[BLOCKED] {symbol} {side}: conf {confidence:.2f} < min {effective_min_conf:.2f}",
+                        wallet_id=wallet["id"],
+                        level="debug",
+                    )
                 continue
 
             # =====================================================================

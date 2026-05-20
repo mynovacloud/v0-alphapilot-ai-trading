@@ -18,7 +18,7 @@ DEFAULTS: dict[str, str] = {
     "bot_tick_seconds": "60",              # how often the loop wakes up
     "bot_universe": "coinbase_usd",        # which universe to trade
     "bot_universe_limit": "100",           # max symbols per tick (increased for diversity)
-    "bot_min_confidence": "0.55",          # minimum AI confidence to act (raised for quality)
+    "bot_min_confidence": "0.45",          # minimum AI confidence to act (lowered to allow more trades)
     "bot_default_strategy_type": "Momentum",
     "bot_position_size_usd": "80",         # default per-trade notional in USD
     "bot_max_open_per_wallet": "25",       # max concurrent positions (increased for scalping)
