@@ -131,6 +131,20 @@ def get_price(symbol: str, use_cache: bool = True) -> dict[str, Any]:
             if cached:
                 return {"ok": True, "symbol": sym, "price": cached[0], "source": "cache (stale)", "live": False}
         logger.warning("Price fetch failed for %s: %s", sym, e)
+        
+        # Log to activity log for debug console
+        try:
+            from database.db import session_scope
+            from database.models import ActivityLog
+            with session_scope() as s:
+                s.add(ActivityLog(
+                    category="api",
+                    level="warn",
+                    message=f"[live_prices] Price fetch failed for {sym}: {str(e)[:200]}",
+                ))
+        except Exception:
+            pass
+        
         return {"ok": False, "symbol": sym, "error": f"Live price fetch failed: {e}"}
 
 
