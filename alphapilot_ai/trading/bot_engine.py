@@ -46,6 +46,7 @@ from trading.strategy_engine import evaluate_symbol
 from trading.advanced_signal_engine import get_signal_engine, AdvancedSignal
 from trading.advanced_position_sizer import get_position_sizer
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
+from trading.market_intelligence import get_market_intelligence
 from utils.helpers import utcnow
 from utils.logger import get_logger
 
@@ -400,6 +401,17 @@ class BotEngine:
                 result.skipped += 1
                 continue
 
+            # =====================================================================
+            # MARKET INTELLIGENCE CHECK
+            # Analyzes BTC correlation, liquidity, entry timing, sentiment
+            # This is what makes us smarter than average traders
+            # =====================================================================
+            market_intel = get_market_intelligence()
+            market_intel.update_price(symbol, price)  # Track price history
+            
+            # Get market context (BTC trend, overall sentiment)
+            market_ctx = market_intel.get_market_context()
+            
             # Compute the REAL signal from Coinbase candle data instead of a
             # synthetic snapshot. evaluate_symbol picks the strategy implementation
             # (Momentum / Mean Reversion / Volatility Breakout / Probability Edge)
@@ -409,6 +421,36 @@ class BotEngine:
             signal = evaluate_symbol(symbol, strategy_type, tick_seconds=cfg.tick_seconds)
             evaluated += 1
             result.decisions += 1
+            
+            # Get intelligence on this specific trade opportunity
+            intel = market_intel.analyze_trade_opportunity(
+                symbol=symbol,
+                current_price=price,
+                side=signal.side,
+                volume_24h=price_payload.get("volume_24h", 0),
+                bid=price_payload.get("bid", price * 0.999),
+                ask=price_payload.get("ask", price * 1.001),
+            )
+            
+            # Skip if market intelligence says don't trade
+            if not intel.should_trade and intel.confidence_adjustment < 0.6:
+                self._log(
+                    "bot",
+                    f"[INTEL] Skip {symbol}: {intel.skip_reason}",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+                continue
+            
+            # Skip longs if BTC is dumping (alts dump harder)
+            if market_ctx.avoid_longs and signal.side == "BUY" and symbol != "BTC-USD":
+                self._log(
+                    "bot",
+                    f"[INTEL] Skip {symbol} long: {market_ctx.reasoning}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
 
             # ALWAYS call Claude for BUY/SELL signals, even if confidence is low.
             # Let Claude be the arbiter. Only skip truly empty HOLD signals.
@@ -439,6 +481,22 @@ class BotEngine:
 
             side = decision.action
             confidence = float(decision.confidence or 0.0)
+            
+            # Apply market intelligence adjustments to confidence
+            # Better entry timing = higher confidence, poor liquidity = lower confidence
+            adjusted_confidence = confidence * intel.confidence_adjustment
+            
+            # Log intelligence impact if significant
+            if abs(intel.confidence_adjustment - 1.0) > 0.1:
+                self._log(
+                    "bot",
+                    f"[INTEL] {symbol}: conf {confidence:.2f} -> {adjusted_confidence:.2f} "
+                    f"(entry={intel.entry_timing.entry_quality}, sector={intel.sector})",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+            
+            confidence = adjusted_confidence
 
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
