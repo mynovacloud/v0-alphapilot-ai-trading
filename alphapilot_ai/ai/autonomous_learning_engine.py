@@ -740,16 +740,32 @@ class AutonomousLearningEngine:
             confidence=signal_confidence,
         )
         
+        # =====================================================================
+        # TRAINING MODE: When the user is running a live training session, we
+        # want the bot to TRADE actively so it can learn new patterns — even
+        # if those patterns historically lost money. A 36% win rate with 168
+        # closed trades is too small a sample; the "known losing pattern"
+        # database is mostly noise. Disable the AVOID shortcut so we gather
+        # more data. The risk-manager's position-sizing and stop-losses still
+        # protect the (paper) capital.
+        # =====================================================================
+        from config import bot_config as bot_cfg_mod
+        training_active = str(bot_cfg_mod.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
+        
         # 1. Check for known mistake patterns (CRITICAL)
         mistake_penalty = self._check_mistakes(fingerprint, context)
         if mistake_penalty > 0:
             decision.confidence *= (1 - mistake_penalty)
             decision.avoided_patterns.append(f"mistake:{fingerprint}")
             
+            # Only hard-block in live mode; in training we log and continue.
             if mistake_penalty > 0.5:
-                decision.action = "AVOID"
-                decision.reasoning = f"Matches known losing pattern (penalty={mistake_penalty:.0%})"
-                return decision
+                if training_active:
+                    decision.reasoning = f"Training mode — trading despite penalty={mistake_penalty:.0%} to gather data"
+                else:
+                    decision.action = "AVOID"
+                    decision.reasoning = f"Matches known losing pattern (penalty={mistake_penalty:.0%})"
+                    return decision
         
         # 2. Check for known success patterns
         pattern_bonus = self._check_patterns(fingerprint, context)
