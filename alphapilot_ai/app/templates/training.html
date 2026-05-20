@@ -633,25 +633,35 @@ loadPnlStats('today');
 // Position management functions
 let positionsData = [];
 
+// Helper to preserve scroll position during DOM updates
+function preserveScrollPosition(fn) {
+  const scrollY = window.scrollY;
+  const scrollX = window.scrollX;
+  fn();
+  // Restore scroll if it changed significantly
+  if (Math.abs(window.scrollY - scrollY) > 5) {
+    window.scrollTo(scrollX, scrollY);
+  }
+}
+
 async function refreshPositions() {
-  console.log('[v0] refreshPositions called');
   try {
     const res = await fetch('/v1/positions');
-    console.log('[v0] refreshPositions response status:', res.status);
     const data = await res.json();
-    console.log('[v0] refreshPositions data:', data);
     if (data.ok) {
       positionsData = data.positions;
-      renderPositions(data.positions);
+      preserveScrollPosition(() => renderPositions(data.positions));
     } else {
-      console.error('[v0] refreshPositions error:', data.error);
-      document.getElementById('positions-body').innerHTML = 
-        `<tr><td colspan="9" class="empty">Error: ${data.error || 'Failed to load'}</td></tr>`;
+      preserveScrollPosition(() => {
+        document.getElementById('positions-body').innerHTML = 
+          `<tr><td colspan="9" class="empty">Error: ${data.error || 'Failed to load'}</td></tr>`;
+      });
     }
   } catch (err) {
-    console.error('[v0] Failed to refresh positions:', err);
-    document.getElementById('positions-body').innerHTML = 
-      `<tr><td colspan="9" class="empty">Error: ${err.message}</td></tr>`;
+    preserveScrollPosition(() => {
+      document.getElementById('positions-body').innerHTML = 
+        `<tr><td colspan="9" class="empty">Error: ${err.message}</td></tr>`;
+    });
   }
 }
 

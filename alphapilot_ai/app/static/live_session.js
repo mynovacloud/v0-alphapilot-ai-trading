@@ -106,6 +106,18 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
+  
+  // --- Scroll preservation ---
+  // Prevents auto-scroll-to-top when DOM is updated
+  function preserveScroll(fn) {
+    const scrollY = window.scrollY;
+    const scrollX = window.scrollX;
+    fn();
+    // Only restore if we actually scrolled (prevents fighting with user)
+    if (Math.abs(window.scrollY - scrollY) > 5) {
+      window.scrollTo(scrollX, scrollY);
+    }
+  }
 
   // --- Status / pulse ---
   function setStatus(active, info) {
@@ -248,26 +260,29 @@
       const data = await res.json();
       if (!data.ok) return;
       
-      setStatus(!!data.session.active, data.session);
-      renderPortfolio(data.portfolio);
+      // Preserve scroll position during all DOM updates
+      preserveScroll(() => {
+        setStatus(!!data.session.active, data.session);
+        renderPortfolio(data.portfolio);
 
-      (data.decisions || []).forEach(renderDecision);
-      (data.fills || []).forEach(renderFill);
-      (data.logs || []).forEach(renderLog);
+        (data.decisions || []).forEach(renderDecision);
+        (data.fills || []).forEach(renderFill);
+        (data.logs || []).forEach(renderLog);
 
-      if (data.decisions && data.decisions.length) {
-        state.decisionCount += data.decisions.length;
-        decCountEl.textContent = state.decisionCount;
-      }
-      if (data.fills && data.fills.length) {
-        state.fillCount += data.fills.length;
-        fillCountEl.textContent = state.fillCount;
-      }
-      if (data.cursors) {
-        state.cursors = data.cursors;
-      }
+        if (data.decisions && data.decisions.length) {
+          state.decisionCount += data.decisions.length;
+          decCountEl.textContent = state.decisionCount;
+        }
+        if (data.fills && data.fills.length) {
+          state.fillCount += data.fills.length;
+          fillCountEl.textContent = state.fillCount;
+        }
+        if (data.cursors) {
+          state.cursors = data.cursors;
+        }
+      });
       
-      // Poll portfolio intelligence status
+      // Poll portfolio intelligence status (outside preserveScroll since it's async)
       pollPortfolioIntel();
     } catch (e) {
       console.error("[v0] live feed poll failed", e);
@@ -282,65 +297,68 @@
       const data = await res.json();
       if (!data.ok) return;
       
-      // Update the intel card if it exists
-      const card = document.getElementById("portfolio-intel-card");
-      if (!card) return;
-      
-      // Show card if there are positions
-      if (data.portfolios && data.portfolios.length > 0) {
-        card.style.display = "block";
+      // Preserve scroll during DOM updates
+      preserveScroll(() => {
+        // Update the intel card if it exists
+        const card = document.getElementById("portfolio-intel-card");
+        if (!card) return;
         
-        // Set recovery mode styling
-        if (data.is_recovery_mode) {
-          card.classList.add("recovery-mode");
-          const badge = document.getElementById("intel-mode-badge");
-          if (badge) badge.textContent = "RECOVERY MODE";
-        } else {
-          card.classList.remove("recovery-mode");
-          const badge = document.getElementById("intel-mode-badge");
-          if (badge) badge.textContent = "ACTIVE";
-        }
-        
-        // Update action list from recent activity logs
-        const list = document.getElementById("intel-actions-list");
-        if (list && data.recent_actions && data.recent_actions.length > 0) {
-          list.innerHTML = data.recent_actions.slice(0, 5).map(a => {
-            // Parse action type from message
-            let type = "unknown";
-            if (a.message.toLowerCase().includes("dca")) type = "dca";
-            else if (a.message.toLowerCase().includes("scale-in")) type = "scale_in";
-            else if (a.message.toLowerCase().includes("offset")) type = "offset";
-            
-            // Extract symbol if present
-            const symbolMatch = a.message.match(/([A-Z]{2,6}-USD)/);
-            const symbol = symbolMatch ? symbolMatch[1] : "—";
-            
-            return `
-              <div class="intel-action-item">
-                <div class="flex items-center gap-2">
-                  <span class="intel-action-type ${type}">${type.replace("_", " ")}</span>
-                  <span class="mono">${symbol}</span>
+        // Show card if there are positions
+        if (data.portfolios && data.portfolios.length > 0) {
+          card.style.display = "block";
+          
+          // Set recovery mode styling
+          if (data.is_recovery_mode) {
+            card.classList.add("recovery-mode");
+            const badge = document.getElementById("intel-mode-badge");
+            if (badge) badge.textContent = "RECOVERY MODE";
+          } else {
+            card.classList.remove("recovery-mode");
+            const badge = document.getElementById("intel-mode-badge");
+            if (badge) badge.textContent = "ACTIVE";
+          }
+          
+          // Update action list from recent activity logs
+          const list = document.getElementById("intel-actions-list");
+          if (list && data.recent_actions && data.recent_actions.length > 0) {
+            list.innerHTML = data.recent_actions.slice(0, 5).map(a => {
+              // Parse action type from message
+              let type = "unknown";
+              if (a.message.toLowerCase().includes("dca")) type = "dca";
+              else if (a.message.toLowerCase().includes("scale-in")) type = "scale_in";
+              else if (a.message.toLowerCase().includes("offset")) type = "offset";
+              
+              // Extract symbol if present
+              const symbolMatch = a.message.match(/([A-Z]{2,6}-USD)/);
+              const symbol = symbolMatch ? symbolMatch[1] : "—";
+              
+              return `
+                <div class="intel-action-item">
+                  <div class="flex items-center gap-2">
+                    <span class="intel-action-type ${type}">${type.replace("_", " ")}</span>
+                    <span class="mono">${symbol}</span>
+                  </div>
+                  <span class="text-dim">${a.message.substring(0, 50)}...</span>
                 </div>
-                <span class="text-dim">${a.message.substring(0, 50)}...</span>
-              </div>
-            `;
-          }).join("");
-        } else if (list) {
-          list.innerHTML = '<div class="text-dim">No recent portfolio intelligence actions</div>';
+              `;
+            }).join("");
+          } else if (list) {
+            list.innerHTML = '<div class="text-dim">No recent portfolio intelligence actions</div>';
+          }
+          
+          // Update counts (approximate from recent actions)
+          const dcaCount = (data.recent_actions || []).filter(a => a.message.toLowerCase().includes("dca")).length;
+          const offsetCount = (data.recent_actions || []).filter(a => a.message.toLowerCase().includes("offset")).length;
+          const el1 = document.getElementById("intel-action-count");
+          const el2 = document.getElementById("intel-dca-count");
+          const el3 = document.getElementById("intel-offset-count");
+          if (el1) el1.textContent = data.recent_actions ? data.recent_actions.length : 0;
+          if (el2) el2.textContent = dcaCount;
+          if (el3) el3.textContent = offsetCount;
+        } else {
+          card.style.display = "none";
         }
-        
-        // Update counts (approximate from recent actions)
-        const dcaCount = (data.recent_actions || []).filter(a => a.message.toLowerCase().includes("dca")).length;
-        const offsetCount = (data.recent_actions || []).filter(a => a.message.toLowerCase().includes("offset")).length;
-        const el1 = document.getElementById("intel-action-count");
-        const el2 = document.getElementById("intel-dca-count");
-        const el3 = document.getElementById("intel-offset-count");
-        if (el1) el1.textContent = data.recent_actions ? data.recent_actions.length : 0;
-        if (el2) el2.textContent = dcaCount;
-        if (el3) el3.textContent = offsetCount;
-      } else {
-        card.style.display = "none";
-      }
+      });
     } catch (e) {
       console.error("[v0] portfolio intel poll failed", e);
     }
