@@ -75,8 +75,22 @@ class RiskManager:
 
     @classmethod
     def is_training_mode(cls) -> bool:
-        """Check if training mode bypass is active."""
-        return cls._training_mode_bypass
+        """Check if training mode bypass is active.
+
+        We OR the in-memory class flag with the persisted DB flag so the
+        bypass survives a server restart / autoreload between session start
+        and the next tick — otherwise a fresh process would forget that a
+        training session was ever started, and `_cooldown_until` would lock
+        the wallet out for 15 minutes after every micro-loss.
+        """
+        if cls._training_mode_bypass:
+            return True
+        try:
+            from config import bot_config as _bot_cfg
+            val = str(_bot_cfg.get("training_session_active") or "").strip().lower()
+            return val in {"1", "true", "yes", "on"}
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -107,12 +121,12 @@ class RiskManager:
                 return RiskDecision(False, "Wallet not found", "wallet_missing")
 
             # 2. Per-wallet pause flag (bypass in training mode)
-            if wallet.bot_paused and not self._training_mode_bypass:
+            if wallet.bot_paused and not self.is_training_mode():
                 return RiskDecision(False, "Wallet bot is paused.", "wallet_paused")
 
             # 3. Daily-loss circuit breaker (bypass in training mode)
             #    If breached outside training, auto-pause the wallet.
-            if not self._training_mode_bypass:
+            if not self.is_training_mode():
                 tripped, day_loss = self._daily_loss_tripped(s, wallet, is_paper=is_paper)
                 if tripped:
                     self._auto_pause(s, wallet, reason=f"daily loss ${day_loss:,.2f} hit cap")
@@ -123,7 +137,7 @@ class RiskManager:
                     )
 
             # 4. Cooldown after consecutive losses (bypass in training mode)
-            if not self._training_mode_bypass:
+            if not self.is_training_mode():
                 cooldown_until = self._cooldown_until(s, wallet, is_paper=is_paper)
                 if cooldown_until is not None:
                     return RiskDecision(
