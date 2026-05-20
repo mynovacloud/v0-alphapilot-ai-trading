@@ -72,7 +72,7 @@ from typing import Any
 from ai.claude_learning import build_playbook
 from ai.adaptive_learning_engine import analyze_signal
 from database.db import session_scope
-from database.models import ClaudeDecision, PaperTrade
+from database.models import ActivityLog, ClaudeDecision, PaperTrade
 from services.claude_client import chat as claude_chat
 from services.claude_client import is_configured as claude_is_configured
 from trading.strategy_engine import Signal
@@ -486,6 +486,68 @@ def decide(
             )
     except Exception as e:
         logger.warning("[ADAPTIVE] error: %s", e)
+
+    # ----- Known-losing-pattern guard ------------------------------------- #
+    # Don't repeat mistakes. When the adaptive engine has built up enough
+    # evidence that this fingerprint loses money (>= 3 similar trades with
+    # success rate <= 45%), the "strong" technical signal is no longer
+    # ambiguity-free — it's a known leak. The whole point of the learning
+    # loop is to make trades like this rarer over time. Mirrors the
+    # live/training split used by autonomous_learning_engine.decide(): in
+    # live mode we refuse outright; in training mode we log + fall through
+    # so we keep collecting fresh evidence (but the adaptive engine's own
+    # size_multiplier will already be shrinking the bet).
+    known_loser = (
+        side in {"BUY", "SELL"}
+        and adaptive_rec is not None
+        and adaptive_rec.similar_past_trades >= 3
+        and adaptive_rec.historical_success_rate <= 0.45
+    )
+    if known_loser:
+        msg = (
+            f"[LEARN_BLOCK] {symbol} {side}: known-losing pattern "
+            f"(hist_wr={adaptive_rec.historical_success_rate*100:.0f}% over "
+            f"{adaptive_rec.similar_past_trades} trades) — "
+            f"{'logging only in training mode' if is_training else 'refusing trade'}"
+        )
+        logger.warning(msg)
+        try:
+            with session_scope() as _s:
+                _s.add(ActivityLog(category="ai", level="warn", message=msg))
+        except Exception:
+            logger.debug("LEARN_BLOCK audit-log failed", exc_info=True)
+
+        if not is_training:
+            refused = TradeDecision(
+                action="HOLD",
+                confidence=0.0,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"[LEARN_BLOCK] Pattern historically wins "
+                    f"{adaptive_rec.historical_success_rate*100:.0f}% over "
+                    f"{adaptive_rec.similar_past_trades} similar trades. "
+                    "Refusing to repeat a known-losing setup. "
+                    f"Original signal: {(technical_signal.reasoning or '')[:200]}"
+                ),
+                key_factors=[
+                    "learn_block",
+                    f"hist_wr={adaptive_rec.historical_success_rate:.2f}",
+                    f"n={adaptive_rec.similar_past_trades}",
+                ],
+                risk_flags=["known_losing_pattern", *list(adaptive_rec.warnings or [])[:2]],
+                source="learn_block",
+            )
+            refused.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, refused,
+                prompt_used="[LEARN_BLOCK]", extra_context=extra_context,
+            )
+            return refused
+        # Training mode: fall through. The passthrough will still fire, but
+        # adaptive_rec.size_multiplier (already shrunk for losers) bounds the
+        # damage while we collect fresh evidence.
 
     # ----- Strong-signal / training passthrough --------------------------- #
     bypass_threshold = max(0.0, min(STRONG_PASSTHROUGH_FLOOR, floor)) if is_training else STRONG_PASSTHROUGH_FLOOR
@@ -1350,8 +1412,15 @@ def _persist_decision(
     snapshot into market_snapshot so the autonomous learning engine can rebuild
     a populated TradeContext at close time. Never lets logging fail a trade."""
     try:
+        # Signal stores its indicator dict on `.indicators` — `.metadata` does
+        # not exist on the Signal dataclass. Reading the wrong attribute here
+        # was silently producing an empty snapshot post-merge, which means
+        # every persisted market_snapshot had rsi=50/macd=0/adx=0 defaults
+        # and the close-side learn fingerprint never matched the decide-side
+        # one (built from .indicators in strategic_claude). That collapses
+        # the whole Phase A loop on every trade.
         snapshot = _extract_market_state(
-            getattr(technical_signal, "metadata", {}) or {},
+            getattr(technical_signal, "indicators", {}) or {},
             extra_context or {},
         )
         new_id: int | None = None
