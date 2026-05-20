@@ -41,7 +41,7 @@ from trading.portfolio_intelligence import (
 )
 from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
-from trading.strategy_engine import evaluate_symbol
+from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles, smart_stops
 # Advanced trading modules (signal engine temporarily disabled - uses evaluate_symbol instead)
 from trading.advanced_position_sizer import get_position_sizer
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
@@ -583,6 +583,106 @@ class BotEngine:
             # Apply filter adjustments
             confidence *= filter_result.confidence_adjustment
 
+            # =====================================================================
+            # SUPPORT / RESISTANCE HEADROOM GATE
+            # Reject BUYs sitting right under a wall of resistance (and SELLs
+            # right above support). Without this, even a "valid" signal fires
+            # into a structure ceiling that price can't punch through, which
+            # is exactly the "buy and watch it do nothing then drift down"
+            # pattern the user is seeing.
+            # We also reuse the candles for our smart_stops calculation below
+            # so we only fetch them once.
+            # =====================================================================
+            entry_candles = get_entry_candles(symbol, tick_seconds=cfg.tick_seconds, lookback_bars=80)
+            sr_check = evaluate_entry_quality(entry_candles, side)
+            if not sr_check.get("accept", True):
+                self._log(
+                    "bot",
+                    f"[S/R] {symbol} {side} rejected: {sr_check.get('reason')}",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+
+            # =====================================================================
+            # ENTRY QUALITY CONFIDENCE MULTIPLIER
+            # `evaluate_entry_quality` also returns a quality_score and the
+            # naive max R:R for the setup. Setups with great asymmetry (3R+
+            # potential, 4+ ATRs of headroom) get a small confidence boost;
+            # setups that barely cleared the headroom minimum get trimmed.
+            # =====================================================================
+            sr_quality = float(sr_check.get("quality_score", 1.0))
+            potential_rr = float(sr_check.get("potential_rr", 0.0))
+
+            # Hard reject: structural R:R below 1.2 means we are paying fees
+            # on a coin-flip even if the technicals look great.
+            if potential_rr > 0 and potential_rr < 1.2:
+                self._log(
+                    "bot",
+                    f"[R:R] {symbol} {side} rejected: potential R:R {potential_rr:.1f} (need 1.2+)",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+
+            confidence *= sr_quality
+
+            # =====================================================================
+            # MARKET-WIDE FUNDAMENTAL ALIGNMENT
+            # Combine fear/greed sentiment and BTC trend to nudge confidence.
+            # Aligned conditions push borderline trades over the floor;
+            # misaligned conditions trim weak signals so they fall short.
+            # =====================================================================
+            try:
+                fg_score = float(getattr(market_ctx, "market_fear_greed", 50.0))
+            except (TypeError, ValueError):
+                fg_score = 50.0
+            btc_trend = (getattr(market_ctx, "btc_trend", "") or "").lower()
+
+            fundamental_mult = 1.0
+            fundamental_notes: list[str] = []
+
+            if side == "BUY":
+                if fg_score >= 80:
+                    fundamental_mult *= 0.85
+                    fundamental_notes.append(f"extreme greed ({fg_score:.0f})")
+                elif fg_score <= 25 and signal.strategy in ("Mean Reversion", "Scalping"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"fear ({fg_score:.0f}) + reversion")
+                if btc_trend in ("strong_uptrend", "uptrend", "bullish"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"BTC {btc_trend}")
+                elif btc_trend in ("strong_downtrend", "downtrend", "bearish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.90
+                    fundamental_notes.append(f"BTC {btc_trend} - alts follow")
+            else:  # SELL
+                if fg_score <= 20:
+                    fundamental_mult *= 0.85
+                    fundamental_notes.append(f"extreme fear ({fg_score:.0f})")
+                elif fg_score >= 75 and signal.strategy in ("Mean Reversion", "Scalping"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"greed ({fg_score:.0f}) + reversion")
+                if btc_trend in ("strong_downtrend", "downtrend", "bearish"):
+                    fundamental_mult *= 1.05
+                    fundamental_notes.append(f"BTC {btc_trend}")
+                elif btc_trend in ("strong_uptrend", "uptrend", "bullish") and symbol != "BTC-USD":
+                    fundamental_mult *= 0.90
+                    fundamental_notes.append(f"BTC {btc_trend}")
+
+            confidence *= fundamental_mult
+
+            if fundamental_notes or abs(sr_quality - 1.0) > 0.05:
+                self._log(
+                    "bot",
+                    (
+                        f"[QUALITY] {symbol} {side}: sr_q={sr_quality:.2f} "
+                        f"(R:R={potential_rr:.1f}), fundamentals={fundamental_mult:.2f} "
+                        f"({'; '.join(fundamental_notes) or 'neutral'}) -> conf={confidence:.2f}"
+                    ),
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+
             # Always remember the strongest candidate we saw so the tick log
             # reads like "best was BTC-USD BUY 0.42 (below 0.55 floor)".
             if best is None or confidence > best.get("confidence", 0.0):
@@ -717,48 +817,60 @@ class BotEngine:
                 slots_left -= 1
                 # =====================================================================
                 # ADVANCED EXIT MANAGEMENT
-                # Dynamic SL/TP based on ATR, with trailing stops and break-even logic
+                # Structure-aware SL/TP: stops are anchored to the most recent
+                # swing low (BUY) or swing high (SELL), then ATR-padded so noise
+                # can't tag us out. Take-profits scale with confidence (2.0R
+                # base, up to 3.5R for high-conviction trades) but capped at
+                # 1.5x the recent range so we don't chase unreachable targets.
                 # =====================================================================
                 trade_id = outcome.get("trade_id")
                 if trade_id:
                     with session_scope() as s:
                         trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
                         if trade:
-                            # Use advanced exit manager for dynamic stops
-                            exit_manager = get_exit_manager()
-                            
-                            # Get ATR for dynamic stop calculation (use decision's stop as fallback)
-                            atr_estimate = price * decision.stop_loss_pct  # Approximate ATR
-                            
-                            stop_price, target_price, trailing_pct = exit_manager.calculate_dynamic_stops(
-                                entry_price=price,
-                                side=side,
-                                atr=atr_estimate,
-                                confidence=confidence,
-                            )
-                            
-                            # Convert prices to percentages for initialize_trade_sl_tp
-                            sl_pct = abs(price - stop_price) / price
-                            tp_pct = abs(target_price - price) / price
-                            
+                            stops = smart_stops(entry_candles, side, confidence)
+                            if stops:
+                                sl_pct = float(stops.get("stop_pct") or 0.025)
+                                tp_pct = float(stops.get("tp_pct") or 0.05)
+                                atr_pct = float(stops.get("atr_pct") or 0.02)
+                                rr = float(stops.get("rr_ratio") or 2.0)
+                                # Trailing stop sized as 0.7x ATR — tight
+                                # enough to lock in profit, wide enough to
+                                # not get stopped on a single noisy bar.
+                                trailing_pct = max(0.008, min(0.04, atr_pct * 0.7))
+                                stop_label = (
+                                    f"swing-anchored (low=${stops.get('swing_low', 0):.4f}, "
+                                    f"R:R={rr:.1f})"
+                                )
+                            else:
+                                # Fallback to confidence-scaled fixed stops
+                                # only when we genuinely have no candle data.
+                                sl_pct = max(0.015, min(0.04, decision.stop_loss_pct or 0.025))
+                                tp_pct = max(0.03, sl_pct * 2.5)
+                                trailing_pct = max(0.01, sl_pct * 0.6)
+                                stop_label = "fallback-fixed"
+
                             initialize_trade_sl_tp(
                                 trade,
                                 stop_loss_pct=sl_pct,
                                 take_profit_pct=tp_pct,
                                 trailing_stop_pct=trailing_pct,
                                 max_loss_pct=0.10,  # 10% absolute max
-                                time_limit_hours=72,  # 3 days max hold
+                                time_limit_hours=72,
                             )
-                            
+
                             # Store high water mark for trailing stop
                             trade.high_water_mark = price
                             s.commit()
-                            
+
                             self._log(
                                 "bot",
-                                f"[STOPS] {symbol}: SL={sl_pct:.1%} TP={tp_pct:.1%} Trail={trailing_pct:.1%}",
+                                (
+                                    f"[STOPS] {symbol}: SL={sl_pct:.2%} TP={tp_pct:.2%} "
+                                    f"Trail={trailing_pct:.2%} ({stop_label})"
+                                ),
                                 wallet_id=wallet["id"],
-                                level="debug",
+                                level="info",
                             )
                 self._log(
                     "trade",
