@@ -185,7 +185,23 @@ class PaperTradingEngine:
                 fees = float(trade.fees or 0)
                 slippage = float(trade.slippage or 0)
                 side = (trade.side or "BUY").upper()
-                
+                # FIX (latent bug): symbol and duration_minutes are referenced
+                # by the three learn hooks below but were never assigned in this
+                # function — they NameError'd silently inside the broad
+                # try/except, so adaptive_learning_engine.learn_from_trade and
+                # autonomous_learning_engine.learn_from_closed_trade had been
+                # no-ops since they were wired in. Capture them here so the
+                # learn loop actually runs.
+                symbol = trade.symbol
+                trade_notes = trade.notes or ""  # captured for post-with-block use
+                if trade.opened_at and trade.closed_at:
+                    duration_minutes = max(0.0, (trade.closed_at - trade.opened_at).total_seconds() / 60.0)
+                elif trade.opened_at:
+                    from datetime import datetime, timezone
+                    duration_minutes = max(0.0, (datetime.now(timezone.utc).replace(tzinfo=None) - trade.opened_at).total_seconds() / 60.0)
+                else:
+                    duration_minutes = 0.0
+
                 if entry_price <= 0 or qty <= 0:
                     return {"ok": False, "reason": f"Invalid trade data: entry={entry_price}, qty={qty}"}
                 
@@ -270,6 +286,39 @@ class PaperTradingEngine:
             logger.info(f"[AUTONOMOUS] Learned from trade {trade_id}: {symbol} {'WIN' if pnl > 0 else 'LOSS'}")
         except Exception as e:
             logger.debug(f"Autonomous learning update failed for trade {trade_id}: {e}")
+
+        # Notify the Daily Mission Controller of the outcome so it can advance
+        # its state machine: update daily P&L, trip the loss-streak counter,
+        # apply per-symbol/strategy quarantines, transition modes (RECOVERY,
+        # PROTECT, LOCK, KILL, etc.). When the controller is disabled this
+        # resolves to a no-op via the singleton accessor — safe to call
+        # unconditionally. Wrapped in try/except so a controller bug can never
+        # prevent a trade from closing.
+        try:
+            from risk.daily_mission_controller import get_mission_controller, TradeResult
+            mission = get_mission_controller()
+            strategy_name = ""
+            try:
+                # Derive strategy from the trade's stored notes: format is
+                # "bot/<source>/<strategy_type>: <rationale>". This is a string
+                # match — when notes aren't in that format we just pass "unknown"
+                # which keeps the controller's per-strategy accounting consistent.
+                if "bot/" in trade_notes and ":" in trade_notes:
+                    prefix = trade_notes.split(":", 1)[0]   # "bot/<source>/<strategy_type>"
+                    parts = prefix.split("/")
+                    if len(parts) >= 3:
+                        strategy_name = parts[2]
+            except Exception:
+                pass
+            mission.record_trade_result(TradeResult(
+                symbol=symbol,
+                strategy=strategy_name or "unknown",
+                pnl=float(pnl),
+                fees=0.0,  # fees are already netted into realized_pnl on the close
+                notional=float(entry_price) * float(qty),
+            ))
+        except Exception as e:
+            logger.debug(f"Mission-controller record_trade_result failed for trade {trade_id}: {e}")
 
         return {"ok": True, "pnl": round(pnl, 2), "exit_reason": exit_reason}
     

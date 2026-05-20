@@ -1364,6 +1364,25 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _mission_snapshot_for_feed() -> dict[str, Any]:
+    """Lazy import + snapshot of the Daily Mission Controller.
+
+    Returns a small dict every poll so the training UI can render the current
+    mode, distance to target, and key thresholds without separate endpoints.
+    When the controller is disabled (mission_controller_enabled = False) the
+    snapshot returns `{"enabled": False, "mode": "BUILD"}` and the UI hides
+    the panel.
+    """
+    try:
+        from risk.daily_mission_controller import get_mission_controller, is_enabled
+        snap = get_mission_controller().snapshot()
+        snap["enabled"] = is_enabled()
+        return snap
+    except Exception:
+        # Never let the controller break the polling endpoint.
+        return {"enabled": False, "mode": "BUILD", "error": "snapshot_failed"}
+
+
 @router.post("/training/session/start")
 def training_session_start(
     tick_seconds: int = Form(15),
@@ -2076,6 +2095,7 @@ def training_session_feed(
                 "bot_enabled": sched.get("bot_enabled"),
             },
             "portfolio": portfolio,
+            "mission": _mission_snapshot_for_feed(),
             "decisions": decisions_payload,
             "fills": fills_payload,
             "logs": logs_payload,
@@ -2528,6 +2548,7 @@ def settings_page(request: Request) -> HTMLResponse:
             {"id": w.id, "name": w.name}
             for w in s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
         ]
+    mission_enabled = _truthy(bot_config.get("mission_controller_enabled"))
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
         request,
         active="settings",
@@ -2540,9 +2561,31 @@ def settings_page(request: Request) -> HTMLResponse:
         claude_cfg=claude_cfg,
         kill_switch=kill_switch,
         paused_wallets=paused_wallets,
+        mission_enabled=mission_enabled,
         settings=settings,
     ),
     )
+
+
+@router.post("/settings/mission/save")
+def settings_mission_save(
+    mission_controller_enabled: str = Form("false"),
+) -> RedirectResponse:
+    """Toggle the Daily Mission Controller's enforce flag.
+
+    Off (default) -> get_mission_controller() returns a no-op stand-in that
+    approves every trade. On -> the real controller becomes the boss layer
+    (confidence floor, edge gate, position sizing, Claude routing, throttles).
+    """
+    enabled = "true" if str(mission_controller_enabled).lower() in {"on", "true", "1", "yes"} else "false"
+    bot_config.set_many({"mission_controller_enabled": enabled})
+    with session_scope() as s:
+        s.add(ActivityLog(
+            category="settings",
+            level="info",
+            message=f"Daily Mission Controller {'ENABLED' if enabled == 'true' else 'DISABLED'} (enforce flag toggled).",
+        ))
+    return RedirectResponse(url="/settings#mission", status_code=303)
 
 
 @router.post("/settings/save")

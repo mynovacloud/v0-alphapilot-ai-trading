@@ -435,6 +435,35 @@
   <p class="text-muted">All API credentials are stored as encrypted-at-rest placeholders. Replace the placeholder columns in <span class="mono">api_credentials_placeholder</span> with real encrypted storage (e.g. <span class="mono">cryptography.fernet</span> or an OS keychain) before going live.</p>
 </div>
 
+<!-- =============================================================
+     DAILY MISSION CONTROLLER — gating toggle
+     ============================================================= -->
+<div class="card mt-4" id="mission">
+  <div class="card-header">
+    <div class="card-title">Daily Mission Controller</div>
+  </div>
+  <p class="text-muted mb-3">
+    The "boss layer" over the trade pipeline. When enabled, every trade decision passes through a state machine
+    over today's P&amp;L (SCOUT / BUILD / ATTACK / PROTECT / LOCK / RECOVERY / KILL) that adjusts the confidence
+    floor, position size, Claude routing, and per-symbol/strategy throttles. The mission panel will appear at
+    the top of the AI Training page once this is on.
+  </p>
+  <div class="banner banner-warn" style="margin-bottom:0.8rem;">
+    Scout-mode defaults are conservative: <span class="mono">conf ≥ 0.64</span>, <span class="mono">expected net edge ≥ $0.03</span> per trade.
+    Turning this on for the first time will reject most signals until either thresholds are tuned or trade quality improves.
+  </div>
+  <form method="post" action="/settings/mission/save" class="flex gap-2 items-end">
+    <div class="field">
+      <label>Mission Controller</label>
+      <select class="select" name="mission_controller_enabled">
+        <option value="false" {% if not mission_enabled %}selected{% endif %}>Disabled (default — passthrough)</option>
+        <option value="true"  {% if mission_enabled %}selected{% endif %}>Enabled (enforce mode policies)</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" type="submit">Save</button>
+  </form>
+</div>
+
 <div class="card mt-4">
   <div class="card-header">
     <div class="card-title">Paper Trading Reset</div>
