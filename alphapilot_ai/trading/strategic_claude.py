@@ -267,11 +267,137 @@ Be specific and actionable. Focus on process, not outcome."""
 
 
 # =============================================================================
+# MAIN DECISION INTERFACE - Integrates Autonomous + Claude
+# =============================================================================
+
+class StrategicRouter:
+    """
+    Main decision router that combines:
+    1. Autonomous Learning Engine (FREE - always runs)
+    2. Claude AI (PAID - only when valuable)
+    
+    The autonomous engine learns from every trade and makes decisions
+    without Claude. Claude is only consulted for high-value situations.
+    """
+    
+    def __init__(self):
+        self._claude_router = get_claude_router()
+        self._reflector = get_reflector()
+        
+    def decide(
+        self,
+        wallet: dict,
+        symbol: str,
+        price: float,
+        technical_signal,  # Signal from strategy engine
+        strategy_type: str,
+        position_size_usd: float = 100,
+    ):
+        """
+        Make a trading decision using the optimal combination of:
+        1. Autonomous learning (always)
+        2. Claude (when valuable)
+        
+        Returns a TradeDecision object.
+        """
+        from ai.claude_decision_engine import TradeDecision, claude_decide
+        from ai.autonomous_learning_engine import get_autonomous_decision
+        
+        side = technical_signal.side
+        tech_confidence = float(technical_signal.confidence or 0.5)
+        
+        # 1. ALWAYS get autonomous decision (FREE)
+        autonomous_decision = get_autonomous_decision(
+            symbol=symbol,
+            side=side,
+            current_price=price,
+            signal_confidence=tech_confidence,
+        )
+        
+        # 2. Check if autonomous engine says AVOID
+        if autonomous_decision.action == "AVOID":
+            logger.info(f"[AUTONOMOUS] Avoiding {symbol}: {autonomous_decision.reasoning}")
+            return TradeDecision(
+                action="HOLD",
+                confidence=0.0,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=f"[AUTONOMOUS_AVOID] {autonomous_decision.reasoning}",
+                key_factors=autonomous_decision.avoided_patterns,
+                risk_flags=["autonomous_avoid"],
+                source="autonomous",
+            )
+        
+        # 3. Apply autonomous adjustments
+        adjusted_confidence = autonomous_decision.confidence
+        size_multiplier = autonomous_decision.size_multiplier
+        
+        # 4. Decide if Claude is worth consulting
+        has_position = len(wallet.get("open_positions", [])) > 0
+        existing_side = None
+        if has_position:
+            for pos in wallet.get("open_positions", []):
+                if pos.get("symbol") == symbol:
+                    existing_side = pos.get("side")
+                    break
+        
+        consultation = self._claude_router.should_consult_claude(
+            symbol=symbol,
+            technical_confidence=adjusted_confidence,
+            position_size_usd=position_size_usd * size_multiplier,
+            signal_side=side,
+            has_existing_position=has_position,
+            existing_position_side=existing_side,
+        )
+        
+        # 5. If Claude is worth it, consult
+        if consultation.should_consult:
+            logger.info(f"[CLAUDE] Consulting for {symbol}: {consultation.reason}")
+            self._claude_router.record_consultation(symbol)
+            
+            try:
+                claude_decision = claude_decide(
+                    wallet=wallet,
+                    symbol=symbol,
+                    price=price,
+                    technical_signal=technical_signal,
+                    strategy_type=strategy_type,
+                )
+                
+                # Blend Claude's decision with autonomous insights
+                # Claude overrides action but autonomous adjusts sizing
+                claude_decision.size_multiplier *= size_multiplier
+                claude_decision.rationale = f"[CLAUDE+AUTO] {claude_decision.rationale}"
+                
+                return claude_decision
+            except Exception as e:
+                logger.warning(f"[CLAUDE] Failed, falling back to autonomous: {e}")
+        
+        # 6. Return autonomous decision (no Claude)
+        logger.debug(f"[AUTONOMOUS] {symbol}: {side} conf={adjusted_confidence:.2f} "
+                    f"size={size_multiplier:.1f}x - {autonomous_decision.reasoning[:50]}")
+        
+        return TradeDecision(
+            action=side if adjusted_confidence >= 0.45 else "HOLD",
+            confidence=adjusted_confidence,
+            size_multiplier=size_multiplier,
+            stop_loss_pct=autonomous_decision.stop_loss_pct,
+            take_profit_pct=autonomous_decision.take_profit_pct,
+            rationale=f"[AUTONOMOUS] {autonomous_decision.reasoning}",
+            key_factors=autonomous_decision.matched_patterns[:3],
+            risk_flags=[],
+            source="autonomous",
+        )
+
+
+# =============================================================================
 # SINGLETON ACCESSORS
 # =============================================================================
 
 _claude_router: Optional[StrategicClaudeRouter] = None
 _reflector: Optional[PostTradeReflector] = None
+_strategic_router: Optional[StrategicRouter] = None
 
 
 def get_claude_router() -> StrategicClaudeRouter:
@@ -288,3 +414,12 @@ def get_reflector() -> PostTradeReflector:
     if _reflector is None:
         _reflector = PostTradeReflector()
     return _reflector
+
+
+def get_strategic_router() -> StrategicRouter:
+    """Get or create the main StrategicRouter singleton."""
+    global _strategic_router
+    if _strategic_router is None:
+        _strategic_router = StrategicRouter()
+    return _strategic_router
+

@@ -1217,6 +1217,32 @@ def training_session_config() -> JSONResponse:
     )
 
 
+@router.get("/training/learning/stats")
+def training_learning_stats() -> JSONResponse:
+    """Get statistics from the autonomous learning engine."""
+    try:
+        from ai.autonomous_learning_engine import get_autonomous_engine
+        engine = get_autonomous_engine()
+        stats = engine.get_statistics()
+        return JSONResponse({"ok": True, **stats})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.get("/training/learning/symbol/{symbol}")
+def training_learning_symbol(symbol: str) -> JSONResponse:
+    """Get learned insights for a specific symbol."""
+    try:
+        from ai.autonomous_learning_engine import get_autonomous_engine
+        engine = get_autonomous_engine()
+        insights = engine.get_symbol_insights(symbol)
+        if insights:
+            return JSONResponse({"ok": True, **insights})
+        return JSONResponse({"ok": False, "error": "No data for symbol"}, status_code=404)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.post("/training/session/stop")
 def training_session_stop() -> JSONResponse:
     import logging
