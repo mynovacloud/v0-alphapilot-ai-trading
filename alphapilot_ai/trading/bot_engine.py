@@ -42,8 +42,7 @@ from trading.portfolio_intelligence import (
 from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
 from trading.risk_manager import RiskManager
 from trading.strategy_engine import evaluate_symbol
-# Advanced trading modules
-from trading.advanced_signal_engine import get_signal_engine, AdvancedSignal
+# Advanced trading modules (signal engine temporarily disabled - uses evaluate_symbol instead)
 from trading.advanced_position_sizer import get_position_sizer
 from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from trading.market_intelligence import get_market_intelligence
@@ -424,33 +423,13 @@ class BotEngine:
             # - Pattern recognition
             # - Quality grades (A+, A, B, C, F)
             # =====================================================================
-            signal_engine = get_signal_engine()
-            advanced_signal = signal_engine.generate_signal(
-                symbol=symbol,
-                current_price=price,
-                strategy_type=strategy_type,
-            )
             
-            # Convert to legacy Signal format for compatibility
-            from trading.strategy_engine import Signal
-            signal = Signal(
-                side=advanced_signal.side,
-                confidence=advanced_signal.confidence,
-                reasoning=advanced_signal.reasoning,
-                strategy=advanced_signal.strategy,
-                indicators=advanced_signal.indicators,
-            )
+            # Use the ORIGINAL evaluate_symbol which works reliably
+            # The advanced_signal_engine.analyze() requires candle data we don't have here
+            signal = evaluate_symbol(symbol, strategy_type, tick_seconds=cfg.tick_seconds)
             
-            # Log quality grade for high-conviction signals
-            if advanced_signal.quality in ("A+", "A") and advanced_signal.side != "HOLD":
-                self._log(
-                    "bot",
-                    f"[SIGNAL] {symbol}: {advanced_signal.side} Grade={advanced_signal.quality} "
-                    f"Factors={advanced_signal.confirming_factors}/{advanced_signal.total_factors} "
-                    f"Conf={advanced_signal.confidence:.2f}",
-                    wallet_id=wallet["id"],
-                    level="info",
-                )
+            # Store for later reference
+            advanced_signal = None
             
             evaluated += 1
             result.decisions += 1
@@ -566,7 +545,7 @@ class BotEngine:
                 confidence=confidence,
                 current_positions=current_positions,
                 market_regime=market_ctx.regime if market_ctx else None,
-                signal_strategy=advanced_signal.strategy if advanced_signal else None,
+                signal_strategy=signal.strategy if signal else None,
             )
             
             if not filter_result.should_trade:
@@ -601,6 +580,14 @@ class BotEngine:
             
             if confidence < effective_min_conf:
                 below_conf += 1
+                # Log blocked trades so user knows WHY nothing is executing
+                if side in {"BUY", "SELL"} and confidence >= 0.40:
+                    self._log(
+                        "bot",
+                        f"[BLOCKED] {symbol} {side}: conf {confidence:.2f} < min {effective_min_conf:.2f}",
+                        wallet_id=wallet["id"],
+                        level="debug",
+                    )
                 continue
 
             # =====================================================================
