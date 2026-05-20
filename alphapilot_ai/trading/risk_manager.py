@@ -278,7 +278,7 @@ class RiskManager:
         )
         
         # Log ALL rejections to activity log for debug console
-        if not result.approved:
+        if not result.allowed:
             try:
                 from database.db import session_scope
                 from database.models import ActivityLog
