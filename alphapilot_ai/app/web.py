@@ -846,9 +846,7 @@ def debug_get_logs() -> JSONResponse:
         ).count()
         
         # Check if session is active
-        from config.bot_config import BotConfig
-        cfg = BotConfig.load()
-        session_active = cfg.get_bool("training_session_active")
+        session_active = str(bot_config.get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
         
         log_list = []
         for log in logs:
