@@ -168,6 +168,11 @@ class PaperTrade(Base):
     # Exit reason (for analytics): "sl" / "tp" / "trailing" / "max_loss" / "time" / "manual" / "signal"
     exit_reason = Column(String(30), nullable=True)
 
+    # FK to the ClaudeDecision that produced this entry. Lets the autonomous
+    # learning engine rebuild the entry-time market context on close. Nullable
+    # because not every trade originates from a Claude decision (e.g. manual).
+    claude_decision_id = Column(Integer, ForeignKey("claude_decisions.id"), nullable=True, index=True)
+
     wallet = relationship("Wallet", back_populates="trades")
     strategy = relationship("Strategy")
 
@@ -415,6 +420,12 @@ class ClaudeDecision(Base):
     model = Column(String(80), default="")
     prompt_used = Column(Text, default="")
     raw_response = Column(Text, default="")
+
+    # JSON snapshot of the market state at decision time (indicators, regime,
+    # MTF alignment, fear/greed, etc). Used by the autonomous learning engine
+    # to rebuild a populated TradeContext when a trade closes — without this,
+    # learned fingerprints collapse to defaults (rsi=50, regime=UNKNOWN).
+    market_snapshot = Column(Text, default="{}")
 
     created_at = Column(DateTime, default=utcnow, index=True)
 

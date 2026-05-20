@@ -564,6 +564,27 @@ class StrategicRouter:
             source="autonomous",
         )
         _set_quality(d, adjusted_confidence)
+        # Persist a ClaudeDecision row even for the no-Claude path so the
+        # autonomous engine has a market_snapshot to learn from at close
+        # time. Without this, every signal that's "not worth a Claude call"
+        # — typically the majority of ticks — opens with claude_decision_id=None
+        # and the learn-side loop falls back to degenerate context, defeating
+        # Phase A on the bulk of the trade flow. Side-effects d.claude_decision_id.
+        try:
+            from ai.claude_decision_engine import persist_decision
+            persist_decision(
+                wallet=wallet,
+                symbol=symbol,
+                price=price,
+                technical_signal=technical_signal,
+                decision=d,
+                prompt_used="[AUTONOMOUS_ONLY]",
+                source_override="autonomous",
+            )
+        except Exception:
+            # Persistence is best-effort: a logging failure must never
+            # cancel a trade that the engines already approved.
+            logger.exception("Failed to persist autonomous-only decision for %s", symbol)
         logger.debug("[AUTONOMOUS] %s: %s conf=%.2f size=%.1fx",
                      symbol, action, adjusted_confidence, size_multiplier)
         return d
