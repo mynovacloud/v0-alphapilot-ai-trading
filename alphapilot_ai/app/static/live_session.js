@@ -176,6 +176,142 @@
   }
 
   // --- Equity strip ---
+  // --- Mission Mode (Daily Mission Controller) ---
+  // Driven by /training/session/feed.mission. When mission.enabled is false
+  // the panel stays hidden — the operator hasn't flipped the controller on
+  // in Settings yet. Once enabled, we render the current mode badge, the
+  // five tiles (Net Today / Distance to Lock / Trades · WR / From Peak /
+  // Throttles), and the policy strip showing the active thresholds for
+  // this mode. All ids are addressed by getElementById once and cached
+  // implicitly by browser DOM lookup — cheap on every poll.
+  function renderMission(m) {
+    const panel = document.getElementById("mission-panel");
+    if (!panel) return;
+    if (!m || !m.enabled) {
+      panel.style.display = "none";
+      return;
+    }
+    panel.style.display = "";
+
+    const mode = m.mode || "BUILD";
+    const badge = document.getElementById("mission-mode-badge");
+    if (badge) {
+      badge.textContent = mode;
+      badge.setAttribute("data-mode", mode);
+    }
+    const reason = document.getElementById("mission-mode-reason");
+    if (reason) {
+      // mode_changed_at is ISO UTC — format as "since HH:MM"
+      let since = "";
+      if (m.mode_changed_at) {
+        try {
+          const t = new Date(m.mode_changed_at);
+          const hh = t.getHours().toString().padStart(2, "0");
+          const mm = t.getMinutes().toString().padStart(2, "0");
+          since = " · since " + hh + ":" + mm;
+        } catch (e) { /* ignore */ }
+      }
+      // Short policy hint that explains what this mode does.
+      const hints = {
+        SCOUT:    "small probes, find which pairs behave today",
+        BUILD:    "normal trading, full strategy stack",
+        ATTACK:   "in profit; selectively larger size",
+        PROTECT:  "near target; A-grade trades only",
+        LOCK:     "target reached — refusing new entries",
+        RECOVERY: "loss streak; A+ trades only, doubled cooldowns",
+        KILL:     "trading halted: daily loss / panic / manual kill",
+      };
+      reason.textContent = (hints[mode] || "") + since;
+    }
+
+    const killInd = document.getElementById("mission-kill-indicator");
+    if (killInd) killInd.style.display = (mode === "KILL" || m.manual_kill_enabled) ? "" : "none";
+
+    const pnl = m.pnl || {};
+    const trades = m.trades || {};
+    const policy = m.policy || {};
+
+    // Net P&L today + target reference
+    const netEl = document.getElementById("mission-net-pnl");
+    if (netEl) {
+      netEl.textContent = signedMoney(pnl.net || 0);
+      netEl.style.color = colorFor(pnl.net || 0);
+    }
+    const tgtSub = document.getElementById("mission-target-sub");
+    if (tgtSub) tgtSub.textContent = "target " + fmtMoney(pnl.target || 0);
+
+    // Distance to lock
+    const distEl = document.getElementById("mission-distance");
+    if (distEl) {
+      if (mode === "LOCK") {
+        distEl.textContent = "✓ LOCKED";
+        distEl.style.color = "var(--good)";
+      } else {
+        const remaining = pnl.remaining_to_target;
+        distEl.textContent = remaining !== undefined ? fmtMoney(remaining) : "—";
+        distEl.style.color = "var(--text)";
+      }
+    }
+
+    // Trades / WR
+    const trEl = document.getElementById("mission-trades");
+    if (trEl) {
+      const wr = ((trades.win_rate || 0) * 100).toFixed(0);
+      trEl.textContent = (trades.total_today || 0) + " · " + wr + "%";
+    }
+    const streakEl = document.getElementById("mission-streak");
+    if (streakEl) {
+      const wins = trades.consecutive_wins || 0;
+      const losses = trades.consecutive_losses || 0;
+      if (losses > 0) {
+        streakEl.textContent = losses + " loss streak";
+        streakEl.style.color = "var(--bad)";
+      } else if (wins > 0) {
+        streakEl.textContent = wins + " win streak";
+        streakEl.style.color = "var(--good)";
+      } else {
+        streakEl.textContent = "no active streak";
+        streakEl.style.color = "var(--text-muted)";
+      }
+    }
+
+    // Drawdown from peak
+    const ddEl = document.getElementById("mission-drawdown");
+    if (ddEl) {
+      const dd = pnl.drawdown_from_peak || 0;
+      ddEl.textContent = "−" + fmtMoney(dd);
+      ddEl.style.color = dd > 0.01 ? "var(--warn)" : "var(--text)";
+    }
+    const peakEl = document.getElementById("mission-peak");
+    if (peakEl) peakEl.textContent = "peak " + signedMoney(pnl.peak || 0);
+
+    // Throttles
+    const ds = (m.disabled_symbols || []).length;
+    const dst = (m.disabled_strategies || []).length;
+    const throttlesEl = document.getElementById("mission-throttles");
+    if (throttlesEl) {
+      const total = ds + dst;
+      throttlesEl.textContent = total === 0 ? "—" : ("" + total);
+      throttlesEl.style.color = total > 0 ? "var(--warn)" : "var(--text)";
+    }
+    const throttlesSub = document.getElementById("mission-throttles-sub");
+    if (throttlesSub) {
+      if (ds === 0 && dst === 0) {
+        throttlesSub.textContent = "nothing quarantined";
+      } else {
+        throttlesSub.textContent = ds + " symbols · " + dst + " strategies";
+      }
+    }
+
+    // Policy strip
+    const setText = (id, val) => { const el = document.getElementById(id); if (el) el.textContent = val; };
+    setText("mp-conf",     (policy.confidence_floor || 0).toFixed(2));
+    setText("mp-edge",     "$" + (policy.min_required_edge || 0).toFixed(2));
+    setText("mp-size",     (policy.size_multiplier || 0).toFixed(2) + "×");
+    setText("mp-notional", "$" + (policy.max_notional || 0).toFixed(0));
+    setText("mp-claude",   policy.claude_allowed ? "allowed" : "blocked");
+  }
+
   function renderPortfolio(p) {
     if (!p) return;
     equityEl.textContent = fmtMoney(p.current);
@@ -304,6 +440,7 @@
       preserveScroll(() => {
         setStatus(!!data.session.active, data.session);
         renderPortfolio(data.portfolio);
+        renderMission(data.mission);
 
         (data.decisions || []).forEach(renderDecision);
         (data.fills || []).forEach(renderFill);

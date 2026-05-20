@@ -190,6 +190,82 @@ function recordIntelAction(type, symbol, reason) {
 </script>
 
 <!-- ============================================================ -->
+<!-- DAILY MISSION MODE — the boss layer's current verdict          -->
+<!-- ============================================================ -->
+<!-- Hidden by default; renderMission() in live_session.js flips it -->
+<!-- visible when /training/session/feed.mission.enabled === true.  -->
+<!-- The controller is gated by the mission_controller_enabled bot  -->
+<!-- config flag; when off, this panel stays hidden completely.     -->
+<div class="card mb-4" id="mission-panel" style="display:none; border:1px solid var(--border);">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="flex items-center gap-3">
+      <span class="text-muted" style="font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;">Mission</span>
+      <span id="mission-mode-badge" class="badge mono" style="font-size:0.85rem; font-weight:800; padding:0.25rem 0.6rem;">—</span>
+      <span id="mission-mode-reason" class="text-dim" style="font-size:0.78rem;">—</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="mission-kill-indicator" class="badge" style="display:none; background:rgba(239,68,68,0.15); color:var(--bad); border:1px solid var(--bad); font-size:0.72rem;">KILL ACTIVE</span>
+      <a href="/settings#mission" class="text-dim" style="font-size:0.72rem; text-decoration:underline;">policy</a>
+    </div>
+  </div>
+
+  <div class="grid mt-3" style="grid-template-columns: repeat(5, 1fr); gap:0.8rem;">
+    <!-- Net P&L today vs target -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Net Today</div>
+      <div id="mission-net-pnl" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-target-sub" class="text-dim" style="font-size:0.7rem;">target —</div>
+    </div>
+    <!-- Distance to target / lock -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Distance to Lock</div>
+      <div id="mission-distance" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div class="text-dim" style="font-size:0.7rem;">to +$60 / day</div>
+    </div>
+    <!-- Trades today + win rate -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Trades · WR</div>
+      <div id="mission-trades" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-streak" class="text-dim" style="font-size:0.7rem;">—</div>
+    </div>
+    <!-- Drawdown from peak -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">From Peak</div>
+      <div id="mission-drawdown" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-peak" class="text-dim" style="font-size:0.7rem;">peak —</div>
+    </div>
+    <!-- Throttles active -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Throttles</div>
+      <div id="mission-throttles" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-throttles-sub" class="text-dim" style="font-size:0.7rem;">—</div>
+    </div>
+  </div>
+
+  <!-- Mode policy strip: shows the current allowable thresholds so the
+       operator can verify why a signal was rejected. -->
+  <div id="mission-policy-strip" style="margin-top:0.7rem; padding-top:0.6rem; border-top:1px solid var(--border); font-size:0.72rem; color:var(--text-muted);">
+    <span class="text-dim">min conf:</span> <span id="mp-conf" class="mono">—</span>
+    · <span class="text-dim">min edge:</span> <span id="mp-edge" class="mono">—</span>
+    · <span class="text-dim">size×:</span> <span id="mp-size" class="mono">—</span>
+    · <span class="text-dim">max notional:</span> <span id="mp-notional" class="mono">—</span>
+    · <span class="text-dim">claude:</span> <span id="mp-claude" class="mono">—</span>
+  </div>
+</div>
+
+<style>
+/* Per-mode color treatment of the mode badge. Set on #mission-mode-badge
+   via a `data-mode` attribute by renderMission(). */
+#mission-mode-badge[data-mode="SCOUT"]    { background: rgba(148,163,184,0.15); color: var(--text-muted); border:1px solid var(--text-muted); }
+#mission-mode-badge[data-mode="BUILD"]    { background: rgba(74,163,255,0.15);  color: var(--accent,#4aa3ff); border:1px solid var(--accent,#4aa3ff); }
+#mission-mode-badge[data-mode="ATTACK"]   { background: rgba(34,197,94,0.15);   color: var(--good); border:1px solid var(--good); }
+#mission-mode-badge[data-mode="PROTECT"]  { background: rgba(234,179,8,0.18);   color: var(--warn); border:1px solid var(--warn); }
+#mission-mode-badge[data-mode="LOCK"]     { background: rgba(34,197,94,0.30);   color: var(--good); border:1px solid var(--good); font-weight:900; }
+#mission-mode-badge[data-mode="RECOVERY"] { background: rgba(234,179,8,0.18);   color: var(--warn); border:1px solid var(--warn); }
+#mission-mode-badge[data-mode="KILL"]     { background: rgba(239,68,68,0.18);   color: var(--bad); border:1px solid var(--bad); }
+</style>
+
+<!-- ============================================================ -->
 <!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->
 <!-- ============================================================ -->
 {% set pl = portfolio.total_pl %}
