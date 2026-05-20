@@ -1190,7 +1190,16 @@ def training_page(request: Request) -> HTMLResponse:
             "losses": losses,
             "win_rate": (wins / closed_count) if closed_count else 0.0,
             "session_reset_at": reset_cutoff.isoformat() if reset_cutoff else None,
+            # Human-readable label for the money-strip subtitle. Server-side
+            # so the template stays free of timezone-conversion JS. UTC since
+            # the rest of the page uses UTC consistently in storage.
+            "session_reset_label": (
+                reset_cutoff.strftime("%b %d at %I:%M %p UTC").replace(" 0", " ")
+                if reset_cutoff else None
+            ),
             "excluded_pre_reset_trades": excluded_pre_reset,
+            # Whether to apply session-scoped framing to subtitles.
+            "is_session_scoped": reset_cutoff is not None,
         }
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
