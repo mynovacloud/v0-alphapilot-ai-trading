@@ -1089,12 +1089,22 @@ def get_autonomous_decision(
     side: str,
     current_price: float,
     signal_confidence: float,
+    context: Optional[TradeContext] = None,
 ) -> AutonomousDecision:
-    """Convenience function to get a decision from the autonomous engine."""
+    """Convenience function to get a decision from the autonomous engine.
+
+    Pass a populated `context` so fingerprinting, kNN, and pattern lookups
+    have real indicator/regime data. When None, `decide()` falls back to a
+    degenerate TradeContext (rsi=50, regime=UNKNOWN) and every signal
+    collapses to roughly the same fingerprint.
+    """
     engine = get_autonomous_engine()
     return engine.decide(
         symbol=symbol,
         side=side,
         current_price=current_price,
         signal_confidence=signal_confidence,
+        context=context,
     )
+
+

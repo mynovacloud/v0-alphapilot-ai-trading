@@ -815,6 +815,7 @@ class BotEngine:
                     notes=(
                         f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
                     ),
+                    claude_decision_id=getattr(decision, "claude_decision_id", None),
                 )
             except Exception as e:
                 # A single bad trade (attribute error, DB hiccup, etc.) must

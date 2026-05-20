@@ -354,6 +354,12 @@ class TradeDecision:
     model: str = ""
     raw_text: str = ""
     quality: str = "B"                 # A+/A/B/C/F conviction grade (additive)
+    # Primary key of the persisted ClaudeDecision row this decision came from.
+    # Threaded onto PaperTrade.claude_decision_id at open time so the close-side
+    # learn hook can rebuild entry-time market context from market_snapshot.
+    # None when the decision wasn't routed through _persist_decision (e.g.
+    # synthesized in strategic_claude's autonomous-only path).
+    claude_decision_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1348,6 +1354,7 @@ def _persist_decision(
             getattr(technical_signal, "metadata", {}) or {},
             extra_context or {},
         )
+        new_id: int | None = None
         with session_scope() as s:
             row = ClaudeDecision(
                 wallet_id=int(wallet["id"]),
@@ -1370,6 +1377,15 @@ def _persist_decision(
                 market_snapshot=json.dumps(snapshot)[:4000],
             )
             s.add(row)
+            # Flush to allocate the autoincrement id while the row is still
+            # attached to the session. We capture the id locally and only
+            # publish it onto the decision after the surrounding session_scope
+            # commits — otherwise a rollback would leave decision pointing at
+            # a row that never landed.
+            s.flush()
+            new_id = int(row.id)
+        if new_id is not None:
+            decision.claude_decision_id = new_id
     except Exception:
         logger.exception("Failed to persist ClaudeDecision row.")
 

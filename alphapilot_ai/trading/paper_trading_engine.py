@@ -44,6 +44,7 @@ class PaperTradingEngine:
         take_profit_pct: float | None = None,
         trailing_stop_pct: float | None = None,
         enable_breakeven_stop: bool = True,
+        claude_decision_id: int | None = None,
     ) -> dict[str, Any]:
         side = side.upper()
         if side not in {"BUY", "SELL"}:
@@ -134,6 +135,11 @@ class PaperTradingEngine:
                 # Breakeven stop: once we're up 1%, move stop to entry + 0.2%
                 breakeven_trigger_pct=0.01 if enable_breakeven_stop else None,
                 breakeven_stop_pct=0.002 if enable_breakeven_stop else None,
+                # Link to the originating ClaudeDecision so the autonomous
+                # learning engine can rebuild entry-time market context at
+                # close. None when the trade didn't originate from a persisted
+                # decision (e.g. manual entries, autonomous-only strategic path).
+                claude_decision_id=claude_decision_id,
             )
             s.add(trade)
             s.flush()
