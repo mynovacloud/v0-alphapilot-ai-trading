@@ -36,6 +36,7 @@ from functools import lru_cache
 
 from database.db import session_scope
 from database.models import (
+    ActivityLog,
     AILearningMemory,
     PaperTrade,
     ClaudeDecision,
@@ -584,11 +585,32 @@ class AutonomousLearningEngine:
         
         # 6. Persist to database
         self._persist()
-        
+
         # 7. Log learning insights
         pattern = self._patterns[fingerprint]
         logger.info(f"[LEARN] Pattern {fingerprint}: {pattern.total_trades} trades, "
                    f"{pattern.win_rate:.1%} win rate, {pattern.expectancy:+.2%} expectancy")
+
+        # 8. Surface the learning event into the UI activity log. The
+        # python logger only writes to stdout/log files, so without this the
+        # operator running a training session has no live signal that
+        # autonomous fingerprints are actually accumulating — which is exactly
+        # the visibility they need to verify the loop is closing. Wrapped so
+        # an audit-log failure can never break the learn path.
+        try:
+            with session_scope() as s:
+                s.add(ActivityLog(
+                    category="ai",
+                    level="info",
+                    message=(
+                        f"[AUTONOMOUS] Trade #{trade_id} {symbol} {side} "
+                        f"{'WIN' if is_win else 'LOSS'} {pnl_pct:+.2%} "
+                        f"fp={fingerprint} pattern={pattern.total_trades}tr "
+                        f"wr={pattern.win_rate:.0%} ev={pattern.expectancy:+.2%}"
+                    ),
+                ))
+        except Exception:
+            logger.debug("Failed to write autonomous-learn ActivityLog", exc_info=True)
     
     def _record_mistake(self, fingerprint: str, pnl_pct: float, 
                         context: TradeContext, exit_reason: str):

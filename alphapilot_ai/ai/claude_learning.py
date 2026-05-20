@@ -285,7 +285,12 @@ def record_trade_outcome(trade_id: int) -> dict[str, Any]:
             f"{json.dumps(prompt_payload, default=str)}"
         ),
         system=REFLECTION_SYSTEM_PROMPT,
-        max_tokens=900,
+        # The reflection schema is nested (process_analysis, pattern_recognition,
+        # meta_learning, lessons[], improvement_suggestions[], ...). At 900 we
+        # were getting silent truncation that landed the response in the
+        # "Could not parse" branch and produced empty reflections. 2000 gives
+        # Claude room to complete the JSON; cost is bounded by daily budget.
+        max_tokens=2000,
         temperature=0.2,
     )
     if not result.get("ok"):
@@ -967,13 +972,23 @@ def _save_reflection(
                 existing_rules.append((row, new_norm))
                 added += 1
 
+        # When a reflection lands with zero lessons it's almost always a
+        # failure path (Claude not configured, API call failed, JSON parse
+        # failed, max_tokens truncation). The cause lives in `summary` but the
+        # UI console only renders the ActivityLog message — so without
+        # surfacing summary here, every empty reflection looks identical and
+        # the operator can't tell which failure mode is biting. Promote those
+        # to level=warn AND include a slice of summary so the cause is visible
+        # in the training console in real time.
+        empty = not lessons
         s.add(ActivityLog(
             category="ai",
-            level="info",
+            level="warn" if empty else "info",
             message=(
                 f"Reflection saved for trade #{trade_id}: verdict={verdict}, "
                 f"score={score:.2f}, lessons={len(lessons)} "
                 f"(new={added}, reinforced={reinforced})"
+                + (f" — {summary[:200]}" if empty and summary else "")
             ),
         ))
 
