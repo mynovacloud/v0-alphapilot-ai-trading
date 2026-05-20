@@ -894,9 +894,53 @@ def debug_clear_logs() -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@router.post("/debug/log/push")
+def debug_log_push(
+    level: str = Form("info"),
+    category: str = Form("session_error"),
+    message: str = Form(...),
+    source: str = Form(""),
+) -> JSONResponse:
+    """
+    Client-side failure ingestion. The Training Center calls this whenever
+    the browser encounters a session-related error (poll failure, start/stop
+    failure, kill-switch event, unhandled JS exception, etc.) so the Debug
+    Console — which mirrors ActivityLog — can render it in real time with a
+    timestamp instead of silently swallowing the event in devtools.
+    """
+    lvl = (level or "info").strip().lower()
+    if lvl not in ("info", "warn", "warning", "error", "success", "debug"):
+        lvl = "info"
+    cat = (category or "session_error").strip().lower()[:50] or "session_error"
+    src = (source or "").strip()[:120]
+    msg = (message or "").strip()
+    if not msg:
+        return JSONResponse({"ok": False, "error": "message required"}, status_code=400)
+    # Prefix with [source] so /debug/logs' parser surfaces it in the source column.
+    full = f"[{src}] {msg}" if src else msg
+    with session_scope() as s:
+        s.add(ActivityLog(category=cat, level=lvl, message=full[:2000]))
+    return JSONResponse({"ok": True})
+
+
 @router.get("/debug/diagnostics")
 def debug_run_diagnostics() -> JSONResponse:
-    """Run system diagnostics and return results."""
+    """Run system diagnostics and return results.
+    Wrapped in a top-level try/except so a single broken check still returns
+    a structured 200 — otherwise FastAPI raises 500 and the Debug Console
+    shows nothing, which is exactly the symptom we hit before."""
+    import traceback as _tb
+    try:
+        return _run_diagnostics_inner()
+    except Exception as e:
+        return JSONResponse({
+            "ok": False,
+            "error": str(e) or "Unknown diagnostics error",
+            "traceback": _tb.format_exc(),
+        })
+
+
+def _run_diagnostics_inner() -> JSONResponse:
     from config.bot_config import BotConfig
     import os
     

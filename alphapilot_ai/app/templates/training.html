@@ -347,6 +347,15 @@ loadPnlStats('today');
     confidence floor for an aggressive training session, and watch executions stream in below. Stop any time.
   </p>
 
+  <!-- Background-run hint: shown only while the session is live so users know
+       it's safe to navigate away without killing the bot. -->
+  <div id="live-bg-hint" style="display:none;background:rgba(34,197,94,0.08);border:1px solid var(--good);border-radius:var(--radius-sm);padding:0.55rem 0.8rem;margin-bottom:0.75rem;font-size:0.78rem;color:var(--text);">
+    Session runs in the background — you can leave this page (including switching to the
+    <a href="/debug" style="color:var(--accent);text-decoration:underline;">Debug Console</a>)
+    and trading will continue. Failures stream to the Debug Console with timestamps in real time.
+    Use <strong>Stop Session</strong> to fully halt trading.
+  </div>
+
   <!-- Session Settings panel -->
   <details id="live-settings" open style="background:var(--bg-elev);border:1px solid var(--border);border-radius:var(--radius-sm);padding:0.75rem 0.9rem;margin-bottom:0.9rem;">
     <summary class="mono" style="cursor:pointer;font-size:0.8rem;letter-spacing:0.06em;text-transform:uppercase;color:var(--text-muted);">

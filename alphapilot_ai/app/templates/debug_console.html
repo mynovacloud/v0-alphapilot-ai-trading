@@ -616,32 +616,46 @@ async function runDiagnostics() {
   
   try {
     const res = await fetch('/debug/diagnostics');
+    if (!res.ok) {
+      content.innerHTML = `<div class="log-traceback">HTTP ${res.status} ${res.statusText} — diagnostics endpoint failed.</div>`;
+      return;
+    }
     const data = await res.json();
     
     if (data.ok) {
       let html = '';
-      for (const [section, checks] of Object.entries(data.diagnostics)) {
-        const status = checks.every(c => c.status === 'ok') ? 'ok' 
-          : checks.some(c => c.status === 'error') ? 'error' : 'warn';
+      const sections = data.diagnostics || {};
+      if (Object.keys(sections).length === 0) {
+        content.innerHTML = '<div class="text-dim">Diagnostics returned no sections.</div>';
+        return;
+      }
+      for (const [section, checks] of Object.entries(sections)) {
+        const list = Array.isArray(checks) ? checks : [];
+        const status = list.length === 0 ? 'warn'
+          : list.every(c => c.status === 'ok') ? 'ok' 
+          : list.some(c => c.status === 'error') ? 'error' : 'warn';
         
         html += `
           <div class="diag-section">
             <div class="diag-title">
-              ${section}
+              ${escapeHtml(section)}
               <span class="diag-status ${status}">${status.toUpperCase()}</span>
             </div>
             <div class="diag-items">
-              ${checks.map(c => `<div class="diag-item ${c.status}">${c.message}</div>`).join('')}
+              ${list.length 
+                ? list.map(c => `<div class="diag-item ${c.status}">${escapeHtml(c.message)}</div>`).join('')
+                : '<div class="diag-item warn">No checks ran for this section.</div>'}
             </div>
           </div>
         `;
       }
-      content.innerHTML = html || '<div class="text-dim">No diagnostic data available</div>';
+      content.innerHTML = html;
     } else {
-      content.innerHTML = `<div class="text-dim">Diagnostics failed: ${data.error}</div>`;
+      const tb = data.traceback ? `<div class="log-traceback">${escapeHtml(data.traceback)}</div>` : '';
+      content.innerHTML = `<div class="text-dim">Diagnostics failed: ${escapeHtml(data.error || 'unknown')}</div>${tb}`;
     }
   } catch (err) {
-    content.innerHTML = `<div class="text-dim">Diagnostics failed: ${err.message}</div>`;
+    content.innerHTML = `<div class="text-dim">Diagnostics failed: ${escapeHtml(err.message || String(err))}</div>`;
   }
 }
 

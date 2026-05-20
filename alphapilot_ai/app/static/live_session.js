@@ -106,6 +106,35 @@
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
     });
   }
+
+  // --- Debug Console bridge ---
+  // The Debug Console page polls GET /debug/logs which mirrors ActivityLog.
+  // Anything we POST here lands in that stream with a real DB timestamp, so
+  // the user can leave this page and still see the same failures on /debug.
+  function pushDebug(level, message, extra) {
+    try {
+      const fd = new FormData();
+      fd.append("level", level || "info");
+      fd.append("category", (extra && extra.category) || "session_error");
+      fd.append("message", String(message || ""));
+      fd.append("source", (extra && extra.source) || "training_ui");
+      // Use keepalive so a push initiated right before navigation still
+      // flushes — this is the whole point: the user wants failures to
+      // survive a page change.
+      fetch("/debug/log/push", { method: "POST", body: fd, keepalive: true })
+        .catch(() => {});
+    } catch (_) { /* never let logging break the app */ }
+  }
+  // Mirror unhandled JS errors and rejections to the Debug Console.
+  window.addEventListener("error", (e) => {
+    pushDebug("error", "JS error: " + (e && e.message ? e.message : "unknown") +
+      (e && e.filename ? " @ " + e.filename + ":" + (e.lineno || "?") : ""),
+      { source: "training_ui" });
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    const reason = e && e.reason ? (e.reason.message || String(e.reason)) : "unknown";
+    pushDebug("error", "Unhandled rejection: " + reason, { source: "training_ui" });
+  });
   
   // --- Scroll preservation ---
   // Prevents auto-scroll-to-top when DOM is updated
@@ -122,6 +151,7 @@
   // --- Status / pulse ---
   function setStatus(active, info) {
     state.sessionActive = !!active;
+    const bgHint = document.getElementById("live-bg-hint");
     if (active) {
       pulse.style.background = "var(--good)";
       pulse.style.boxShadow = "0 0 8px var(--good)";
@@ -129,6 +159,7 @@
       statusBadge.textContent = "LIVE — paper";
       startBtn.style.display = "none";
       stopBtn.style.display = "";
+      if (bgHint) bgHint.style.display = "";
     } else {
       pulse.style.background = "var(--text-muted)";
       pulse.style.boxShadow = "none";
@@ -136,6 +167,7 @@
       statusBadge.textContent = "Idle";
       startBtn.style.display = "";
       stopBtn.style.display = "none";
+      if (bgHint) bgHint.style.display = "none";
     }
     if (info && info.tick_seconds) {
       tickInfo.textContent = "tick " + info.tick_seconds + "s · next " +
@@ -256,9 +288,17 @@
         "&since_log_id=" + state.cursors.log_id +
         "&since_trade_id=" + state.cursors.trade_id;
       const res = await fetch(url, { headers: { Accept: "application/json" } });
-      if (!res.ok) return;
+      if (!res.ok) {
+        pushDebug("error", "Session feed HTTP " + res.status + " — " + res.statusText,
+          { source: "training_ui", category: "session_feed" });
+        return;
+      }
       const data = await res.json();
-      if (!data.ok) return;
+      if (!data.ok) {
+        pushDebug("warn", "Session feed responded ok=false" + (data.error ? " — " + data.error : ""),
+          { source: "training_ui", category: "session_feed" });
+        return;
+      }
       
       // Preserve scroll position during all DOM updates
       preserveScroll(() => {
@@ -286,6 +326,8 @@
       pollPortfolioIntel();
     } catch (e) {
       console.error("[v0] live feed poll failed", e);
+      pushDebug("error", "Session feed exception: " + (e && e.message ? e.message : String(e)),
+        { source: "training_ui", category: "session_feed" });
     }
   }
   
@@ -429,10 +471,20 @@
       fd.append("aggressive", aggressiveEl && aggressiveEl.checked ? "true" : "false");
       const styleSel = document.getElementById("live-trading-style");
       fd.append("trading_style", styleSel ? styleSel.value : "hybrid");
-      const res = await fetch("/training/session/start", { method: "POST", body: fd });
-      const data = await res.json();
+      let res, data;
+      try {
+        res = await fetch("/training/session/start", { method: "POST", body: fd });
+        data = await res.json();
+      } catch (e) {
+        pushDebug("error", "Start session network exception: " + (e && e.message ? e.message : String(e)),
+          { source: "training_ui", category: "session_start" });
+        alert("Could not start live session — network error. See Debug Console for details.");
+        return;
+      }
       if (!data.ok) {
         alert("Could not start live session.");
+        pushDebug("error", "Start session failed: " + (data.error || "unknown"),
+          { source: "training_ui", category: "session_start" });
         return;
       }
       if (root.dataset.claudeConfigured === "false") {
@@ -474,15 +526,31 @@
   });
 
   stopBtn.addEventListener("click", async () => {
+    // The session lives in the *backend* scheduler — it keeps ticking even
+    // when the browser is closed or the user navigates to another page.
+    // The Stop button is the ONLY way to actually halt it. Confirm explicitly
+    // so users don't kill it just because they're switching tabs.
+    if (!confirm(
+      "Stop the live training session?\n\n" +
+      "(You don't need to stop it just to leave this page — the bot keeps " +
+      "running in the background. This button fully halts trading.)"
+    )) return;
     stopBtn.disabled = true;
     try {
       const res = await fetch("/training/session/stop", { method: "POST" });
       const data = await res.json();
-      if (!data.ok) return;
+      if (!data.ok) {
+        pushDebug("error", "Stop session failed: " + (data.error || "unknown"),
+          { source: "training_ui", category: "session_stop" });
+        return;
+      }
       setStatus(false);
       // Keep polling once more so we render any final logs.
       pollOnce();
       stopPolling();
+    } catch (e) {
+      pushDebug("error", "Stop session exception: " + (e && e.message ? e.message : String(e)),
+        { source: "training_ui", category: "session_stop" });
     } finally {
       stopBtn.disabled = false;
     }
@@ -491,8 +559,15 @@
   tickBtn.addEventListener("click", async () => {
     tickBtn.disabled = true;
     try {
-      await fetch("/training/session/tick", { method: "POST" });
+      const res = await fetch("/training/session/tick", { method: "POST" });
+      if (!res.ok) {
+        pushDebug("warn", "Manual tick HTTP " + res.status,
+          { source: "training_ui", category: "session_tick" });
+      }
       pollOnce();
+    } catch (e) {
+      pushDebug("error", "Manual tick exception: " + (e && e.message ? e.message : String(e)),
+        { source: "training_ui", category: "session_tick" });
     } finally {
       tickBtn.disabled = false;
     }
@@ -532,7 +607,11 @@
   async function hydrateSettings() {
     try {
       const res = await fetch("/training/session/config", { headers: { Accept: "application/json" } });
-      if (!res.ok) return;
+      if (!res.ok) {
+        pushDebug("warn", "Hydrate config HTTP " + res.status,
+          { source: "training_ui", category: "session_hydrate" });
+        return;
+      }
       const data = await res.json();
       if (!data.ok) return;
       if (tickSel)    { tickSel.value = String(data.tick_seconds); tickValEl.textContent = data.tick_seconds + "s"; }
@@ -544,6 +623,8 @@
       refreshSettingsSummary();
     } catch (e) {
       console.error("[v0] settings hydrate failed", e);
+      pushDebug("error", "Hydrate config exception: " + (e && e.message ? e.message : String(e)),
+        { source: "training_ui", category: "session_hydrate" });
     }
   }
 
