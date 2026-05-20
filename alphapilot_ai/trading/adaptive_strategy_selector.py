@@ -181,7 +181,8 @@ class AdaptiveStrategySelector:
     
     def load_performance_data(self, lookback_days: int = 90) -> None:
         """Load historical performance data from database."""
-        cutoff = utcnow() - timedelta(days=lookback_days)
+        from utils.helpers import utcnow_naive
+        cutoff = utcnow_naive() - timedelta(days=lookback_days)
         
         # Initialize all strategies
         for strategy in Strategy:

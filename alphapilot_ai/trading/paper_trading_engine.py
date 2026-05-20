@@ -17,7 +17,7 @@ from typing import Any
 from database.db import session_scope
 from database.models import ActivityLog, PaperTrade, Wallet
 from trading.risk_manager import RiskManager
-from utils.helpers import utcnow
+from utils.helpers import utcnow, ensure_utc
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -445,7 +445,7 @@ class PaperTradingEngine:
             # Max drawdown (simplified - based on trade P&L)
             cumulative_pnl = []
             running_total = 0
-            for t in sorted(closed_trades, key=lambda x: x.closed_at or utcnow()):
+            for t in sorted(closed_trades, key=lambda x: ensure_utc(x.closed_at) or utcnow()):
                 running_total += float(t.realized_pnl or 0)
                 cumulative_pnl.append(running_total)
             

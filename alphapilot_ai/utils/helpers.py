@@ -9,12 +9,35 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def utcnow_naive() -> datetime:
+    """
+    Return a *naive* UTC datetime suitable for comparisons against SQLAlchemy
+    DateTime columns that were declared without `timezone=True`.
+
+    All `Column(DateTime)` columns in this project store naive UTC values
+    (psycopg/SQLAlchemy strip the tzinfo on insert), so any query filter or
+    sort key that pairs an aware `utcnow()` with one of those columns blows
+    up with "can't compare offset-naive and offset-aware datetimes" on
+    PostgreSQL. Use this helper for the FILTER side of those comparisons.
+    """
+    return datetime.utcnow()
+
+
 def ensure_utc(dt: datetime | None) -> datetime | None:
     """Ensure a datetime is timezone-aware (UTC). Handles naive datetimes from DB."""
     if dt is None:
         return None
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def ensure_naive_utc(dt: datetime | None) -> datetime | None:
+    """Inverse of `ensure_utc` — strip tzinfo so the value matches naive DB columns."""
+    if dt is None:
+        return None
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
     return dt
 
 
