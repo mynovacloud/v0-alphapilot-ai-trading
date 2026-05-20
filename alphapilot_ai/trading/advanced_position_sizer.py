@@ -261,13 +261,15 @@ class AdvancedPositionSizer:
     def _get_historical_stats(self, wallet_id: int) -> Tuple[float, float, float]:
         """Get win rate and average win/loss from recent trades."""
         try:
+            from utils.helpers import utcnow_naive
+            cutoff = utcnow_naive() - timedelta(days=30)
             with session_scope() as s:
                 recent_trades = (
                     s.query(PaperTrade)
                     .filter(
                         PaperTrade.wallet_id == wallet_id,
                         PaperTrade.status == "closed",
-                        PaperTrade.closed_at >= utcnow() - timedelta(days=30),
+                        PaperTrade.closed_at >= cutoff,
                     )
                     .all()
                 )

@@ -145,7 +145,8 @@ class Reconciler:
 
     # ------------------------------------------------------------------
     def _timeout_stale_submits(self) -> int:
-        cutoff = utcnow() - timedelta(seconds=PENDING_SUBMIT_TIMEOUT_SECONDS)
+        from utils.helpers import utcnow_naive
+        cutoff = utcnow_naive() - timedelta(seconds=PENDING_SUBMIT_TIMEOUT_SECONDS)
         count = 0
         with session_scope() as s:
             stale = (

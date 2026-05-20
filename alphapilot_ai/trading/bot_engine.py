@@ -207,7 +207,8 @@ class BotEngine:
             price_map = get_prices_batch(list(set(symbols_needed)))
             self._log("bot", f"Prefetched {len(price_map)} prices", level="debug")
         except Exception as e:
-            self._log("bot", f"Price prefetch failed: {e}", level="warn")
+            import traceback
+            self._log("bot", f"Price prefetch failed: {e}\n{traceback.format_exc()}", level="warn")
             price_map = {}
 
         # -----------------------------------------------------------------
@@ -265,11 +266,13 @@ class BotEngine:
             try:
                 self._evaluate_wallet(cfg, wallet, universe, result)
             except Exception as e:  # never let one wallet kill the tick
+                import traceback
+                tb = traceback.format_exc()
                 result.errors += 1
                 result.notes.append(f"wallet_{wallet['id']}_error: {e}")
                 self._log(
                     "bot",
-                    f"Wallet {wallet['name']} (#{wallet['id']}) tick error: {e}",
+                    f"Wallet {wallet['name']} (#{wallet['id']}) tick error: {e}\n{tb}",
                     wallet_id=wallet["id"],
                     level="warn",
                 )
