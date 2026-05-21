@@ -956,12 +956,18 @@ class AutonomousLearningEngine:
 
         # Calculate distances to all stored vectors. Each stored entry may be
         # either a tuple or a JSON-loaded list (json.loads turns tuples into
-        # lists), so we unpack defensively.
+        # lists), so we unpack defensively. A single malformed historical row
+        # must not poison the entire result — any entry whose shape we can't
+        # trust gets skipped, valid ones still returned.
         distances = []
         for entry in self._trade_vectors:
             try:
                 stored_vector, pnl, fp = entry[0], entry[1], entry[2]
             except (TypeError, IndexError, ValueError):
+                continue
+            # Vector must be a list/tuple of numbers — _euclidean_distance
+            # crashes if it's None or a scalar.
+            if not isinstance(stored_vector, (list, tuple)):
                 continue
             try:
                 pnl = float(pnl)
