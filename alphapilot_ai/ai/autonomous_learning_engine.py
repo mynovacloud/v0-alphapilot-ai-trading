@@ -97,15 +97,72 @@ class TradeContext:
     daily_pnl_percent: float = 0.0
     
     def to_fingerprint(self) -> str:
-        """Create a unique fingerprint for this pattern."""
+        """Create a coarse-grained pattern fingerprint for this context.
+
+        WHY THIS IS COARSE
+        ------------------
+        The original fingerprint composed SEVEN features (rsi 10-pt
+        buckets × macd_sign × adx_bucket × vol_bucket × regime × side ×
+        hour_bucket), producing roughly 3,600 possible cells in fingerprint
+        space. In a 200-trade paper session almost none of those cells
+        got populated more than once — every `[AUTONOMOUS]` log line in
+        the operator console showed `pattern=1tr` — which silently
+        neutralized Phase B's exact-pattern calibration tier (it needs
+        N >= 5 trades on a fingerprint before it considers the win-rate
+        usable).
+
+        The current set keeps the FIVE features that carry the most
+        signal-per-bit and widens the noisiest bucket:
+
+          * side          — trades in different directions don't share fate
+          * regime        — pattern viability shifts dramatically by regime
+          * rsi_bucket    — 20-point buckets (5 cells) instead of 10-point
+                            (10 cells). 20 points still distinguishes
+                            "oversold / neutral / overbought" but stops
+                            single-tick RSI wiggles from splitting cells.
+          * macd_sign     — momentum direction is fundamental
+          * adx_bucket    — trend strength matters; noise/trend is the
+                            same coarse split as before
+
+        DROPPED (with reasoning):
+          * vol_bucket    — relative_volume regime is partially captured
+                            by adx_bucket already (high vol ↔ strong trend
+                            most of the time); the orthogonal information
+                            wasn't worth the 3x cell explosion.
+          * hour_bucket   — crypto trades 24/7. The asia/london/us split
+                            was tripling cell count with no evidence that
+                            time-of-day predicts outcomes for our universe.
+                            If we later find evidence the buckets DO
+                            predict, we add it back as a SEPARATE
+                            adjustment layer rather than a fingerprint
+                            dimension.
+
+        FURTHER DROPPED on the empirical-tuning pass:
+          * adx_bucket    — substantially redundant with `regime`.
+                            TRENDING_UP/DOWN regimes are by definition
+                            strong-ADX; RANGING/UNKNOWN are weak. Keeping
+                            both doubled cells with little orthogonal info.
+                            The test_fingerprint_space_is_meaningfully_
+                            smaller_than_old test caught this: 5 features
+                            still left 200 sample contexts in 90 unique
+                            cells (avg 2.2 trades/cell, below the
+                            calibration threshold). Dropping adx pushed
+                            it under 60 cells (~3.5 trades/cell average).
+
+        Theoretical cell count now: 2 × ~6 × 5 × 2 = ~120 vs ~3,600 before.
+
+        Note for migration: existing learned patterns persisted under the
+        old fingerprint format stay in the database but never match an
+        incoming trade again. Effectively orphaned (not actively harmful);
+        new patterns build up under the new format. The kNN tier (which
+        uses TradeContext.to_vector() instead of this fingerprint) is
+        unaffected and keeps working through the transition.
+        """
         key_features = {
-            "rsi_bucket": round(self.rsi / 10) * 10,  # 10-point buckets
-            "macd_sign": "pos" if self.macd_histogram > 0 else "neg",
-            "adx_bucket": "strong" if self.adx > 25 else "weak",
-            "vol_bucket": "high" if self.volume_ratio > 1.5 else "low" if self.volume_ratio < 0.7 else "normal",
-            "regime": self.regime,
             "side": self.side,
-            "hour_bucket": "asia" if 0 <= self.hour_utc < 8 else "london" if 8 <= self.hour_utc < 16 else "us",
+            "regime": self.regime,
+            "rsi_bucket": round(self.rsi / 20) * 20,  # 20-pt buckets: 0/20/40/60/80/100
+            "macd_sign": "pos" if self.macd_histogram > 0 else "neg",
         }
         fingerprint_str = json.dumps(key_features, sort_keys=True)
         return hashlib.md5(fingerprint_str.encode()).hexdigest()[:12]
@@ -1159,7 +1216,16 @@ def get_autonomous_engine() -> AutonomousLearningEngine:
 # Minimum sample sizes for each tier to "count". Conservative because
 # the cost of an over-confident edge estimate is real money; the cost of
 # falling back to raw confidence is just preserving today's behavior.
-MIN_EXACT_PATTERN_TRADES = 5
+#
+# MIN_EXACT_PATTERN_TRADES was originally 5. Tuned down to 3 after
+# observing that paper sessions with the COARSENED fingerprint were
+# accumulating ~3-4 trades/cell on average — 5 was too conservative
+# given a realistic session's cell density, and the tier never engaged
+# in practice. At N=3 we can already detect 67-100% win rates with
+# useful confidence; meta_confidence shrinkage (n / (n + 8)) still
+# discounts the estimate heavily at low N so the blend with raw
+# confidence is gentle.
+MIN_EXACT_PATTERN_TRADES = 3
 MIN_KNN_NEIGHBORS = 5
 
 

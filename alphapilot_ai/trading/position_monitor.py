@@ -571,8 +571,15 @@ class PositionMonitor:
                         level="info",
                         wallet_id=trade.wallet_id,
                         message=(
+                            # `{x:+.2f}` is the explicit-sign format spec — gives
+                            # "+1.00" for positive and "-0.29" for negative. The
+                            # old `+{x:.2f}` prefix-then-format produced "+-0.29"
+                            # for negative numbers, which is the formatting bug
+                            # you saw in the LOCK_IN console line. peak_pct is
+                            # always >= 0 (it's a peak from entry) so {:.2f}
+                            # with an explicit "+" prefix is fine there.
                             f"[LOCK_IN] {trade.symbol} {side}: peak +{peak_pct*100:.2f}% "
-                            f"-> exit at +{pnl_pct*100:.2f}% (floor +{floor_pct*100:.2f}%)"
+                            f"-> exit at {pnl_pct*100:+.2f}% (floor {floor_pct*100:+.2f}%)"
                         ),
                     ))
                 except Exception:

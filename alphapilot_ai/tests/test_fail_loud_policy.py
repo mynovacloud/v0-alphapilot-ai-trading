@@ -107,6 +107,43 @@ def test_autonomous_persist_logs_loudly_on_failure():
     )
 
 
+def test_mission_reject_console_includes_calibration_source():
+    """The [MISSION REJECT] console line must surface which calibration
+    tier (raw_confidence / knn_neighbors / exact_pattern) backed the
+    rejection. Without this, the operator can't tell from the live
+    console whether the system is learning or still guessing.
+
+    Pinned source-level so a future cleanup pass can't quietly drop the
+    suffix to "reduce log noise" — visibility into calibration source is
+    a feature, not noise."""
+    import inspect
+    import trading.bot_engine as be_mod
+    src = inspect.getsource(be_mod)
+    assert "[calib=" in src, (
+        "calibration-source suffix missing from console logs. After "
+        "fingerprint coarsening + Phase B, the operator needs to see "
+        "[calib=exact_pattern n=N] in [MISSION REJECT] and [TRADE OPENED] "
+        "lines to verify the learning loop is closing."
+    )
+
+
+def test_trade_opened_console_includes_calibration_source():
+    """Same pin as above, applied to the [TRADE OPENED] line."""
+    import inspect
+    import trading.bot_engine as be_mod
+    src = inspect.getsource(be_mod)
+    # The [TRADE OPENED] line should include the calibration suffix.
+    # We look for both substrings rather than the exact composed string
+    # to be robust to whitespace/format edits.
+    assert "[TRADE OPENED]" in src
+    # The combined [calib=...] suffix is added in two places (reject +
+    # open); both should be present.
+    assert src.count("[calib=") >= 2, (
+        f"expected calibration suffix in BOTH [MISSION REJECT] and "
+        f"[TRADE OPENED] console lines; only {src.count('[calib=')} found"
+    )
+
+
 def test_calibration_uses_swallow_with_reason():
     """The two calibration fallbacks introduced in Phase B were given
     labeled swallows in Phase C. Re-checking those labels are present
