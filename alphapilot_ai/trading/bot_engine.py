@@ -800,6 +800,14 @@ class BotEngine:
                 decision=decision,
                 confidence=confidence,
                 proposed_notional=position_usd,
+                # Phase B: pass symbol/side/strategy so the helper can build
+                # an autonomous TradeContext and look up the calibrated
+                # historical win rate for this fingerprint. Without these,
+                # the calibration falls back to raw-confidence and we get
+                # the pre-Phase-B behavior.
+                symbol=symbol,
+                side=side,
+                strategy_type=strategy_type,
             )
             mission_decision = mission.approve_trade(
                 symbol=symbol,
@@ -811,7 +819,17 @@ class BotEngine:
                 volatility_score=mission_inputs["volatility_score"],
                 market_quality_score=mission_inputs["market_quality_score"],
                 router_wants_claude=(decision.source == "claude"),
-                metadata={"strategy_type": strategy_type, "decision_source": decision.source},
+                metadata={
+                    "strategy_type": strategy_type,
+                    "decision_source": decision.source,
+                    # Phase B: record which tier of the win-probability
+                    # estimator backed this approval so post-hoc audits
+                    # can separate "approved on real data" from "approved
+                    # on a confidence guess".
+                    "calibration_source": mission_inputs.get("win_probability_source"),
+                    "calibration_sample_size": mission_inputs.get("win_probability_sample_size"),
+                    "calibration_win_prob": mission_inputs.get("win_probability_used"),
+                },
             )
             if not mission_decision.approved:
                 self._log(
@@ -1303,19 +1321,93 @@ class BotEngine:
 # then the heuristics below give the controller plausible inputs so its
 # mode/edge gates can do useful work in paper trading.
 
-def _compute_mission_inputs(*, signal, decision, confidence: float, proposed_notional: float) -> dict:
+def _compute_mission_inputs(
+    *,
+    signal,
+    decision,
+    confidence: float,
+    proposed_notional: float,
+    symbol: str = "",
+    side: str = "",
+    strategy_type: str = "",
+) -> dict:
     indicators = getattr(signal, "indicators", {}) or {}
     sl_pct = max(0.001, float(decision.stop_loss_pct or 0.025))
     tp_pct = max(0.001, float(decision.take_profit_pct or 0.05))
 
+    # --- Calibrated win probability (Phase B) ----------------------------
+    # The old version used `confidence` as a stand-in for "probability this
+    # trade wins". That's a quality signal, not a calibrated probability.
+    # Meanwhile the autonomous engine has been accumulating real
+    # (fingerprint -> win_rate, expectancy, sample_size) data on every
+    # closed trade. We now use that as the source of truth when we have
+    # enough samples, and blend toward confidence when we don't.
+    #
+    # Resolution order (see autonomous_learning_engine.get_calibrated_win_probability):
+    #   1. exact_pattern   - same fingerprint, n ≥ 5 closed trades
+    #   2. knn_neighbors   - k similar trades by Euclidean distance, n ≥ 5
+    #   3. raw_confidence  - no historical data; fall back to confidence
+    #
+    # We blend the measured estimate with raw confidence using the
+    # estimate's own meta-confidence (which grows with sample size). At
+    # n=0 the formula collapses to today's behavior; at n>=25 we trust
+    # the data ~75%.
+    win_prob_meta = {
+        "source": "raw_confidence",
+        "sample_size": 0,
+        "win_probability": max(0.0, min(1.0, float(confidence))),
+        "confidence_in_estimate": 0.0,
+        "expectancy": None,
+        "avg_win": None,
+        "avg_loss": None,
+    }
+    try:
+        from trading.strategic_claude import _build_autonomous_context
+        from ai.autonomous_learning_engine import get_calibrated_win_probability
+
+        ctx = _build_autonomous_context(
+            symbol=symbol or getattr(signal, "symbol", "") or "?",
+            side=side or getattr(signal, "side", "") or "BUY",
+            technical_signal=signal,
+            strategy_type=strategy_type or getattr(signal, "strategy", "Momentum"),
+            tech_confidence=float(confidence),
+        )
+        if ctx is not None:
+            win_prob_meta = get_calibrated_win_probability(ctx, float(confidence))
+    except Exception:
+        # Calibration is best-effort. If anything in the lookup chain
+        # fails we keep the raw-confidence default already in win_prob_meta
+        # and trade exactly the way we did before Phase B.
+        pass
+
+    measured = max(0.0, min(1.0, float(win_prob_meta["win_probability"])))
+    meta_conf = max(0.0, min(1.0, float(win_prob_meta["confidence_in_estimate"])))
+    raw_conf = max(0.0, min(1.0, float(confidence)))
+    prob_win = meta_conf * measured + (1.0 - meta_conf) * raw_conf
+
     # --- Expected net edge (dollars) -------------------------------------
-    # Bayesian-ish: prob_win ≈ confidence. Round-trip fees taken at a coarse
-    # 0.5% (50 bps total) — Coinbase Advanced taker can run lower at higher
-    # tiers; this errs on the conservative side which is what we want from
-    # an entry gate. When we have live fees per-pair we'd source it here.
-    prob_win = max(0.0, min(1.0, float(confidence)))
-    expected_win_pnl = prob_win * tp_pct * proposed_notional
-    expected_loss_pnl = (1.0 - prob_win) * sl_pct * proposed_notional
+    # When we have a calibrated exact_pattern estimate with measured
+    # avg_win / avg_loss magnitudes, use those instead of the decision's
+    # tp_pct / sl_pct (which are forward targets, not realized averages).
+    # The autonomous engine's averages already net out exits that hit
+    # before TP, partial fills, etc. — they're closer to reality.
+    avg_win_pct = win_prob_meta.get("avg_win")
+    avg_loss_pct = win_prob_meta.get("avg_loss")
+    if (
+        win_prob_meta.get("source") == "exact_pattern"
+        and avg_win_pct is not None
+        and avg_loss_pct is not None
+        and avg_win_pct > 0
+        and avg_loss_pct > 0
+    ):
+        win_magnitude_pct = float(avg_win_pct)
+        loss_magnitude_pct = float(avg_loss_pct)
+    else:
+        win_magnitude_pct = tp_pct
+        loss_magnitude_pct = sl_pct
+
+    expected_win_pnl = prob_win * win_magnitude_pct * proposed_notional
+    expected_loss_pnl = (1.0 - prob_win) * loss_magnitude_pct * proposed_notional
     fee_drag = 0.005 * proposed_notional  # 50 bps round-trip
     expected_net_edge = expected_win_pnl - expected_loss_pnl - fee_drag
 
@@ -1351,6 +1443,13 @@ def _compute_mission_inputs(*, signal, decision, confidence: float, proposed_not
         "spread_bps": round(spread_bps, 2),
         "volatility_score": round(volatility_score, 4),
         "market_quality_score": round(market_quality_score, 4),
+        # Phase B observability: which estimator backed the edge math?
+        # Surfaced so the mission decision's metadata records (and the
+        # operator can audit) whether a given approval was based on
+        # measured data or a confidence guess.
+        "win_probability_source": win_prob_meta.get("source", "raw_confidence"),
+        "win_probability_sample_size": int(win_prob_meta.get("sample_size") or 0),
+        "win_probability_used": round(prob_win, 4),
     }
 
 
