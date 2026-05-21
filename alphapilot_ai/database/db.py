@@ -130,6 +130,11 @@ def _migrate_schema() -> None:
             # at close time. Nullable for trades that don't originate from
             # a Claude decision.
             ("claude_decision_id", "INTEGER"),
+            # Phase B calibration audit (see PaperTrade model docstring).
+            # Lets the training-page scorecard show how many of today's
+            # trades were backed by measured pattern data vs raw confidence.
+            ("calibration_source", "VARCHAR(20)"),
+            ("calibration_sample_size", "INTEGER"),
         ],
         "claude_decisions": [
             # JSON snapshot of indicators + regime at decision time. Consumed

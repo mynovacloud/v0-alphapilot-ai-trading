@@ -45,6 +45,8 @@ class PaperTradingEngine:
         trailing_stop_pct: float | None = None,
         enable_breakeven_stop: bool = True,
         claude_decision_id: int | None = None,
+        calibration_source: str | None = None,
+        calibration_sample_size: int | None = None,
     ) -> dict[str, Any]:
         side = side.upper()
         if side not in {"BUY", "SELL"}:
@@ -140,6 +142,10 @@ class PaperTradingEngine:
                 # close. None when the trade didn't originate from a persisted
                 # decision (e.g. manual entries, autonomous-only strategic path).
                 claude_decision_id=claude_decision_id,
+                # Phase B calibration audit fields — see PaperTrade model.
+                # Populated by bot_engine when the trade is opened.
+                calibration_source=calibration_source,
+                calibration_sample_size=calibration_sample_size,
             )
             s.add(trade)
             s.flush()
