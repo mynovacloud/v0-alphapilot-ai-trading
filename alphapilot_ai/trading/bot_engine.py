@@ -832,9 +832,19 @@ class BotEngine:
                 },
             )
             if not mission_decision.approved:
+                # Include the calibration source + sample so the operator
+                # can tell from the console whether this rejection was
+                # backed by measured fingerprint data or just a confidence
+                # guess. After Phase B + the fingerprint coarsening, we
+                # want to see "exact_pattern(n=N)" appearing on more
+                # rejections over time — that's evidence the learning loop
+                # is closing.
+                src = mission_inputs.get("win_probability_source", "?")
+                ssz = mission_inputs.get("win_probability_sample_size", 0)
                 self._log(
                     "bot",
-                    f"[MISSION REJECT] {symbol} {side}: {mission_decision.rejection_code.value} — {mission_decision.reason}",
+                    f"[MISSION REJECT] {symbol} {side}: {mission_decision.rejection_code.value} "
+                    f"— {mission_decision.reason} [calib={src} n={ssz}]",
                     wallet_id=wallet["id"],
                     level="info",
                 )
@@ -907,9 +917,17 @@ class BotEngine:
                 continue
 
             if outcome.get("ok"):
+                # Surface which calibration tier backed the decision so
+                # the operator can audit live whether trades are being
+                # approved on measured data (exact_pattern / knn) or on
+                # raw confidence. Over a session the mix should shift
+                # toward exact_pattern as fingerprints accumulate.
+                src = mission_inputs.get("win_probability_source", "?")
+                ssz = mission_inputs.get("win_probability_sample_size", 0)
                 self._log(
                     "bot",
-                    f"[TRADE OPENED] {symbol} {side} - trade_id={outcome.get('trade_id')}",
+                    f"[TRADE OPENED] {symbol} {side} - trade_id={outcome.get('trade_id')} "
+                    f"[calib={src} n={ssz}]",
                     wallet_id=wallet["id"],
                     level="info",
                 )
