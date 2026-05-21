@@ -476,8 +476,14 @@ class AutonomousLearningEngine:
             self._loaded = True
             logger.info(f"[AUTONOMOUS] Loaded {len(self._patterns)} patterns, "
                        f"{len(self._mistakes)} mistakes, {len(self._symbols)} symbols")
-        except Exception as e:
-            logger.error(f"[AUTONOMOUS] Failed to load memory: {e}")
+        except Exception:
+            # Boot-path failure: persistence is corrupt / DB is unavailable.
+            # We log with full traceback (the old code lost it) and continue
+            # with empty in-memory state. Crashing here would take down the
+            # whole singleton and break trading; the operator needs to see
+            # the engine forgot everything, not have the bot die. Surfaced
+            # at ERROR so it stands out in the console.
+            logger.exception("[AUTONOMOUS] Failed to load memory — engine starts empty")
             self._loaded = True  # Prevent retry loops
     
     def _persist(self):
@@ -501,8 +507,13 @@ class AutonomousLearningEngine:
                                    json.dumps(self._trade_vectors[-1000:]))
                 
                 s.commit()
-        except Exception as e:
-            logger.error(f"[AUTONOMOUS] Failed to persist memory: {e}")
+        except Exception:
+            # Persistence failure: learning that happened this tick is lost
+            # on next restart. Bumped from logger.error (no traceback) to
+            # logger.exception so the operator can SEE which table or which
+            # serialization step blew up. We still don't raise — the trade
+            # path must continue even if learning storage is broken.
+            logger.exception("[AUTONOMOUS] Failed to persist memory — learning this tick is lost")
     
     def _upsert_memory(self, session, category: str, content: str):
         """Insert or update a memory row."""
@@ -597,7 +608,8 @@ class AutonomousLearningEngine:
         # autonomous fingerprints are actually accumulating — which is exactly
         # the visibility they need to verify the loop is closing. Wrapped so
         # an audit-log failure can never break the learn path.
-        try:
+        from utils.errors import swallow_with_reason
+        with swallow_with_reason(logger, "autonomous-learn audit log is best-effort; trade learning still occurred"):
             with session_scope() as s:
                 s.add(ActivityLog(
                     category="ai",
@@ -609,8 +621,6 @@ class AutonomousLearningEngine:
                         f"wr={pattern.win_rate:.0%} ev={pattern.expectancy:+.2%}"
                     ),
                 ))
-        except Exception:
-            logger.debug("Failed to write autonomous-learn ActivityLog", exc_info=True)
     
     def _record_mistake(self, fingerprint: str, pnl_pct: float, 
                         context: TradeContext, exit_reason: str):
@@ -725,9 +735,21 @@ class AutonomousLearningEngine:
                 if trade and trade.opened_at:
                     context.hour_utc = trade.opened_at.hour
                     context.day_of_week = trade.opened_at.weekday()
-        except Exception as e:
-            logger.debug(f"[AUTONOMOUS] Failed to build context: {e}")
-        
+        except Exception:
+            # This swallow used to hide the metadata-vs-indicators bug for
+            # weeks: every learn-time context build silently fell back to
+            # defaults (rsi=50, regime=UNKNOWN) and the autonomous engine
+            # learned from collapsed fingerprints. Bumped from logger.debug
+            # (invisible) to logger.exception so any future shape mismatch
+            # or schema drift shows a stack trace in the console
+            # immediately. We still degrade to default-context return
+            # because crashing the learn path on close is worse than
+            # learning a less-accurate fingerprint.
+            logger.exception(
+                "[AUTONOMOUS] _build_context_from_trade failed for trade %s — "
+                "fingerprint will be degenerate", trade_id,
+            )
+
         return context
     
     # =========================================================================
@@ -1196,9 +1218,18 @@ def get_calibrated_win_probability(
     """
     fp_clamped = max(0.0, min(1.0, float(fallback_confidence)))
 
-    try:
+    # Labeled swallow: if the caller hands us a broken context we degrade
+    # to raw-confidence rather than blocking the trade. Calibration is
+    # additive — without it the system trades exactly the way it did
+    # pre-Phase-B.
+    from utils.errors import swallow_with_reason
+    fingerprint = None
+    with swallow_with_reason(
+        logger,
+        "calibration falls back to raw_confidence when context.to_fingerprint() raises",
+    ):
         fingerprint = context.to_fingerprint()
-    except Exception:
+    if fingerprint is None:
         return _raw_confidence_estimate(fp_clamped)
 
     # Tier 1: exact pattern match
@@ -1223,11 +1254,13 @@ def get_calibrated_win_probability(
 
     # Tier 2: kNN of similar trades
     engine = get_autonomous_engine()
-    try:
+    neighbors: list = []
+    with swallow_with_reason(
+        logger,
+        "calibration kNN lookup is best-effort; falls through to raw_confidence on failure",
+    ):
         engine._ensure_loaded()
         neighbors = engine._find_similar_trades(context, k=20)
-    except Exception:
-        neighbors = []
 
     if neighbors and len(neighbors) >= MIN_KNN_NEIGHBORS:
         wins = sum(1 for pnl, _fp in neighbors if pnl > 0)

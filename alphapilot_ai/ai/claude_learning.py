@@ -363,8 +363,12 @@ def record_trade_outcome(trade_id: int) -> dict[str, Any]:
             strategy_name=strategy_name,
             regime=regime,
         )
-    except Exception as e:
-        logger.warning(f"Failed to update adaptive learning: {e}")
+    except Exception:
+        # Bumped from logger.warning (no traceback) -> logger.exception
+        # so any future shape mismatch surfaces with a stack trace.
+        # The adaptive-learning hook is a side path off reflection —
+        # failure here doesn't break the reflection save above.
+        logger.exception("[REFLECTION] Failed to update adaptive learning side-path")
     
     return result
 
@@ -407,6 +411,15 @@ def consolidate_lessons() -> dict[str, Any]:
 
     applied = {"updated": 0, "deleted": 0, "created": 0}
     with session_scope() as s:
+        # Per-item error handling in the consolidation loops below:
+        # one bad rule must not abort the entire pass. Previously these
+        # were `except Exception: continue` with no log at all — if 5 of
+        # 50 rules silently dropped, no one would know. Now each failure
+        # logs at warning level (no stack trace per item to keep the log
+        # readable, since these are expected to be data-shape errors)
+        # and tracks the count in `applied["errors"]` so a summary
+        # appears at the end.
+        applied["errors"] = 0
         for item in keep:
             try:
                 row = s.get(AILearningMemory, int(item.get("id")))
@@ -419,7 +432,10 @@ def consolidate_lessons() -> dict[str, Any]:
                 if nc:
                     row.content = str(nc)[:2000]
                 applied["updated"] += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("[CONSOLIDATE] keep item dropped (id=%s): %s",
+                               item.get("id"), e)
+                applied["errors"] += 1
                 continue
         for did in delete:
             try:
@@ -427,7 +443,9 @@ def consolidate_lessons() -> dict[str, Any]:
                 if row:
                     s.delete(row)
                     applied["deleted"] += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("[CONSOLIDATE] delete item dropped (id=%s): %s", did, e)
+                applied["errors"] += 1
                 continue
         for c in create:
             try:
@@ -437,7 +455,10 @@ def consolidate_lessons() -> dict[str, Any]:
                     weight=max(0.0, min(_float(c.get("weight"), 1.0, lo=0.0, hi=5.0), 5.0)),
                 ))
                 applied["created"] += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("[CONSOLIDATE] create item dropped: %s — content=%r",
+                               e, str(c.get("content", ""))[:80])
+                applied["errors"] += 1
                 continue
 
         s.add(ActivityLog(
