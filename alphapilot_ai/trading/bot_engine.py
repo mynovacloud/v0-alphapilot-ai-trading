@@ -901,6 +901,11 @@ class BotEngine:
                         f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
                     ),
                     claude_decision_id=getattr(decision, "claude_decision_id", None),
+                    # Persist the Phase B calibration tier so the scorecard
+                    # on /training can show how many of today's trades were
+                    # backed by measured pattern data vs raw confidence.
+                    calibration_source=mission_inputs.get("win_probability_source"),
+                    calibration_sample_size=mission_inputs.get("win_probability_sample_size"),
                 )
             except Exception as e:
                 # A single bad trade (attribute error, DB hiccup, etc.) must

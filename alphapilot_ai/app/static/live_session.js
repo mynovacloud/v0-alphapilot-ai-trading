@@ -184,6 +184,148 @@
   // Throttles), and the policy strip showing the active thresholds for
   // this mode. All ids are addressed by getElementById once and cached
   // implicitly by browser DOM lookup — cheap on every poll.
+  // --- Trade Quality Scorecard (Phase B+ visibility) ---
+  // Polls /training/scorecard separately from the feed (it's a much
+  // cheaper aggregation query and only the operator's eye uses it, so
+  // it doesn't need the per-2s cadence the feed uses). Renders four
+  // blocks: decision-source breakdown, calibration-tier breakdown,
+  // reflection dedup ratio, top accumulated patterns.
+  async function fetchScorecard() {
+    try {
+      const res = await fetch("/training/scorecard", { cache: "no-store" });
+      const data = await res.json();
+      if (data && data.ok) renderScorecard(data);
+    } catch (err) {
+      // Non-fatal: scorecard is observability, not pipeline.
+      if (window.console) console.warn("scorecard fetch failed", err);
+    }
+  }
+
+  function renderScorecard(data) {
+    const panel = document.getElementById("scorecard-panel");
+    if (!panel) return;
+    panel.style.display = "";
+
+    // Session-cutoff label
+    const sessEl = document.getElementById("scorecard-session");
+    if (sessEl && data.session_cutoff) {
+      try {
+        const t = new Date(data.session_cutoff);
+        const hh = t.getHours().toString().padStart(2, "0");
+        const mm = t.getMinutes().toString().padStart(2, "0");
+        sessEl.textContent = "since " + hh + ":" + mm;
+      } catch (e) { sessEl.textContent = ""; }
+    }
+
+    // --- Block 1: decision sources ---------------------------------------
+    const decTotalEl = document.getElementById("sc-decisions-total");
+    const decBarsEl = document.getElementById("sc-decisions-bars");
+    if (decTotalEl) decTotalEl.textContent = "(" + (data.decisions.total || 0) + ")";
+    if (decBarsEl) {
+      decBarsEl.innerHTML = "";
+      const total = data.decisions.total || 1;
+      // Flatten the by_source dict to rows {label, count}.
+      const rows = [];
+      for (const [src, actions] of Object.entries(data.decisions.by_source || {})) {
+        const count = (actions.HOLD || 0) + (actions.BUY || 0) + (actions.SELL || 0) + (actions.OTHER || 0);
+        rows.push({ label: src, count, klass: src });
+      }
+      // Sort by count desc so the dominant sources appear first.
+      rows.sort((a, b) => b.count - a.count);
+      if (rows.length === 0) {
+        decBarsEl.innerHTML = '<div class="text-dim" style="font-size:0.78rem;">no decisions yet</div>';
+      } else {
+        rows.forEach(r => {
+          const pct = total > 0 ? (r.count / total * 100) : 0;
+          const row = document.createElement("div");
+          row.className = "sc-row";
+          row.innerHTML =
+            '<div class="sc-label">' + r.label + '</div>' +
+            '<div class="sc-track"><div class="sc-fill ' + r.klass + '" style="width:' + pct.toFixed(0) + '%;"></div></div>' +
+            '<div class="sc-count">' + r.count + '</div>';
+          decBarsEl.appendChild(row);
+        });
+      }
+    }
+
+    // --- Block 2: trade calibration --------------------------------------
+    const tradTotalEl = document.getElementById("sc-trades-total");
+    const calibBarsEl = document.getElementById("sc-calib-bars");
+    if (tradTotalEl) tradTotalEl.textContent = "(" + (data.trades.total || 0) + ")";
+    if (calibBarsEl) {
+      calibBarsEl.innerHTML = "";
+      const total = data.trades.total || 1;
+      const rows = data.trades.by_calibration || [];
+      if (rows.length === 0) {
+        calibBarsEl.innerHTML = '<div class="text-dim" style="font-size:0.78rem;">no trades yet</div>';
+      } else {
+        rows.forEach(r => {
+          const pct = total > 0 ? (r.count / total * 100) : 0;
+          const row = document.createElement("div");
+          row.className = "sc-row";
+          const labelText = r.source + (r.avg_sample_size ? " <span class=\"text-dim mono\" style=\"font-weight:400;\">n=" + r.avg_sample_size + "</span>" : "");
+          row.innerHTML =
+            '<div class="sc-label">' + labelText + '</div>' +
+            '<div class="sc-track"><div class="sc-fill ' + r.source + '" style="width:' + pct.toFixed(0) + '%;"></div></div>' +
+            '<div class="sc-count">' + r.count + '</div>';
+          calibBarsEl.appendChild(row);
+        });
+      }
+    }
+
+    // --- Block 3: reflection dedup ---------------------------------------
+    const ratioEl = document.getElementById("sc-dedup-ratio");
+    const newEl = document.getElementById("sc-dedup-new");
+    const reinfEl = document.getElementById("sc-dedup-reinforced");
+    const emptyEl = document.getElementById("sc-dedup-empty");
+    const refl = data.reflections || {};
+    if (ratioEl) {
+      const ratio = (refl.dedup_ratio || 0) * 100;
+      ratioEl.textContent = ratio.toFixed(0) + "%";
+      // Colour: green if dedup is doing work (>20%), warn if low, gray if no data.
+      const total = (refl.lessons_new || 0) + (refl.lessons_reinforced || 0);
+      if (total === 0) ratioEl.style.color = "var(--text-muted)";
+      else if (ratio >= 20) ratioEl.style.color = "var(--good)";
+      else if (ratio >= 5) ratioEl.style.color = "var(--warn)";
+      else ratioEl.style.color = "var(--bad)";
+    }
+    if (newEl) newEl.textContent = refl.lessons_new || 0;
+    if (reinfEl) reinfEl.textContent = refl.lessons_reinforced || 0;
+    if (emptyEl) {
+      const e = refl.empty || 0;
+      emptyEl.textContent = e > 0 ? "· " + e + " empty" : "";
+      emptyEl.style.color = e > 0 ? "var(--warn)" : "var(--text-muted)";
+    }
+
+    // --- Block 4: top patterns -------------------------------------------
+    const topEl = document.getElementById("sc-top-patterns");
+    if (topEl) {
+      topEl.innerHTML = "";
+      const patterns = data.top_patterns || [];
+      if (patterns.length === 0) {
+        topEl.innerHTML = '<div class="text-dim">no patterns accumulated yet</div>';
+      } else {
+        patterns.forEach(p => {
+          const row = document.createElement("div");
+          row.style.cssText = "display:grid; grid-template-columns: 120px 50px 70px 60px 1fr; gap:0.5rem; align-items:center;";
+          const wrColor =
+            p.win_rate >= 0.6 ? "var(--good)" :
+            p.win_rate >= 0.4 ? "var(--warn)" : "var(--bad)";
+          const evColor =
+            p.expectancy_pct > 0 ? "var(--good)" :
+            p.expectancy_pct < 0 ? "var(--bad)" : "var(--text-muted)";
+          row.innerHTML =
+            '<div class="mono text-dim" style="font-size:0.7rem;">' + p.fingerprint + '</div>' +
+            '<div class="mono">' + p.side + '</div>' +
+            '<div class="mono">' + p.sample_size + 'tr</div>' +
+            '<div class="mono" style="color:' + wrColor + '">' + (p.win_rate * 100).toFixed(0) + '%</div>' +
+            '<div class="mono" style="color:' + evColor + '">ev ' + (p.expectancy_pct >= 0 ? '+' : '') + p.expectancy_pct.toFixed(2) + '%</div>';
+          topEl.appendChild(row);
+        });
+      }
+    }
+  }
+
   function renderMission(m) {
     const panel = document.getElementById("mission-panel");
     if (!panel) return;
@@ -441,6 +583,12 @@
         setStatus(!!data.session.active, data.session);
         renderPortfolio(data.portfolio);
         renderMission(data.mission);
+      });
+      // Scorecard fetches from a separate endpoint (cheaper than bundling
+      // it into the feed JSON every tick) and renders outside the
+      // preserveScroll wrapper since its bars are below the fold.
+      fetchScorecard().catch(() => {});
+      preserveScroll(() => {
 
         (data.decisions || []).forEach(renderDecision);
         (data.fills || []).forEach(renderFill);

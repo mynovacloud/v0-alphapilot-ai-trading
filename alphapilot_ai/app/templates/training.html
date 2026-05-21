@@ -266,6 +266,107 @@ function recordIntelAction(type, symbol, reason) {
 </style>
 
 <!-- ============================================================ -->
+<!-- TRADE QUALITY SCORECARD                                         -->
+<!-- Aggregates today's session into three blocks the operator       -->
+<!-- needs to see at a glance: (a) what's making my decisions,       -->
+<!-- (b) how many trades are backed by measured data, (c) is the     -->
+<!-- reflection dedup actually working.                              -->
+<!-- Polled by live_session.js alongside the existing portfolio /    -->
+<!-- mission updates. Hidden until first successful fetch.           -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="scorecard-panel" style="display:none; border:1px solid var(--border);">
+  <div class="card-header" style="padding-bottom:0.4rem; border-bottom:1px solid var(--border);">
+    <div class="card-title" style="display:flex; align-items:center; gap:0.6rem;">
+      <span>Trade Quality Scorecard</span>
+      <span id="scorecard-session" class="text-dim mono" style="font-size:0.72rem; font-weight:400;">—</span>
+    </div>
+  </div>
+
+  <div class="grid mt-3" style="grid-template-columns: 1.4fr 1fr 1fr; gap: 1rem;">
+    <!-- BLOCK 1: decision-source breakdown -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Decision sources <span id="sc-decisions-total" class="mono text-dim" style="text-transform:none; letter-spacing:0;">(0)</span>
+      </div>
+      <div id="sc-decisions-bars" style="display:flex; flex-direction:column; gap:0.25rem;">
+        <!-- Filled by renderScorecard() -->
+        <div class="text-dim" style="font-size:0.78rem;">waiting for data…</div>
+      </div>
+    </div>
+
+    <!-- BLOCK 2: trade calibration breakdown -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Trade calibration <span id="sc-trades-total" class="mono text-dim" style="text-transform:none; letter-spacing:0;">(0)</span>
+      </div>
+      <div id="sc-calib-bars" style="display:flex; flex-direction:column; gap:0.25rem;">
+        <div class="text-dim" style="font-size:0.78rem;">waiting for data…</div>
+      </div>
+    </div>
+
+    <!-- BLOCK 3: reflection dedup health -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Reflection dedup
+      </div>
+      <div class="mono" style="font-size:1.4rem; font-weight:800;">
+        <span id="sc-dedup-ratio">—%</span>
+      </div>
+      <div class="text-dim" style="font-size:0.7rem;">
+        <span id="sc-dedup-new">0</span> new · <span id="sc-dedup-reinforced">0</span> reinforced
+        <span id="sc-dedup-empty" class="text-dim" style="margin-left:0.3rem;"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- BLOCK 4: top autonomous patterns by sample size -->
+  <details style="margin-top:0.7rem; padding-top:0.6rem; border-top:1px solid var(--border);">
+    <summary class="text-muted mono" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; cursor:pointer;">
+      Top patterns by sample size
+    </summary>
+    <div id="sc-top-patterns" style="margin-top:0.5rem; display:flex; flex-direction:column; gap:0.2rem; font-size:0.78rem;">
+      <div class="text-dim">no patterns accumulated yet</div>
+    </div>
+  </details>
+</div>
+
+<style>
+/* Tiny inline bars used by sc-decisions-bars / sc-calib-bars. The bar
+   width is set via inline style by JS; the segment color is set per
+   row via the class names below. */
+.sc-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 50px;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.78rem;
+}
+.sc-row .sc-label { color: var(--text); font-weight: 600; }
+.sc-row .sc-track {
+  height: 8px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sc-row .sc-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+.sc-row .sc-count { font-family: var(--mono); text-align: right; color: var(--text-muted); }
+
+.sc-fill.exact_pattern  { background: var(--good); }
+.sc-fill.knn_neighbors  { background: var(--accent, #4aa3ff); }
+.sc-fill.raw_confidence { background: var(--warn); }
+.sc-fill.training_passthrough { background: var(--accent, #4aa3ff); }
+.sc-fill.autonomous     { background: var(--good); }
+.sc-fill.tech_hold      { background: var(--text-muted); }
+.sc-fill.claude         { background: var(--good); }
+.sc-fill.cache          { background: var(--text-muted); }
+.sc-fill.learn_block    { background: var(--bad); }
+.sc-fill.default        { background: var(--text-muted); }
+</style>
+
+<!-- ============================================================ -->
 <!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->
 <!-- ============================================================ -->
 {% set pl = portfolio.total_pl %}

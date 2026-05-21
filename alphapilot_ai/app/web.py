@@ -42,6 +42,7 @@ from database.models import (
     ActivityLog,
     AppSetting,
     ApiCredentialPlaceholder,
+    ClaudeDecision,
     PaperTrade,
     Position,
     Strategy,
@@ -1623,6 +1624,170 @@ def training_learning_stats() -> JSONResponse:
         engine = get_autonomous_engine()
         stats = engine.get_statistics()
         return JSONResponse({"ok": True, **stats})
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
+@router.get("/training/scorecard")
+def training_scorecard() -> JSONResponse:
+    """Trade-quality scorecard for the training UI.
+
+    Aggregates today's session into three blocks the operator should see at
+    a glance:
+
+      1. DECISION SOURCES — across every ClaudeDecision row since the last
+         bankroll reset, count what `source` produced each verdict. This
+         answers "what's actually making my trade decisions today?" — is it
+         the autonomous engine dominating, training_passthroughs, or Claude?
+
+      2. TRADE CALIBRATION — across PaperTrade rows opened since the last
+         bankroll reset, count which Phase B calibration tier
+         (exact_pattern / knn_neighbors / raw_confidence) backed each
+         approved trade. Tells the operator how many trades today were
+         based on measured pattern data vs heuristic confidence.
+
+      3. REFLECTION DEDUP — over the past N reflections, sum lessons_added
+         vs lessons_reinforced. Proves whether the new dedup is matching
+         paraphrases (reinforced rises) or still cloning everything
+         (reinforced stays at 0).
+
+    Cheap to compute (three small aggregations); safe to poll on the
+    feed cadence.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import func
+
+    try:
+        with session_scope() as s:
+            # --- session cutoff ----------------------------------------------
+            # Use the most recent bankroll_reset_at across wallets as "today".
+            # If no wallet has been reset, fall back to UTC start-of-day.
+            wallets_db = s.query(Wallet).all()
+            cutoff = None
+            for w in wallets_db:
+                if w.bankroll_reset_at is not None:
+                    if cutoff is None or w.bankroll_reset_at > cutoff:
+                        cutoff = w.bankroll_reset_at
+            if cutoff is None:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            # --- decision sources (block 1) ----------------------------------
+            decision_rows = (
+                s.query(ClaudeDecision.source, ClaudeDecision.action, func.count())
+                .filter(ClaudeDecision.created_at >= cutoff)
+                .group_by(ClaudeDecision.source, ClaudeDecision.action)
+                .all()
+            )
+            decision_breakdown: dict[str, dict[str, int]] = {}
+            total_decisions = 0
+            for src, action, count in decision_rows:
+                src_key = (src or "unknown").strip()
+                action_key = (action or "HOLD").strip().upper()
+                decision_breakdown.setdefault(src_key, {"HOLD": 0, "BUY": 0, "SELL": 0, "OTHER": 0})
+                bucket = action_key if action_key in {"HOLD", "BUY", "SELL"} else "OTHER"
+                decision_breakdown[src_key][bucket] += int(count or 0)
+                total_decisions += int(count or 0)
+
+            # --- trade calibration (block 2) ---------------------------------
+            calib_rows = (
+                s.query(PaperTrade.calibration_source, func.count(), func.avg(PaperTrade.calibration_sample_size))
+                .filter(PaperTrade.opened_at >= cutoff)
+                .group_by(PaperTrade.calibration_source)
+                .all()
+            )
+            calib_breakdown = []
+            total_trades = 0
+            for src, count, avg_n in calib_rows:
+                src_key = (src or "raw_confidence")
+                cnt = int(count or 0)
+                calib_breakdown.append({
+                    "source": src_key,
+                    "count": cnt,
+                    "avg_sample_size": round(float(avg_n or 0.0), 1),
+                })
+                total_trades += cnt
+            # Stable ordering so the UI renders in the same place every poll.
+            _ORDER = {"exact_pattern": 0, "knn_neighbors": 1, "raw_confidence": 2}
+            calib_breakdown.sort(key=lambda r: _ORDER.get(r["source"], 99))
+
+            # --- reflection dedup (block 3) ----------------------------------
+            # Sum lessons_added vs reinforced across the most recent N
+            # reflections (since cutoff). We don't have explicit columns for
+            # added/reinforced on TradeReflection — they're embedded in the
+            # ActivityLog message "(new=N, reinforced=M)". We parse that.
+            reflection_logs = (
+                s.query(ActivityLog.message)
+                .filter(ActivityLog.category == "ai")
+                .filter(ActivityLog.created_at >= cutoff)
+                .filter(ActivityLog.message.like("Reflection saved%"))
+                .all()
+            )
+            import re
+            lessons_new = 0
+            lessons_reinforced = 0
+            reflections_count = 0
+            empty_reflections = 0
+            for (msg,) in reflection_logs:
+                reflections_count += 1
+                m = re.search(r"new=(\d+),\s*reinforced=(\d+)", msg or "")
+                if m:
+                    lessons_new += int(m.group(1))
+                    lessons_reinforced += int(m.group(2))
+                # Detect the "lessons=0 ... — <cause>" pattern from Phase A.
+                if "lessons=0" in (msg or ""):
+                    empty_reflections += 1
+
+            dedup_ratio = (
+                lessons_reinforced / (lessons_new + lessons_reinforced)
+                if (lessons_new + lessons_reinforced) > 0 else 0.0
+            )
+
+            # --- top patterns (block 4) — autonomous engine top fingerprints --
+            top_patterns = []
+            try:
+                from ai.autonomous_learning_engine import get_autonomous_engine
+                eng = get_autonomous_engine()
+                eng._ensure_loaded()
+                # _patterns is dict[fingerprint -> LearnedPattern]
+                ranked = sorted(
+                    eng._patterns.values(),
+                    key=lambda p: p.total_trades,
+                    reverse=True,
+                )[:5]
+                for p in ranked:
+                    top_patterns.append({
+                        "fingerprint": p.fingerprint,
+                        "side": p.side,
+                        "sample_size": int(p.total_trades),
+                        "win_rate": round(float(p.win_rate or 0.0), 3),
+                        "expectancy_pct": round(float(p.expectancy or 0.0) * 100, 2),
+                    })
+            except Exception:
+                # Top-patterns is supplementary — don't block the scorecard
+                # if the engine can't be queried right now.
+                top_patterns = []
+
+            return JSONResponse({
+                "ok": True,
+                "session_cutoff": cutoff.isoformat(),
+                "decisions": {
+                    "total": total_decisions,
+                    "by_source": decision_breakdown,
+                },
+                "trades": {
+                    "total": total_trades,
+                    "by_calibration": calib_breakdown,
+                },
+                "reflections": {
+                    "total": reflections_count,
+                    "lessons_new": lessons_new,
+                    "lessons_reinforced": lessons_reinforced,
+                    "dedup_ratio": round(dedup_ratio, 3),
+                    "empty": empty_reflections,
+                },
+                "top_patterns": top_patterns,
+            })
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 

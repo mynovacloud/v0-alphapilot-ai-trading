@@ -182,6 +182,18 @@ class PaperTrade(Base):
     # because not every trade originates from a Claude decision (e.g. manual).
     claude_decision_id = Column(Integer, ForeignKey("claude_decisions.id"), nullable=True, index=True)
 
+    # Phase B calibration audit: which tier of the win-probability estimator
+    # backed the approval. Populated by bot_engine when the trade is opened.
+    # The training-page scorecard aggregates these to show the operator how
+    # many trades today were backed by measured data vs raw confidence.
+    #   - 'exact_pattern' : same fingerprint has >= MIN_EXACT_PATTERN_TRADES
+    #                       closed trades; uses measured win_rate.
+    #   - 'knn_neighbors' : kNN of similar trades by vector distance.
+    #   - 'raw_confidence': no historical data; fell back to signal confidence.
+    #   - NULL on manual / pre-Phase-B trades.
+    calibration_source = Column(String(20), nullable=True, index=True)
+    calibration_sample_size = Column(Integer, nullable=True)
+
     wallet = relationship("Wallet", back_populates="trades")
     strategy = relationship("Strategy")
 
