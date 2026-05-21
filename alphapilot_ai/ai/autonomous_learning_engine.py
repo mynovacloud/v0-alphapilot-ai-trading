@@ -803,9 +803,14 @@ class AutonomousLearningEngine:
         # 4. Find similar historical trades
         similar_trades = self._find_similar_trades(context)
         if similar_trades:
-            avg_pnl = sum(t[1] for t in similar_trades) / len(similar_trades)
-            win_rate = sum(1 for t in similar_trades if t[1] > 0) / len(similar_trades)
-            
+            # similar_trades is a list of (pnl_pct, fingerprint) tuples — see
+            # _find_similar_trades. pnl is index 0; fingerprint is index 1.
+            # The v2 rewrite shipped this loop reading t[1] for pnl, which is
+            # the fingerprint string — every call crashed with TypeError on
+            # the first sum() because Python can't add 0 + "abc123...".
+            avg_pnl = sum(t[0] for t in similar_trades) / len(similar_trades)
+            win_rate = sum(1 for t in similar_trades if t[0] > 0) / len(similar_trades)
+
             decision.historical_expectancy = avg_pnl
             decision.pattern_match_score = win_rate
             
@@ -934,20 +939,38 @@ class AutonomousLearningEngine:
         
         return adjustment
     
-    def _find_similar_trades(self, context: TradeContext, k: int = 10) -> List[Tuple[List[float], float]]:
-        """Find k most similar historical trades using vector similarity."""
+    def _find_similar_trades(self, context: TradeContext, k: int = 10) -> List[Tuple[float, str]]:
+        """Find the k most similar historical trades by vector distance.
+
+        Returns a list of (pnl_pct, fingerprint) tuples — sorted by similarity,
+        closest first. The (vector, pnl, fp) shape stored in self._trade_vectors
+        is collapsed to (pnl, fp) since the caller never needs the vector
+        again. NOTE: the type annotation in the v2 rewrite was wrong
+        (claimed List[Tuple[List[float], float]]) and the call site at the
+        top of decide() trusted that wrong annotation — crashes from that
+        mismatch are what we just fixed."""
         if not self._trade_vectors:
             return []
-        
+
         current_vector = context.to_vector()
-        
-        # Calculate distances to all stored vectors
+
+        # Calculate distances to all stored vectors. Each stored entry may be
+        # either a tuple or a JSON-loaded list (json.loads turns tuples into
+        # lists), so we unpack defensively.
         distances = []
-        for stored_vector, pnl, fp in self._trade_vectors:
+        for entry in self._trade_vectors:
+            try:
+                stored_vector, pnl, fp = entry[0], entry[1], entry[2]
+            except (TypeError, IndexError, ValueError):
+                continue
+            try:
+                pnl = float(pnl)
+            except (TypeError, ValueError):
+                continue
             dist = self._euclidean_distance(current_vector, stored_vector)
-            distances.append((dist, pnl, fp))
-        
-        # Sort by distance and return top k
+            distances.append((dist, pnl, str(fp)))
+
+        # Sort by distance and return top k as (pnl, fingerprint).
         distances.sort(key=lambda x: x[0])
         return [(d[1], d[2]) for d in distances[:k]]
     
