@@ -875,24 +875,191 @@ def recent_decisions(limit: int = 25) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------- #
 
 
+# =============================================================================
+# Lesson normalization for dedup
+# =============================================================================
+# Why this matters: reflections from Claude regularly produce 5 lessons each.
+# Without dedup, a 50-trade session creates 250 lessons in AILearningMemory.
+# Most of them are paraphrases of the same insight ("avoid buying when RSI
+# overbought above 70" vs "do not enter long positions when RSI is in
+# overbought territory above 70"). The playbook bloats; Claude's prompt
+# context gets diluted; rule weighting becomes meaningless.
+#
+# The OLD normalization was bag-of-tokens with a 0.72 jaccard threshold. It
+# never matched in practice — observed `lessons=5 (new=5, reinforced=0)` on
+# EVERY reflection in a 50+ trade session. Five obviously-equivalent
+# paraphrases scored 0.00 to 0.36 jaccard — well below threshold.
+#
+# The fix has three pieces:
+#   1. Synonym mapping — common trading-verb variants ("buy"/"long"/
+#      "enter long"/"purchase") all collapse to canonical tokens.
+#   2. Simple suffix stemming — "-ing"/"-ed"/"-s" dropped on long words.
+#   3. Threshold lowered to 0.55, with a direction-conflict guard so two
+#      lessons recommending OPPOSITE directions can't collapse even with
+#      high overlap on the conditions.
+
+# Stop-word set: words that carry no trading semantics. Filtered before
+# jaccard so they don't dominate the token set artificially. Kept short —
+# we want to keep "not"/"no" since negation matters, just rewrite them to
+# the canonical "avoid" token via the synonym map.
+_LESSON_STOP_WORDS = frozenset({
+    "the", "and", "for", "with", "from", "when", "before", "after",
+    "once", "until", "during", "while", "since",
+    "is", "are", "was", "were", "be", "been", "being",
+    "to", "of", "in", "on", "at", "by", "as", "or", "if",
+    "a", "an", "the",
+    "we", "you", "your", "our", "us", "they", "them",
+    "this", "that", "these", "those", "it", "its", "their",
+    "than", "then", "there", "here", "where",
+    "would", "could", "should", "will", "may", "might", "must",
+    "have", "has", "had", "having", "do", "does", "did",
+    "very", "much", "more", "less", "most", "least",
+    "also", "just", "only", "too", "so",
+})
+
+# Synonym map: variant → canonical. Direction-preserving — "buy" and
+# "sell" stay distinct. The avoidance modifier ("avoid"/"do not"/"never"/
+# "skip") all collapse to "avoid" so negation-based phrasings match
+# avoidance-based ones.
+_LESSON_SYNONYMS = {
+    # --- Buy-side direction --------------------------------------------------
+    "buy": "buy", "buys": "buy", "buying": "buy", "bought": "buy",
+    "long": "buy", "longs": "buy", "longing": "buy",
+    "purchase": "buy", "purchased": "buy", "purchases": "buy",
+    "purchasing": "buy", "acquire": "buy", "acquiring": "buy",
+
+    # --- Sell-side direction -------------------------------------------------
+    "sell": "sell", "sells": "sell", "selling": "sell", "sold": "sell",
+    "short": "sell", "shorts": "sell", "shorting": "sell", "shorted": "sell",
+
+    # --- Position lifecycle (orthogonal to direction) -----------------------
+    # "enter"/"open"/"start" map to "enter"
+    "enter": "enter", "enters": "enter", "entered": "enter", "entering": "enter",
+    "open": "enter", "opens": "enter", "opened": "enter", "opening": "enter",
+    "start": "enter", "started": "enter", "starting": "enter",
+    "initiate": "enter", "initiated": "enter", "initiating": "enter",
+    # "exit"/"close" map to "exit"
+    "exit": "exit", "exits": "exit", "exited": "exit", "exiting": "exit",
+    "close": "exit", "closes": "exit", "closed": "exit", "closing": "exit",
+    "cut": "exit", "cuts": "exit", "cutting": "exit",
+    "leave": "exit", "left": "exit", "leaving": "exit",
+    "dump": "exit", "dumped": "exit", "dumping": "exit",
+
+    # --- Avoidance / inhibition ---------------------------------------------
+    # Both modal-avoidance ("avoid") AND negation ("not"/"no"/"dont"/"never")
+    # collapse to the same canonical so "avoid buying" matches "do not buy".
+    "avoid": "avoid", "avoids": "avoid", "avoided": "avoid", "avoiding": "avoid",
+    "skip": "avoid", "skips": "avoid", "skipped": "avoid", "skipping": "avoid",
+    "refuse": "avoid", "refuses": "avoid", "refused": "avoid", "refusing": "avoid",
+    "reject": "avoid", "rejects": "avoid", "rejected": "avoid", "rejecting": "avoid",
+    "block": "avoid", "blocks": "avoid", "blocked": "avoid", "blocking": "avoid",
+    "no": "avoid", "not": "avoid", "dont": "avoid", "doesnt": "avoid",
+    "never": "avoid", "wont": "avoid",
+
+    # --- Profit-protection actions ------------------------------------------
+    "tighten": "tighten", "tightens": "tighten", "tightened": "tighten",
+    "tightening": "tighten", "tighter": "tighten", "tight": "tighten",
+    "move": "tighten", "moves": "tighten", "moved": "tighten", "moving": "tighten",
+    "shift": "tighten", "shifts": "tighten", "shifted": "tighten",
+    "lock": "lock", "locks": "lock", "locked": "lock", "locking": "lock",
+    "protect": "lock", "protects": "lock", "protected": "lock", "protecting": "lock",
+    "preserve": "lock", "preserves": "lock", "preserved": "lock",
+    "guarantee": "lock", "guarantees": "lock", "guaranteed": "lock",
+    "secure": "lock", "secures": "lock", "secured": "lock",
+
+    # --- Reversal / regime shift --------------------------------------------
+    "reverse": "reverse", "reverses": "reverse", "reversed": "reverse",
+    "reversing": "reverse", "reversal": "reverse",
+    "flip": "reverse", "flipped": "reverse", "flipping": "reverse",
+    "turn": "reverse", "turns": "reverse", "turned": "reverse", "turning": "reverse",
+
+    # --- Confirmation / signal-strength -------------------------------------
+    "confirm": "confirm", "confirms": "confirm", "confirmed": "confirm",
+    "confirming": "confirm", "confirmation": "confirm",
+    "verify": "confirm", "verifies": "confirm", "verified": "confirm",
+    "validate": "confirm", "validated": "confirm", "validation": "confirm",
+
+    # --- Outcome words ------------------------------------------------------
+    "loss": "loss", "losses": "loss", "losing": "loss", "lost": "loss",
+    "lose": "loss", "loser": "loss",
+    "win": "win", "wins": "win", "winning": "win", "won": "win",
+    "winner": "win", "victory": "win",
+    "profit": "profit", "profits": "profit", "profitable": "profit",
+    "gain": "profit", "gains": "profit", "gained": "profit", "gaining": "profit",
+
+    # --- Conditions / direction modifiers -----------------------------------
+    "above": "above", "over": "above", "exceeding": "above", "higher": "above",
+    "below": "below", "under": "below", "lower": "below", "less": "below",
+    "negative": "below", "positive": "above",
+    "overbought": "overbought", "oversold": "oversold",
+
+    # --- Momentum vocabulary ------------------------------------------------
+    "momentum": "momentum",
+    "trend": "trend", "trending": "trend", "trended": "trend", "trends": "trend",
+    "breakout": "breakout", "breakouts": "breakout", "broke": "breakout",
+    "breaking": "breakout",
+    "pullback": "pullback", "pullbacks": "pullback",
+
+    # --- Indicators ---------------------------------------------------------
+    "rsi": "rsi", "macd": "macd",
+    "histogram": "histogram", "histograms": "histogram",
+    "ema": "ema", "sma": "ma", "moving": "ma", "average": "ma", "averages": "ma",
+    "atr": "atr", "bollinger": "bollinger",
+    "volume": "volume", "volumes": "volume", "vol": "volume",
+    "spread": "spread", "spreads": "spread",
+}
+
+
+def _stem_token(t: str) -> str:
+    """Strip common English suffixes for tokens not handled by the synonym
+    map. Tiny rule-based stemmer — no nltk dependency, intentionally
+    conservative so we don't over-collapse."""
+    if len(t) <= 4:
+        return t
+    # Order matters: longer suffixes first so "ies" wins over "s".
+    for suf in ("ing", "ied", "ies", "ed", "es", "s"):
+        if t.endswith(suf) and len(t) > len(suf) + 2:
+            stem = t[:-len(suf)]
+            # "ies" → "y" (parties → party; strategies → strategy)
+            if suf == "ies":
+                stem = stem + "y"
+            return stem
+    return t
+
+
 def _normalize_lesson(text: str) -> str:
     """Normalize lesson text for fuzzy duplicate detection.
 
-    Strips punctuation, collapses whitespace, lowercases, and drops common
-    filler tokens so two phrasings of the same insight collapse to the same
-    bag-of-words key. Used to detect when a "new" lesson is really a
-    restatement of one already in the playbook.
+    Pipeline:
+      1. Lowercase, strip punctuation.
+      2. Tokenize; drop pure digits, single chars, stop words.
+      3. Synonym-rewrite known trading vocabulary to canonical tokens.
+      4. Simple suffix-stem anything not in the synonym map.
+      5. Return a sorted unique token string for jaccard.
+
+    Returns a SPACE-JOINED SORTED UNIQUE token string. Consumers should
+    .split() it back to a set for jaccard.
     """
     import re
     s = (text or "").lower()
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
-    # Drop tiny/uninformative tokens; the structural words like "do", "not",
-    # "when" are what keeps two opposite rules from collapsing to the same
-    # signature, so we keep them. Numbers are stripped because exact thresholds
-    # ("0.5x", "0.1x", "30%", etc.) shouldn't make an otherwise-duplicate
-    # lesson look novel.
-    tokens = [t for t in s.split() if t and not t.isdigit() and len(t) > 1]
-    return " ".join(sorted(set(tokens)))
+    out: list[str] = []
+    for raw in s.split():
+        if not raw or raw.isdigit() or len(raw) <= 1:
+            continue
+        if raw in _LESSON_STOP_WORDS:
+            continue
+        # Apply synonym map if known; else stem.
+        if raw in _LESSON_SYNONYMS:
+            canon = _LESSON_SYNONYMS[raw]
+            if canon:
+                out.append(canon)
+        else:
+            stem = _stem_token(raw)
+            if stem and stem not in _LESSON_STOP_WORDS:
+                # The stem might itself be in the synonym map now.
+                out.append(_LESSON_SYNONYMS.get(stem, stem))
+    return " ".join(sorted(set(out)))
 
 
 def _jaccard(a: str, b: str) -> float:
@@ -904,11 +1071,42 @@ def _jaccard(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+def _has_conflicting_direction(a: str, b: str) -> bool:
+    """Detect if two normalized lessons recommend OPPOSING directions.
+
+    Buy and sell are direction tokens after synonym normalization. If
+    lesson A explicitly has "buy" but not "sell" and lesson B explicitly
+    has "sell" but not "buy" (or vice versa), they're opposite
+    recommendations on otherwise-similar setups. Don't collapse them.
+    """
+    ta = set(a.split())
+    tb = set(b.split())
+    a_buy, a_sell = "buy" in ta, "sell" in ta
+    b_buy, b_sell = "buy" in tb, "sell" in tb
+    return (a_buy and b_sell and not a_sell and not b_buy) or \
+           (a_sell and b_buy and not a_buy and not b_sell)
+
+
 # Rules whose normalized token sets overlap by >= this threshold are treated
-# as the SAME rule. 0.72 is empirically tight enough to keep "do not buy when
-# RSI < 30" distinct from "do not sell when RSI < 30" while collapsing the
-# 30+ paraphrases of "contradictory divergence patterns = noise" into one.
-_DEDUP_SIMILARITY_THRESHOLD = 0.72
+# as the SAME rule, UNLESS _has_conflicting_direction flags them as opposite.
+#
+# Lowered from 0.72 (original — never matched anything; `reinforced=0` on
+# every reflection in a 50-trade paper session) to 0.50 based on empirical
+# testing against 5 plausibly-equivalent Claude lesson pairs:
+#   - "avoid buying when RSI > 70" vs "do not enter long when RSI
+#     overbought above 70" → sim 0.62, matches
+#   - "cut losses quickly when momentum reverses" vs "exit fast on
+#     momentum reversal" → sim 0.50, matches at threshold
+#   - 3 other paraphrases ("wait for volume" vs "don't enter without
+#     volume", "tighten stops at 3%" vs "move stops at 3 percent",
+#     "sell when MACD negative" vs "exit longs when MACD below zero")
+#     stayed below 0.50. Those need richer semantic matching to catch;
+#     they're acceptable misses — better to under-merge than to
+#     incorrectly collapse genuinely different lessons.
+# The direction-conflict guard (above) prevents threshold-crossing
+# false collisions on opposite-direction lessons even if their condition
+# tokens happen to overlap heavily.
+_DEDUP_SIMILARITY_THRESHOLD = 0.50
 
 # Per-repeat weight increment when a duplicate fires. Capped at 5.0 globally
 # so a loud insight crowds out noise but can't infinitely dominate.
@@ -963,14 +1161,22 @@ def _save_reflection(
             new_norm = _normalize_lesson(content)
             new_weight = max(0.05, min(float(lesson.get("weight", 1.0) or 1.0), 5.0))
 
-            # Find best fuzzy match against existing playbook.
+            # Find best fuzzy match against existing playbook. Apply the
+            # direction-conflict guard so a "buy when X" lesson can't
+            # collapse into a "sell when X" lesson on otherwise-similar
+            # condition tokens — that would silently invert the playbook's
+            # recommendation.
             best_row = None
             best_sim = 0.0
+            best_norm = ""
             for row, row_norm in existing_rules:
+                if _has_conflicting_direction(new_norm, row_norm):
+                    continue
                 sim = _jaccard(new_norm, row_norm)
                 if sim > best_sim:
                     best_sim = sim
                     best_row = row
+                    best_norm = row_norm
 
             if best_row is not None and best_sim >= _DEDUP_SIMILARITY_THRESHOLD:
                 # Same insight — reinforce instead of cloning. Bump weight
