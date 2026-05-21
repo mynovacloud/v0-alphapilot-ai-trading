@@ -409,7 +409,12 @@ def _read_calibration_knobs() -> tuple[float, bool]:
             floor = float(raw_floor)
         is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
-        pass
+        # Labeled-but-quiet swallow: bot_config read failure leaves us on
+        # hard-coded defaults (floor=0.55, is_training=False). The bot can
+        # still trade at its baseline. A real DB problem will surface
+        # elsewhere in this tick at a louder level. Keep this DEBUG so the
+        # signal-to-noise on the console stays clean.
+        logger.debug("[swallowed:bot_config-read] using hard-coded defaults", exc_info=True)
     return floor, is_training
 
 
@@ -484,8 +489,13 @@ def decide(
                 [p.name for p in adaptive_rec.matched_patterns],
                 adaptive_rec.strategy_weight,
             )
-    except Exception as e:
-        logger.warning("[ADAPTIVE] error: %s", e)
+    except Exception:
+        # The adaptive engine runs on every decision and is part of the
+        # mission-controller edge math. Bumped from logger.warning (no
+        # traceback) -> logger.exception so any future signature drift or
+        # shape mismatch surfaces with a stack trace. The decision still
+        # continues — adaptive context is additive, not required.
+        logger.exception("[ADAPTIVE] enhancement failed; decision continues with empty adaptive context")
 
     # ----- Known-losing-pattern guard ------------------------------------- #
     # Don't repeat mistakes. When the adaptive engine has built up enough
@@ -779,8 +789,11 @@ def _maybe_second_opinion(
         if parsed is None:
             return decision
         second = _normalize_and_clamp(parsed, wallet)
-    except Exception as e:
-        logger.warning("[SECOND_OPINION] failed: %s", e)
+    except Exception:
+        # Bumped to exception level so a second-opinion failure shows a
+        # stack trace. The original decision is returned unchanged —
+        # second opinion is additive when ENABLE_SECOND_OPINION is True.
+        logger.exception("[SECOND_OPINION] failed; returning original decision unchanged")
         return decision
 
     if second.action != decision.action:
@@ -1049,8 +1062,13 @@ def _symbol_recent_history(wallet_id: int, symbol: str, limit: int = 5) -> list[
                     "exit_reason": getattr(t, "exit_reason", None),
                 })
             return out
-    except Exception as e:
-        logger.debug("[SYMBOL_HISTORY] %s: %s", symbol, e)
+    except Exception:
+        # Bumped from logger.debug -> logger.warning. Symbol history feeds
+        # Claude's prompt context for the symbol — a silent failure here
+        # would mean Claude reasons with no per-symbol memory, which is
+        # invisible from the outside. Worth surfacing.
+        logger.warning("[SYMBOL_HISTORY] failed for %s; prompt will lack per-symbol context",
+                       symbol, exc_info=True)
         return []
 
 
@@ -1176,8 +1194,13 @@ def _confidence_calibration_factor(wallet_id: int) -> float:
             win_rate = wins / len(rows) if rows else 0.5
             if mean_pred > 0:
                 factor = _clamp(win_rate / mean_pred, CALIBRATION_FLOOR, CALIBRATION_CEIL)
-    except Exception as e:
-        logger.debug("[CALIBRATION] unavailable: %s", e)
+    except Exception:
+        # Calibration is the anti-overconfidence damper applied to every
+        # Claude directional decision. Silent debug-level failure was
+        # hiding shape mismatches; bumped to warning so the operator
+        # notices when the calibrator goes dark.
+        logger.warning("[CALIBRATION] unavailable; using factor=1.0 (no damping)",
+                       exc_info=True)
         factor = 1.0
 
     _calibration_cache.set(wallet_id, factor)
@@ -1206,6 +1229,12 @@ def _fetch_fear_greed() -> dict | None:
                 "summary": fg.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: external service failure (network / API down)
+        # is non-fatal — we cache None so the next tick gets a fresh
+        # retry, and Claude's prompt reasons without the fear/greed
+        # signal this tick. DEBUG level: we don't want this to spam the
+        # console during outages.
+        logger.debug("[swallowed:fear_greed-fetch] external API failed", exc_info=True)
         out = None
     _global_md_cache.set("fear_greed", out or {})
     return out
@@ -1228,6 +1257,12 @@ def _fetch_derivatives(symbol: str) -> dict | None:
                 "summary": d.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: derivatives data is opportunistic context for
+        # Claude. External fetcher down is non-fatal — None is cached so
+        # the next tick retries; Claude's prompt this tick skips the
+        # derivatives block. DEBUG-level to avoid console spam during
+        # external outages.
+        logger.debug("[swallowed:derivatives-fetch] external API failed for %s", symbol, exc_info=True)
         out = None
     _global_md_cache.set(("deriv", symbol), out or {})
     return out
@@ -1251,6 +1286,10 @@ def _fetch_mtf(symbol: str, confidence: float) -> dict | None:
                 "summary": m.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: multi-timeframe analysis is opportunistic
+        # context. Same pattern as the other external-fetcher swallows
+        # above — non-fatal, debug-level to avoid spamming on outages.
+        logger.debug("[swallowed:mtf-fetch] external service failed for %s", symbol, exc_info=True)
         out = None
     _global_md_cache.set(("mtf", symbol), out or {})
     return out

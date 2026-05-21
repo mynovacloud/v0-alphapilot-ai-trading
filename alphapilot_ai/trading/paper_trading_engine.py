@@ -266,7 +266,13 @@ class PaperTradingEngine:
             )
             logger.debug(f"[LEARN] Adaptive learning updated for trade {trade_id}")
         except Exception:
-            logger.debug("Adaptive learning update failed for trade %s", trade_id)
+            # Bumped from logger.debug -> logger.exception (Phase C). The
+            # debug-level swallow was what hid the symbol/duration_minutes
+            # NameError for weeks: the adaptive learn hook ran on every
+            # close, NameError'd silently, and never updated any
+            # per-strategy stats. Future NameErrors / shape mismatches now
+            # surface in the console with a full stack trace.
+            logger.exception("[LEARN] Adaptive learning update failed for trade %s", trade_id)
         
         # CRITICAL: Update the autonomous learning engine
         # This is the self-improving brain that operates WITHOUT Claude
@@ -284,8 +290,14 @@ class PaperTradingEngine:
                 exit_reason=exit_reason,
             )
             logger.info(f"[AUTONOMOUS] Learned from trade {trade_id}: {symbol} {'WIN' if pnl > 0 else 'LOSS'}")
-        except Exception as e:
-            logger.debug(f"Autonomous learning update failed for trade {trade_id}: {e}")
+        except Exception:
+            # Bumped from logger.debug -> logger.exception (Phase C). Same
+            # latent-bug story as the adaptive hook above: silent
+            # NameError / shape mismatch here means autonomous fingerprints
+            # never accumulate. We still don't raise — the trade closes
+            # regardless of whether learning succeeds — but the operator
+            # now sees the failure live in the console.
+            logger.exception("[AUTONOMOUS] Learning update failed for trade %s", trade_id)
 
         # Notify the Daily Mission Controller of the outcome so it can advance
         # its state machine: update daily P&L, trip the loss-streak counter,
@@ -297,19 +309,22 @@ class PaperTradingEngine:
         try:
             from risk.daily_mission_controller import get_mission_controller, TradeResult
             mission = get_mission_controller()
+            # Strategy-name parsing from the free-text notes field is
+            # genuinely best-effort. If the format changes or notes is
+            # empty, we fall through with strategy_name="" and the mission
+            # controller buckets the trade as "unknown". No trade
+            # information is lost — the close still happens regardless.
+            from utils.errors import swallow_with_reason
             strategy_name = ""
-            try:
-                # Derive strategy from the trade's stored notes: format is
-                # "bot/<source>/<strategy_type>: <rationale>". This is a string
-                # match — when notes aren't in that format we just pass "unknown"
-                # which keeps the controller's per-strategy accounting consistent.
+            with swallow_with_reason(
+                logger,
+                "strategy-name parsing from notes is opportunistic; falls back to 'unknown'",
+            ):
                 if "bot/" in trade_notes and ":" in trade_notes:
                     prefix = trade_notes.split(":", 1)[0]   # "bot/<source>/<strategy_type>"
                     parts = prefix.split("/")
                     if len(parts) >= 3:
                         strategy_name = parts[2]
-            except Exception:
-                pass
             mission.record_trade_result(TradeResult(
                 symbol=symbol,
                 strategy=strategy_name or "unknown",
@@ -317,8 +332,13 @@ class PaperTradingEngine:
                 fees=0.0,  # fees are already netted into realized_pnl on the close
                 notional=float(entry_price) * float(qty),
             ))
-        except Exception as e:
-            logger.debug(f"Mission-controller record_trade_result failed for trade {trade_id}: {e}")
+        except Exception:
+            # Bumped from logger.debug -> logger.exception (Phase C).
+            # The mission controller is the boss layer over future trades;
+            # if it silently fails to record an outcome the next mode
+            # transition is based on stale data. Operator must see this
+            # in the console rather than have to dig in debug logs.
+            logger.exception("[MISSION] record_trade_result failed for trade %s", trade_id)
 
         return {"ok": True, "pnl": round(pnl, 2), "exit_reason": exit_reason}
     

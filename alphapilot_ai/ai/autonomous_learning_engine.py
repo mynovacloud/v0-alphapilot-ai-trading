@@ -476,8 +476,14 @@ class AutonomousLearningEngine:
             self._loaded = True
             logger.info(f"[AUTONOMOUS] Loaded {len(self._patterns)} patterns, "
                        f"{len(self._mistakes)} mistakes, {len(self._symbols)} symbols")
-        except Exception as e:
-            logger.error(f"[AUTONOMOUS] Failed to load memory: {e}")
+        except Exception:
+            # Boot-path failure: persistence is corrupt / DB is unavailable.
+            # We log with full traceback (the old code lost it) and continue
+            # with empty in-memory state. Crashing here would take down the
+            # whole singleton and break trading; the operator needs to see
+            # the engine forgot everything, not have the bot die. Surfaced
+            # at ERROR so it stands out in the console.
+            logger.exception("[AUTONOMOUS] Failed to load memory — engine starts empty")
             self._loaded = True  # Prevent retry loops
     
     def _persist(self):
@@ -501,8 +507,13 @@ class AutonomousLearningEngine:
                                    json.dumps(self._trade_vectors[-1000:]))
                 
                 s.commit()
-        except Exception as e:
-            logger.error(f"[AUTONOMOUS] Failed to persist memory: {e}")
+        except Exception:
+            # Persistence failure: learning that happened this tick is lost
+            # on next restart. Bumped from logger.error (no traceback) to
+            # logger.exception so the operator can SEE which table or which
+            # serialization step blew up. We still don't raise — the trade
+            # path must continue even if learning storage is broken.
+            logger.exception("[AUTONOMOUS] Failed to persist memory — learning this tick is lost")
     
     def _upsert_memory(self, session, category: str, content: str):
         """Insert or update a memory row."""
@@ -597,7 +608,8 @@ class AutonomousLearningEngine:
         # autonomous fingerprints are actually accumulating — which is exactly
         # the visibility they need to verify the loop is closing. Wrapped so
         # an audit-log failure can never break the learn path.
-        try:
+        from utils.errors import swallow_with_reason
+        with swallow_with_reason(logger, "autonomous-learn audit log is best-effort; trade learning still occurred"):
             with session_scope() as s:
                 s.add(ActivityLog(
                     category="ai",
@@ -609,8 +621,6 @@ class AutonomousLearningEngine:
                         f"wr={pattern.win_rate:.0%} ev={pattern.expectancy:+.2%}"
                     ),
                 ))
-        except Exception:
-            logger.debug("Failed to write autonomous-learn ActivityLog", exc_info=True)
     
     def _record_mistake(self, fingerprint: str, pnl_pct: float, 
                         context: TradeContext, exit_reason: str):
@@ -725,9 +735,21 @@ class AutonomousLearningEngine:
                 if trade and trade.opened_at:
                     context.hour_utc = trade.opened_at.hour
                     context.day_of_week = trade.opened_at.weekday()
-        except Exception as e:
-            logger.debug(f"[AUTONOMOUS] Failed to build context: {e}")
-        
+        except Exception:
+            # This swallow used to hide the metadata-vs-indicators bug for
+            # weeks: every learn-time context build silently fell back to
+            # defaults (rsi=50, regime=UNKNOWN) and the autonomous engine
+            # learned from collapsed fingerprints. Bumped from logger.debug
+            # (invisible) to logger.exception so any future shape mismatch
+            # or schema drift shows a stack trace in the console
+            # immediately. We still degrade to default-context return
+            # because crashing the learn path on close is worse than
+            # learning a less-accurate fingerprint.
+            logger.exception(
+                "[AUTONOMOUS] _build_context_from_trade failed for trade %s — "
+                "fingerprint will be degenerate", trade_id,
+            )
+
         return context
     
     # =========================================================================
@@ -956,12 +978,18 @@ class AutonomousLearningEngine:
 
         # Calculate distances to all stored vectors. Each stored entry may be
         # either a tuple or a JSON-loaded list (json.loads turns tuples into
-        # lists), so we unpack defensively.
+        # lists), so we unpack defensively. A single malformed historical row
+        # must not poison the entire result — any entry whose shape we can't
+        # trust gets skipped, valid ones still returned.
         distances = []
         for entry in self._trade_vectors:
             try:
                 stored_vector, pnl, fp = entry[0], entry[1], entry[2]
             except (TypeError, IndexError, ValueError):
+                continue
+            # Vector must be a list/tuple of numbers — _euclidean_distance
+            # crashes if it's None or a scalar.
+            if not isinstance(stored_vector, (list, tuple)):
                 continue
             try:
                 pnl = float(pnl)
@@ -1101,6 +1129,174 @@ def get_autonomous_engine() -> AutonomousLearningEngine:
     if _engine is None:
         _engine = AutonomousLearningEngine()
     return _engine
+
+
+# =============================================================================
+# Calibrated win probability — three-tier estimator
+# =============================================================================
+# The single biggest piece of structural debt in the project was using
+# `confidence` as a stand-in for "probability this trade wins". Confidence
+# is a quality signal, not a calibrated probability. Meanwhile, the
+# autonomous engine has been accumulating real (fingerprint -> win_rate,
+# expectancy, sample_size) data on every closed trade. This block exposes
+# that data as the calibrated input the rest of the pipeline should be
+# using instead of a confidence guess.
+#
+# Three tiers, picked best-available:
+#   1. EXACT_PATTERN  - this exact fingerprint has been seen ≥ MIN_EXACT
+#                       times. Use its measured win_rate. Most reliable
+#                       when it applies because the pattern matches by
+#                       construction.
+#   2. KNN_NEIGHBORS  - no exact pattern, but ≥ MIN_KNN similar trades by
+#                       Euclidean distance on the context vector. Use
+#                       their average outcome.
+#   3. RAW_CONFIDENCE - no historical data of either kind. Fall back to
+#                       the caller's confidence as the only signal we have.
+#
+# Callers receive a small dict so they can decide how much to trust the
+# estimate (sample_size, source) instead of just a number.
+
+# Minimum sample sizes for each tier to "count". Conservative because
+# the cost of an over-confident edge estimate is real money; the cost of
+# falling back to raw confidence is just preserving today's behavior.
+MIN_EXACT_PATTERN_TRADES = 5
+MIN_KNN_NEIGHBORS = 5
+
+
+def get_pattern_stats(fingerprint: str) -> Optional[Dict[str, Any]]:
+    """Return measured stats for an exact pattern fingerprint, or None if
+    we don't yet have enough data on it.
+
+    Threshold: needs at least MIN_EXACT_PATTERN_TRADES closed trades on
+    this fingerprint before the win_rate is considered usable. Below that
+    threshold the autonomous engine's win_rate is just noise around the
+    0.5 default and would be a worse estimator than confidence.
+    """
+    engine = get_autonomous_engine()
+    engine._ensure_loaded()
+    pattern = engine._patterns.get(fingerprint)
+    if pattern is None or pattern.total_trades < MIN_EXACT_PATTERN_TRADES:
+        return None
+    return {
+        "win_rate": float(pattern.win_rate),
+        "sample_size": int(pattern.total_trades),
+        "expectancy": float(pattern.expectancy),
+        "avg_win": float(pattern.avg_win),
+        "avg_loss": float(pattern.avg_loss),
+        "profit_factor": float(pattern.profit_factor),
+    }
+
+
+def get_calibrated_win_probability(
+    context: "TradeContext",
+    fallback_confidence: float,
+) -> Dict[str, Any]:
+    """Return the best-available win-probability estimate for a context.
+
+    This is the function bot_engine._compute_mission_inputs and the
+    position sizer should call instead of using raw confidence as a
+    win-probability proxy.
+
+    Always returns a dict with these keys (never None) so callers don't
+    branch on null:
+      - win_probability  (float, 0..1) — the estimator's best guess
+      - sample_size      (int)         — how many trades back it
+      - source           (str)         — "exact_pattern" | "knn_neighbors"
+                                          | "raw_confidence"
+      - confidence_in_estimate (float) — meta-confidence; raises as the
+                                          sample size grows. Use this to
+                                          decide whether to BLEND with
+                                          confidence or trust outright.
+
+    Resolution order:
+      1. EXACT_PATTERN if context.to_fingerprint() has ≥ MIN_EXACT trades.
+      2. KNN_NEIGHBORS if at least MIN_KNN similar historical trades exist.
+      3. RAW_CONFIDENCE fallback otherwise.
+
+    The fallback never throws. If anything in the lookup chain fails the
+    function still returns a sane raw_confidence dict.
+    """
+    fp_clamped = max(0.0, min(1.0, float(fallback_confidence)))
+
+    # Labeled swallow: if the caller hands us a broken context we degrade
+    # to raw-confidence rather than blocking the trade. Calibration is
+    # additive — without it the system trades exactly the way it did
+    # pre-Phase-B.
+    from utils.errors import swallow_with_reason
+    fingerprint = None
+    with swallow_with_reason(
+        logger,
+        "calibration falls back to raw_confidence when context.to_fingerprint() raises",
+    ):
+        fingerprint = context.to_fingerprint()
+    if fingerprint is None:
+        return _raw_confidence_estimate(fp_clamped)
+
+    # Tier 1: exact pattern match
+    stats = get_pattern_stats(fingerprint)
+    if stats is not None:
+        # confidence_in_estimate: rises from ~0 at MIN_EXACT trades to ~0.95
+        # asymptotically as samples grow. Bayesian-ish shrinkage toward a
+        # neutral prior — at 5 trades we only half-trust it, at 25 we trust
+        # it strongly. The shape doesn't matter much; what matters is that
+        # callers can blend with confidence when the sample is small.
+        n = stats["sample_size"]
+        meta_conf = n / (n + 8.0)  # n=5 -> 0.38, n=12 -> 0.6, n=25 -> 0.76
+        return {
+            "win_probability": stats["win_rate"],
+            "sample_size": n,
+            "source": "exact_pattern",
+            "confidence_in_estimate": round(meta_conf, 3),
+            "expectancy": stats["expectancy"],
+            "avg_win": stats["avg_win"],
+            "avg_loss": stats["avg_loss"],
+        }
+
+    # Tier 2: kNN of similar trades
+    engine = get_autonomous_engine()
+    neighbors: list = []
+    with swallow_with_reason(
+        logger,
+        "calibration kNN lookup is best-effort; falls through to raw_confidence on failure",
+    ):
+        engine._ensure_loaded()
+        neighbors = engine._find_similar_trades(context, k=20)
+
+    if neighbors and len(neighbors) >= MIN_KNN_NEIGHBORS:
+        wins = sum(1 for pnl, _fp in neighbors if pnl > 0)
+        wr = wins / len(neighbors)
+        avg_pnl = sum(pnl for pnl, _fp in neighbors) / len(neighbors)
+        n = len(neighbors)
+        # kNN is noisier than exact pattern — discount its meta-confidence
+        # more aggressively.
+        meta_conf = n / (n + 20.0)  # n=5 -> 0.20, n=20 -> 0.50
+        return {
+            "win_probability": wr,
+            "sample_size": n,
+            "source": "knn_neighbors",
+            "confidence_in_estimate": round(meta_conf, 3),
+            "expectancy": avg_pnl,
+            "avg_win": None,
+            "avg_loss": None,
+        }
+
+    # Tier 3: no historical data — caller's confidence is all we've got.
+    return _raw_confidence_estimate(fp_clamped)
+
+
+def _raw_confidence_estimate(confidence: float) -> Dict[str, Any]:
+    """The pure-fallback shape: caller's confidence is treated as a
+    win-probability guess. confidence_in_estimate is fixed low so
+    callers know to apply heavy risk discounts."""
+    return {
+        "win_probability": confidence,
+        "sample_size": 0,
+        "source": "raw_confidence",
+        "confidence_in_estimate": 0.0,
+        "expectancy": None,
+        "avg_win": None,
+        "avg_loss": None,
+    }
 
 
 def learn_from_closed_trade(
