@@ -7,7 +7,7 @@ logic that decides EDGE FOUND vs NO EDGE.
 """
 from __future__ import annotations
 
-from signal_edge import measure, summarize, _signed_bps, _Sample
+from signal_edge import measure, summarize, alpha_report, _signed_bps, _Sample
 
 
 def _candle(t: int, close: float, vol: float = 1000.0) -> dict:
@@ -98,3 +98,49 @@ def test_summarize_flags_weak_edge_eaten_by_cost():
         samples.append(_Sample("SELL", 0.7, {15: -0.0010 + noise}))
     report = summarize(samples, (15,), cost_bps=30.0)
     assert "WEAK EDGE" in report
+
+
+# --------------------------------------------------------------------------
+# alpha_report() — does the BUY signal beat buy-and-hold?
+# --------------------------------------------------------------------------
+
+def test_alpha_report_confirms_when_buy_beats_hold():
+    # 1800 ~flat non-BUY bars, 200 BUY bars at ~+100 bps -> BUY clearly
+    # picks better-than-average moments, beating hold even after the fee.
+    samples = []
+    for i in range(1800):
+        n = 0.0005 if i % 2 == 0 else -0.0005
+        samples.append(_Sample("HOLD", 0.2, {15: n}))
+    for i in range(200):
+        n = 0.002 if i % 2 == 0 else -0.002
+        samples.append(_Sample("BUY", 0.75, {15: 0.010 + n}))
+    report = alpha_report(samples, (15,), cost_bps=30.0)
+    assert "TIMING ALPHA CONFIRMED" in report
+
+
+def test_alpha_report_no_alpha_when_buy_matches_market():
+    # BUY bars are drawn from the same distribution as every other bar:
+    # the signal picks no better moment than holding does.
+    samples = []
+    for i in range(1000):
+        n = 0.002 if i % 2 == 0 else -0.002
+        samples.append(_Sample("HOLD", 0.2, {15: 0.0003 + n}))
+    for i in range(1000):
+        n = 0.002 if i % 2 == 0 else -0.002
+        samples.append(_Sample("BUY", 0.75, {15: 0.0003 + n}))
+    report = alpha_report(samples, (15,), cost_bps=30.0)
+    assert "NO TIMING ALPHA" in report
+
+
+def test_alpha_report_marginal_when_alpha_below_cost():
+    # BUY bars beat the market (~20 vs ~5 bps) with significance, but the
+    # ~15 bps gap is smaller than the 30 bps round-trip fee.
+    samples = []
+    for i in range(1000):
+        n = 0.002 if i % 2 == 0 else -0.002
+        samples.append(_Sample("HOLD", 0.2, {15: 0.0005 + n}))
+    for i in range(1000):
+        n = 0.002 if i % 2 == 0 else -0.002
+        samples.append(_Sample("BUY", 0.75, {15: 0.0020 + n}))
+    report = alpha_report(samples, (15,), cost_bps=30.0)
+    assert "MARGINAL" in report

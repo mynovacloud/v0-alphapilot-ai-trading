@@ -26,18 +26,22 @@ runs):
 from __future__ import annotations
 
 import argparse
+import datetime
 import statistics
 import sys
 import time
 from dataclasses import dataclass, field
 
+import httpx
+
 # Repo root is this file's directory; make intra-package imports resolve
 # whether run as `python signal_edge.py` or `python -m signal_edge`.
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
-from connectors.candles import get_candles
 from connectors.universe import _LIQUID_UNIVERSE
 from trading.strategy_engine import _STRATEGY_REGISTRY
+
+_COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/{pid}/candles"
 
 WARMUP_BARS = 40            # bars the indicators need before a signal is meaningful
 DEFAULT_HORIZONS = (5, 15, 30, 60)   # forward-return horizons, in bars
@@ -250,22 +254,166 @@ def summarize(
     return "\n".join(out)
 
 
-def _fetch(symbols, granularity: int, limit: int) -> dict[str, list[dict]]:
-    """Pull candles for each symbol; tolerate per-symbol failures."""
+def alpha_report(
+    samples: list[_Sample],
+    horizons: tuple[int, ...],
+    cost_bps: float,
+) -> str:
+    """Does acting on BUY signals beat just holding the coins?
+
+    The honest test for a long-only bot is not "do BUY signals make
+    money" (in an up-drifting market almost anything long does) — it is
+    "do BUY signals make MORE money than being in the market at a random
+    moment". That gap is timing alpha.
+
+      buy&hold  = mean forward return over EVERY bar (the unconditional
+                  experience of someone simply holding)
+      BUY       = mean forward return on bars the signal said BUY
+      alpha     = BUY - buy&hold
+      net alpha = (BUY - cost) - buy&hold   — the signal pays a fee on
+                  every trade; the holder does not.
+
+    If net alpha is not clearly positive, the signal's timing earns
+    nothing and the bot is just fee drag on top of buy-and-hold.
+    """
+    out: list[str] = []
+    out.append("=" * 72)
+    out.append("ALPHA REPORT — does the BUY signal beat buy-and-hold?")
+    out.append("=" * 72)
+    buys = [s for s in samples if s.side == "BUY"]
+    out.append(f"BUY signals: {len(buys):,} of {len(samples):,} bars evaluated")
+    if not buys or not samples:
+        out.append("Not enough data to measure timing alpha.")
+        return "\n".join(out)
+    out.append(f"Round-trip cost: {cost_bps:.0f} bps "
+               f"(buy-and-hold pays this once; the signal pays it every trade)")
+    out.append("")
+    out.append(f"{'horizon':>8} {'buy&hold':>10} {'BUY signal':>11} "
+               f"{'alpha':>9} {'net alpha':>10} {'t-stat':>8}")
+    out.append("-" * 72)
+
+    best = None  # (net_alpha, horizon, t)
+    for h in horizons:
+        all_r = [s.fwd[h] * 10_000.0 for s in samples if h in s.fwd]
+        buy_r = [s.fwd[h] * 10_000.0 for s in buys if h in s.fwd]
+        if not all_r or not buy_r:
+            continue
+        hold_mean = statistics.mean(all_r)
+        buy_mean = statistics.mean(buy_r)
+        alpha = buy_mean - hold_mean
+        net_alpha = (buy_mean - cost_bps) - hold_mean
+        if len(buy_r) >= 2 and statistics.pstdev(buy_r) > 0:
+            t = (buy_mean - hold_mean) / (statistics.pstdev(buy_r) / (len(buy_r) ** 0.5))
+        else:
+            t = 0.0
+        if best is None or net_alpha > best[0]:
+            best = (net_alpha, h, t)
+        out.append(f"{h:>6}b  {hold_mean:>+9.1f} {buy_mean:>+10.1f} "
+                   f"{alpha:>+8.1f} {net_alpha:>+9.1f} {t:>+8.2f}")
+
+    if best is not None:
+        _, h, _ = best
+        out.append("")
+        out.append(f"BUY-SIGNAL ALPHA BY CONFIDENCE  @ {h}-bar horizon")
+        out.append("-" * 72)
+        out.append(f"{'conf bucket':>14} {'n':>8} {'net alpha bps':>15}")
+        hold_mean_h = statistics.mean([s.fwd[h] * 10_000.0 for s in samples if h in s.fwd])
+        for lo, hi in ((0.0, 0.60), (0.60, 0.70), (0.70, 0.80), (0.80, 1.01)):
+            bucket = [s.fwd[h] * 10_000.0 for s in buys
+                      if h in s.fwd and lo <= s.confidence < hi]
+            if bucket:
+                na = (statistics.mean(bucket) - cost_bps) - hold_mean_h
+                out.append(f"  [{lo:.2f},{hi:.2f}) {len(bucket):>8,} {na:>+14.1f}")
+
+    out.append("")
+    out.append("=" * 72)
+    out.append("VERDICT")
+    out.append("=" * 72)
+    if best is None:
+        out.append("Inconclusive — not enough samples.")
+        return "\n".join(out)
+    net_alpha, h, t = best
+    if net_alpha > 0 and t >= 2.0:
+        out.append(f"TIMING ALPHA CONFIRMED: BUY signals beat buy-and-hold by "
+                   f"{net_alpha:+.1f} bps/trade net of fees at the {h}-bar horizon "
+                   f"(t={t:+.2f}).")
+        out.append("The signal's entry timing is genuinely worth something. THIS is")
+        out.append("the horizon and edge to build the bot around.")
+    elif t >= 2.0 and net_alpha <= 0:
+        out.append(f"MARGINAL: BUY signals do pick better-than-average moments "
+                   f"(t={t:+.2f}) but the {cost_bps:.0f} bps round-trip fee eats the "
+                   f"advantage (net {net_alpha:+.1f} bps).")
+        out.append("The timing has some skill but not enough to pay for itself.")
+        out.append("Cheaper execution or longer holds might rescue it; as-is it loses.")
+    else:
+        out.append(f"NO TIMING ALPHA: best horizon ({h}b) nets {net_alpha:+.1f} bps "
+                   f"vs buy-and-hold with t={t:+.2f}.")
+        out.append("The BUY signal does not pick better moments than simply holding.")
+        out.append("An autonomous bot on this signal cannot beat — and after fees")
+        out.append("will trail — just buying the basket and sitting. The signal")
+        out.append("itself has to change, or the honest move is buy-and-hold.")
+    return "\n".join(out)
+
+
+def _fetch_extended(product_id: str, granularity: int, target_bars: int) -> list[dict]:
+    """Paginate Coinbase's candle endpoint backward in time.
+
+    The public endpoint returns at most 300 candles per request, so a
+    longer history needs several windowed requests walking into the
+    past. Returns candles oldest -> newest, deduped by timestamp.
+    """
+    by_time: dict[int, dict] = {}
+    end = time.time()
+    span = 300 * granularity
+    max_requests = (target_bars // 300) + 2
+    for _ in range(max_requests):
+        if len(by_time) >= target_bars:
+            break
+        start = end - span
+        try:
+            with httpx.Client(timeout=20.0) as c:
+                r = c.get(
+                    _COINBASE_CANDLES.format(pid=product_id),
+                    params={
+                        "granularity": granularity,
+                        "start": datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat(),
+                        "end": datetime.datetime.fromtimestamp(end, datetime.timezone.utc).isoformat(),
+                    },
+                )
+                r.raise_for_status()
+                rows = r.json()
+        except Exception:
+            break
+        if not rows:
+            break
+        for row in rows:  # [time, low, high, open, close, volume]
+            t = int(row[0])
+            by_time[t] = {
+                "time": t, "low": float(row[1]), "high": float(row[2]),
+                "open": float(row[3]), "close": float(row[4]), "volume": float(row[5]),
+            }
+        end = start
+        time.sleep(0.12)   # ~8 req/s — under the public-endpoint limit
+    return [by_time[t] for t in sorted(by_time)]
+
+
+def _fetch(symbols, granularity: int, target_bars: int) -> dict[str, list[dict]]:
+    """Pull deep candle history for each symbol; tolerate per-symbol failures."""
     series: dict[str, list[dict]] = {}
+    need = WARMUP_BARS + max(DEFAULT_HORIZONS) + 1
     ok = fail = 0
     for sym in symbols:
         try:
-            candles = get_candles(sym, granularity=granularity, limit=limit)
+            candles = _fetch_extended(sym, granularity, target_bars)
         except Exception:
             candles = []
-        if len(candles) >= WARMUP_BARS + max(DEFAULT_HORIZONS) + 1:
+        if len(candles) >= need:
             series[sym] = candles
             ok += 1
         else:
             fail += 1
-        time.sleep(0.15)   # be polite to the public endpoint (429 guard)
-    print(f"  fetched candles for {ok} symbols ({fail} skipped — no/insufficient data)")
+    total = sum(len(c) for c in series.values())
+    print(f"  fetched {total:,} candles across {ok} symbols ({fail} skipped — no/insufficient data)")
     return series
 
 
@@ -275,21 +423,29 @@ def main(argv: list[str] | None = None) -> int:
                    help=f"one of {sorted(_STRATEGY_REGISTRY)}")
     p.add_argument("--granularity", type=int, default=60,
                    help="candle size in seconds (60 = what the live bot trades)")
-    p.add_argument("--limit", type=int, default=300, help="candles per symbol (Coinbase caps ~300)")
+    p.add_argument("--bars", type=int, default=2400,
+                   help="target candles per symbol (paginated, ~300 per request)")
     p.add_argument("--cost-bps", type=float, default=30.0,
                    help="round-trip fee+slippage in bps (paper engine models ~30)")
     args = p.parse_args(argv)
 
     horizons = DEFAULT_HORIZONS
     print(f"Signal-edge harness — strategy={args.strategy!r}, granularity={args.granularity}s, "
-          f"horizons={horizons} bars")
-    print(f"Fetching candles for {len(_LIQUID_UNIVERSE)} liquid symbols...")
-    series = _fetch(_LIQUID_UNIVERSE, args.granularity, args.limit)
+          f"target {args.bars} bars/symbol, horizons={horizons}")
+    print(f"Fetching deep candle history for {len(_LIQUID_UNIVERSE)} liquid symbols "
+          f"(paginated — takes a few minutes)...")
+    series = _fetch(_LIQUID_UNIVERSE, args.granularity, args.bars)
     if not series:
         print("ERROR: no candle data fetched. Is this machine able to reach Coinbase?")
         return 1
+    spans = [c[-1]["time"] - c[0]["time"] for c in series.values() if len(c) > 1]
+    if spans:
+        hrs = statistics.median(spans) / 3600.0
+        print(f"  median history per symbol: {hrs:.1f}h ({hrs / 24:.1f} days)")
     print("Evaluating the real signal at every bar...")
     samples = measure(series, args.strategy, horizons)
+    print("")
+    print(alpha_report(samples, horizons, args.cost_bps))
     print("")
     print(summarize(samples, horizons, args.cost_bps))
     return 0
