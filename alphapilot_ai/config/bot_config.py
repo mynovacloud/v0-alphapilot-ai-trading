@@ -28,6 +28,10 @@ DEFAULTS: dict[str, str] = {
     # thresholds are. See trading/holding_profiles.py for the profiles.
     # One of: scalp | short_hold | short_swing | long_hold | mixed | ai_decide
     "bot_holding_mode": "mixed",
+    # Long-only: never open short positions. Default ON — the signal-edge
+    # harness measured SELL signals at -127 to -196 bps forward return,
+    # and a spot account cannot really short anyway.
+    "bot_long_only": "true",
     # Aggressive trading settings
     "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
     "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+
@@ -74,6 +78,7 @@ class BotConfig:
     max_open_per_wallet: int
     dry_run: bool
     holding_mode: str
+    long_only: bool
     # Aggressive trading settings
     auto_dca_enabled: bool
     auto_dca_threshold_pct: float
@@ -95,6 +100,7 @@ class BotConfig:
             max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 25))),
             dry_run=_b(raw.get("bot_dry_run"), default=False),
             holding_mode=_holding_mode(raw.get("bot_holding_mode")),
+            long_only=_b(raw.get("bot_long_only"), default=True),
             # Aggressive trading
             auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
             auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),

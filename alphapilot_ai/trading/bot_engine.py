@@ -685,7 +685,24 @@ class BotEngine:
 
             if side not in {"BUY", "SELL"}:
                 continue
-            
+
+            # ---- Long-only policy --------------------------------------------
+            # The signal-edge harness measured every strategy's SELL signals
+            # at -127 to -196 bps forward return: shorting an asset class
+            # that structurally drifts up is a losing proposition, and on a
+            # spot account a "short" isn't even a real position. When
+            # long_only is set we never OPEN a short; SELL exits of existing
+            # longs are still handled by the position monitor.
+            if cfg.long_only and side == "SELL":
+                self._log(
+                    "bot",
+                    f"[LONG_ONLY] {symbol} SELL skipped — short entries disabled",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+                result.skipped += 1
+                continue
+
             # ---- Risk gating -------------------------------------------------
             # Two layers gate every entry:
             #
