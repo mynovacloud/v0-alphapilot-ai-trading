@@ -1510,13 +1510,27 @@ def training_session_start(
                         w.meta = {}
                     w.meta["_session_prev_max_open"] = w.max_open_positions
                     w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                    w.meta["_session_prev_max_daily_trades"] = w.max_daily_trades
                     w.meta["_session_prev_trading_style"] = getattr(w, "trading_style", None)
                 except Exception:
                     # meta column may not exist in older schema - skip the backup
                     pass
                 # Apply session settings to wallet
                 w.max_open_positions = max_open
-                w.max_position_usd = pos_usd
+                # The wallet hard cap must sit ABOVE the per-trade size, not
+                # equal to it. The position sizer targets pos_usd and scales
+                # up on high conviction; a cap == pos_usd then rejects nearly
+                # every trade ("Notional $750 > cap $750", code
+                # wallet_position_cap) on conviction boosts and float
+                # rounding alone. 2x keeps a real safety rail with room for
+                # the sizer to work.
+                w.max_position_usd = pos_usd * 2.0
+                # A training session exists to generate many trades to learn
+                # from; the default 10-trades/day cap (code wallet_daily_count)
+                # chokes it within the first minute at a 7s tick. 0 disables
+                # the daily-count gate entirely for the duration of the
+                # session (RiskManager skips the check when it is falsy).
+                w.max_daily_trades = 0
                 w.bot_paused = False  # Unpause all wallets for training
                 # Force the trading style for the duration of the session so the
                 # autonomous engine and exit loop both honor what the user picked
@@ -1526,7 +1540,7 @@ def training_session_start(
                     w.trading_style = style
                 except Exception:
                     pass
-            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}, trading_style={style}")
+            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, position_size=${pos_usd}, max_position_usd=${pos_usd * 2.0}, max_daily_trades=0 (unlimited), trading_style={style}")
 
         bot_scheduler.reload()  # pick up the new tick interval
 
@@ -1865,6 +1879,9 @@ def training_session_stop() -> JSONResponse:
                         # Clean up the temporary keys
                         w.meta.pop("_session_prev_max_open", None)
                         w.meta.pop("_session_prev_max_position_usd", None)
+                    if w.meta and "_session_prev_max_daily_trades" in w.meta:
+                        w.max_daily_trades = w.meta.get("_session_prev_max_daily_trades")
+                        w.meta.pop("_session_prev_max_daily_trades", None)
                     if w.meta and "_session_prev_trading_style" in w.meta:
                         prev_style = w.meta.get("_session_prev_trading_style")
                         if prev_style:
