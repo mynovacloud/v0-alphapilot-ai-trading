@@ -1,21 +1,27 @@
 """
 Universe builder.
 
-Decides which symbols the bot evaluates each tick. The user chose
-"All Coinbase USD pairs", so we hit Coinbase's public products endpoint,
-filter to spot USD pairs that aren't disabled / view-only, and return the
-list ranked by 24h volume so most-liquid pairs go first.
+Decides which symbols the bot evaluates each tick. We hit Coinbase's
+public products endpoint, filter to spot USD pairs that are currently
+tradable, and — by default — restrict the result to a curated set of
+liquid majors.
 
-Filters:
-  - quote_currency == 'USD'
+Why curated-liquid by default
+-----------------------------
+Coinbase lists 300+ USD pairs, most of them thin micro-caps. The bot
+has no edge there: fees + slippage swamp any small move, and the learned
+playbook is full of rules to that effect ("micro-price assets", "fees +
+slippage consumed the whole loss"). Worse, the old builder appended
+every non-priority symbol ALPHABETICALLY, so a limit of 200 pulled in
+`00-USD`, `A8-USD`, `BOBBOB-USD`, `DOOD-USD` — junk the bot then traded
+and lost on. Restricting to the curated list keeps the bot on names
+where a technical signal can actually resolve into a fill at a fair
+price. Pass `liquid_only=False` to get the full tradable list back.
+
+Filters (always applied):
+  - quote currency == 'USD'
   - status == 'online'
-  - trading_disabled == False
-  - is_disabled == False
-  - cancel_only == False
-  - limit_only == False
-  - post_only == False
-
-Cached for 10 minutes; the universe doesn't change minute-to-minute.
+  - not trading_disabled / cancel_only / limit_only / post_only / auction
 """
 from __future__ import annotations
 
@@ -31,36 +37,65 @@ logger = get_logger(__name__)
 _CACHE: dict[str, tuple[list[dict[str, Any]], float]] = {}
 _CACHE_TTL = 600.0  # 10 minutes
 
+# Curated liquid universe. This is the bot's tradable set when
+# `liquid_only` is True (the default). Ordered loosely by tier so the
+# most-liquid names are evaluated first within a tick's budget. A symbol
+# that has since been delisted simply drops out — it won't survive the
+# intersection with Coinbase's live `online` product list.
+_LIQUID_UNIVERSE: tuple[str, ...] = (
+    # Top tier — highest liquidity
+    "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD",
+    # Layer 1s
+    "AVAX-USD", "DOT-USD", "ATOM-USD", "NEAR-USD", "APT-USD", "SUI-USD",
+    "TON-USD", "TRX-USD", "HBAR-USD", "ALGO-USD", "ICP-USD",
+    # Layer 2s & scaling
+    "ARB-USD", "OP-USD", "IMX-USD", "STRK-USD",
+    # DeFi
+    "LINK-USD", "UNI-USD", "AAVE-USD", "MKR-USD", "CRV-USD", "LDO-USD",
+    "SNX-USD", "COMP-USD", "SUSHI-USD", "1INCH-USD", "BAL-USD", "YFI-USD",
+    # Memecoins (high volatility)
+    "SHIB-USD", "PEPE-USD", "BONK-USD", "WIF-USD", "FLOKI-USD",
+    # Infrastructure
+    "FIL-USD", "AR-USD", "RENDER-USD", "GRT-USD",
+    # Gaming & metaverse
+    "AXS-USD", "SAND-USD", "MANA-USD", "GALA-USD",
+    # Majors / store-of-value
+    "BCH-USD", "LTC-USD", "ETC-USD", "XLM-USD", "VET-USD",
+    # AI
+    "FET-USD", "TAO-USD",
+    # Misc high-volume
+    "INJ-USD", "SEI-USD", "TIA-USD", "PYTH-USD", "JTO-USD", "JUP-USD",
+)
+_PRIORITY_INDEX: dict[str, int] = {sym: i for i, sym in enumerate(_LIQUID_UNIVERSE)}
 
-def _is_tradable(p: dict[str, Any]) -> bool:
-    """All disabled flags must be False, status online, quote currency USD."""
-    if (p.get("quote_currency_id") or "").upper() != "USD":
-        return False
-    if (p.get("status") or "").lower() != "online":
-        return False
-    for flag in ("trading_disabled", "is_disabled", "cancel_only", "limit_only", "post_only"):
-        if p.get(flag):
-            return False
-    return True
+
+def _rank(rows: list[dict[str, Any]], limit: int, liquid_only: bool) -> list[dict[str, Any]]:
+    """Filter to the liquid set (if requested), order by priority, cap at limit."""
+    if liquid_only:
+        rows = [r for r in rows if r["product_id"] in _PRIORITY_INDEX]
+    rows = sorted(rows, key=lambda r: (_PRIORITY_INDEX.get(r["product_id"], 999), r["product_id"]))
+    return rows[:limit]
 
 
-def coinbase_usd_universe(limit: int = 50) -> list[dict[str, Any]]:
+def coinbase_usd_universe(limit: int = 50, *, liquid_only: bool = True) -> list[dict[str, Any]]:
     """
-    Pull all SPOT USD-quoted pairs from Coinbase that are currently tradable.
-    Returned sorted by 24h volume desc. Each entry:
+    Pull SPOT USD-quoted pairs from Coinbase that are currently tradable.
+
+    With `liquid_only=True` (default) the result is restricted to the
+    curated `_LIQUID_UNIVERSE`; `limit` then acts as a cap, not a target.
+    Each entry:
         {
           "product_id": "BTC-USD",
           "base": "BTC",
           "quote": "USD",
-          "price": 67000.0,
-          "volume_24h": 1234567.0,
-          "price_change_24h_pct": 0.012,
+          "price": 0.0,        # live price is fetched per-symbol each tick
+          "volume_24h": 0.0,
         }
     """
     cached = _CACHE.get("coinbase_usd")
     now = time.time()
     if cached and (now - cached[1]) < _CACHE_TTL:
-        return cached[0][:limit]
+        return _rank(cached[0], limit, liquid_only)
 
     url = "https://api.exchange.coinbase.com/products"
     try:
@@ -70,10 +105,9 @@ def coinbase_usd_universe(limit: int = 50) -> list[dict[str, Any]]:
             products = r.json()
     except Exception as e:
         logger.warning("Failed to fetch Coinbase universe: %s", e)
-        return cached[0][:limit] if cached else []
+        return _rank(cached[0], limit, liquid_only) if cached else []
 
-    # The /products endpoint uses slightly different field names than the brokerage API.
-    # quote_currency / base_currency are top-level on this endpoint.
+    # The /products endpoint uses base_currency / quote_currency at top level.
     out: list[dict[str, Any]] = []
     for p in products:
         try:
@@ -88,9 +122,6 @@ def coinbase_usd_universe(limit: int = 50) -> list[dict[str, Any]]:
                     "product_id": p.get("id"),
                     "base": p.get("base_currency"),
                     "quote": p.get("quote_currency"),
-                    # Volume / price come from /stats endpoint, but to keep this fast and
-                    # rate-limit friendly we leave them as 0 here. The strategy engine pulls
-                    # live price per-symbol on each tick anyway via CoinGecko.
                     "price": 0.0,
                     "volume_24h": 0.0,
                 }
@@ -98,34 +129,10 @@ def coinbase_usd_universe(limit: int = 50) -> list[dict[str, Any]]:
         except Exception:
             continue
 
-    # Best-effort: bring well-known liquid majors to the front so the bot evaluates
-    # them first within its tick budget.
-    PRIORITY = [
-        # Top tier - highest liquidity
-        "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD",
-        # Layer 1s
-        "AVAX-USD", "DOT-USD", "ATOM-USD", "NEAR-USD", "APT-USD", "SUI-USD",
-        "TON-USD", "TRX-USD", "HBAR-USD", "ALGO-USD", "FTM-USD", "ICP-USD",
-        # Layer 2s & Scaling
-        "MATIC-USD", "ARB-USD", "OP-USD", "IMX-USD", "STRK-USD", "MANTA-USD",
-        # DeFi
-        "LINK-USD", "UNI-USD", "AAVE-USD", "MKR-USD", "CRV-USD", "LDO-USD",
-        "SNX-USD", "COMP-USD", "SUSHI-USD", "1INCH-USD", "BAL-USD", "YFI-USD",
-        # Memecoins (high volatility = scalping opportunities)
-        "SHIB-USD", "PEPE-USD", "BONK-USD", "WIF-USD", "FLOKI-USD", "MEME-USD",
-        # Infrastructure
-        "FIL-USD", "AR-USD", "RENDER-USD", "RNDR-USD", "GRT-USD", "OCEAN-USD",
-        # Gaming & Metaverse
-        "AXS-USD", "SAND-USD", "MANA-USD", "ENJ-USD", "GALA-USD", "IMX-USD",
-        # Exchange tokens
-        "BCH-USD", "LTC-USD", "ETC-USD", "XLM-USD", "VET-USD", "EGLD-USD",
-        # AI tokens
-        "FET-USD", "AGIX-USD", "RNDR-USD", "TAO-USD",
-        # Misc high-volume
-        "INJ-USD", "SEI-USD", "TIA-USD", "PYTH-USD", "JTO-USD", "JUP-USD",
-    ]
-    priority_index = {sym: i for i, sym in enumerate(PRIORITY)}
-    out.sort(key=lambda r: (priority_index.get(r["product_id"], 999), r["product_id"]))
-
     _CACHE["coinbase_usd"] = (out, now)
-    return out[:limit]
+    ranked = _rank(out, limit, liquid_only)
+    logger.info(
+        "Universe built: %d tradable USD pairs, %d after liquid filter (liquid_only=%s)",
+        len(out), len(ranked), liquid_only,
+    )
+    return ranked

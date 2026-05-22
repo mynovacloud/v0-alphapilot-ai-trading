@@ -2808,6 +2808,7 @@ def settings_bot_save(
     bot_max_open_per_wallet: str = Form("5"),
     bot_dry_run: str = Form("true"),
     bot_holding_mode: str = Form("mixed"),
+    bot_long_only: str = Form("true"),
 ) -> RedirectResponse:
     """
     Persist autonomous-bot settings and reload the scheduler so the new
@@ -2816,6 +2817,7 @@ def settings_bot_save(
     # Checkboxes only post their value when checked. Normalize.
     enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
     dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
+    long_only = "true" if str(bot_long_only).lower() in {"on", "true", "1", "yes"} else "false"
 
     # Validate the holding mode against the known set; fall back to default.
     from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
@@ -2835,6 +2837,7 @@ def settings_bot_save(
             "bot_max_open_per_wallet": str(max(1, int(float(bot_max_open_per_wallet or 5)))),
             "bot_dry_run": dry,
             "bot_holding_mode": holding_mode,
+            "bot_long_only": long_only,
         }
     )
 
