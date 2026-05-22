@@ -422,6 +422,89 @@ def _read_calibration_knobs() -> tuple[float, bool]:
 # MAIN ENTRY POINT
 # =============================================================================
 
+# Minimum number of directional confluence checks a passthrough trade must
+# pass. The bot's own playbook arrived at this independently (w2.0 rule:
+# "at least 3 of {...} must be TRUE before executing").
+_PASSTHROUGH_MIN_CONFLUENCE = 3
+
+
+def _confluence_gate(technical_signal: Signal, side: str) -> tuple[bool, str]:
+    """Deterministic multi-indicator quality gate for passthrough trades.
+
+    The training_passthrough / technical_strong paths execute a raw
+    technical signal WITHOUT Claude review. With no gate, that fired
+    textbook-bad entries — shorting RSI 28, buying RSI 83, entering on
+    0.0x volume — every one of which the learned playbook already had a
+    rule against but could not enforce (Claude, which carries the
+    playbook, is never called on the passthrough path).
+
+    This gate is the enforcement the playbook kept asking for. It uses
+    only the core indicators `_common_indicators` puts on every Signal,
+    so it works regardless of which strategy produced the signal.
+
+    Returns (passed, reason). A blocked signal is turned into a HOLD.
+    """
+    ind = technical_signal.indicators or {}
+
+    def _num(key: str, default: float) -> float:
+        try:
+            v = ind.get(key)
+            return default if v is None else float(v)
+        except (TypeError, ValueError):
+            return default
+
+    rsi = _num("rsi", 50.0)
+    macd_h = _num("macd_histogram", 0.0)
+    rel_vol = _num("relative_volume", 1.0)
+    vel3 = _num("velocity_3bar", 0.0)
+    body = _num("body_direction", 0.0)
+    cross_age = ind.get("cross_age_bars")
+
+    # ---- HARD VETOES: the egregious entries the playbook flagged repeatedly.
+    # RSI thresholds match the playbook's strongest rules ("NEVER initiate a
+    # momentum SELL when RSI < 32"; "RSI > 70 ... overbought exhaustion").
+    if side == "BUY" and rsi >= 72.0:
+        return False, f"overbought RSI {rsi:.0f} (>=72) — blow-off, not momentum"
+    if side == "SELL" and rsi <= 32.0:
+        return False, f"oversold RSI {rsi:.0f} (<=32) — exhaustion, not momentum"
+    if rel_vol <= 0.5:
+        return False, f"volume {rel_vol:.1f}x (<=0.5x) — no participation"
+    if cross_age is not None:
+        try:
+            if float(cross_age) <= 1.0:
+                return False, f"EMA cross {cross_age}b old — noise, not a cross"
+        except (TypeError, ValueError):
+            pass
+
+    # ---- CONFLUENCE: require >= N directional confirmations.
+    if side == "BUY":
+        checks = {
+            "rsi_room": rsi < 65.0,
+            "macd_up": macd_h > 0.0,
+            "volume": rel_vol >= 1.0,
+            "velocity": vel3 > 0.0,
+            "body": body > 0.0,
+        }
+    else:  # SELL
+        checks = {
+            "rsi_room": rsi > 35.0,
+            "macd_down": macd_h < 0.0,
+            "volume": rel_vol >= 1.0,
+            "velocity": vel3 < 0.0,
+            "body": body < 0.0,
+        }
+
+    passed = [name for name, ok in checks.items() if ok]
+    if len(passed) < _PASSTHROUGH_MIN_CONFLUENCE:
+        failed = [name for name, ok in checks.items() if not ok]
+        return False, (
+            f"only {len(passed)}/{len(checks)} confluence "
+            f"[{'+'.join(passed) or 'none'}], need {_PASSTHROUGH_MIN_CONFLUENCE} "
+            f"— weak on {'+'.join(failed)}"
+        )
+    return True, f"{len(passed)}/{len(checks)} confluence [{'+'.join(passed)}]"
+
+
 def decide(
     *,
     wallet: dict[str, Any],
@@ -562,8 +645,42 @@ def decide(
     # ----- Strong-signal / training passthrough --------------------------- #
     bypass_threshold = max(0.0, min(STRONG_PASSTHROUGH_FLOOR, floor)) if is_training else STRONG_PASSTHROUGH_FLOOR
     if side in {"BUY", "SELL"} and tech_conf >= bypass_threshold:
+        # Quality gate. The passthrough executes a raw technical signal
+        # without Claude review; the gate is what stops it from firing the
+        # textbook-bad entries (oversold shorts, overbought buys, no-volume
+        # entries) that the playbook already had rules against but could
+        # not enforce on this path. A blocked signal becomes a HOLD.
+        gate_ok, gate_reason = _confluence_gate(technical_signal, side)
+        if not gate_ok:
+            blocked = TradeDecision(
+                action="HOLD",
+                confidence=tech_conf,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"Passthrough blocked by confluence gate: {gate_reason}. "
+                    f"Raw technical signal was {side} (conf {tech_conf:.2f}) but "
+                    f"lacked the multi-indicator agreement required to execute "
+                    f"without Claude review."
+                ),
+                key_factors=["passthrough_blocked", f"side={side}"],
+                risk_flags=["weak_confluence"],
+                source="passthrough_blocked",
+            )
+            blocked.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, blocked,
+                prompt_used="", extra_context=extra_context,
+            )
+            return blocked
+
         size_mult, stop_pct, take_pct = 1.0, 0.05, 0.10
-        key_factors = [f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"]
+        key_factors = [
+            f"strategy={technical_signal.strategy}",
+            f"floor={bypass_threshold:.2f}",
+            f"gate={gate_reason}",
+        ]
         risk_flags: list[str] = []
         if adaptive_rec:
             size_mult = adaptive_rec.size_multiplier
