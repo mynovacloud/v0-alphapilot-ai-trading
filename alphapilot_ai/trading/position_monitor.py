@@ -16,19 +16,10 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Optional, List, Dict
 
 from database.db import session_scope
 from database.models import PaperTrade, ActivityLog
-from utils.helpers import utcnow
-
-# Import advanced exit manager for smarter exit decisions
-try:
-    from trading.advanced_exit_manager import get_exit_manager, ExitDecision
-    ADVANCED_EXIT_AVAILABLE = True
-except ImportError:
-    ADVANCED_EXIT_AVAILABLE = False
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
@@ -39,7 +30,7 @@ class ExitSignal:
     """Represents a position that should be closed."""
     trade_id: int
     symbol: str
-    reason: str  # "sl" / "tp" / "trailing" / "max_loss" / "time" / "scalp_profit" / "momentum_exit"
+    reason: str  # take_profit / max_loss / momentum_reversal / time_cap / stale / profit_lock_in / trailing
     current_price: float
     trigger_price: float | None
     pnl_pct: float
@@ -317,89 +308,66 @@ class PositionMonitor:
         age_minutes = time_since_minutes(trade.opened_at) if trade.opened_at else 0
 
         # =====================================================================
-        # GET WALLET SETTINGS
+        # HOLDING PROFILE — the single source of truth for this trade's exits.
+        # Resolved and stamped at entry (see trading/holding_profiles.py).
+        # Legacy trades opened before profiles existed carry no stamp; resolve
+        # one on the fly from the current global mode + the trade's confidence.
         # =====================================================================
-        from database.models import Wallet
-        wallet = session.query(Wallet).filter(Wallet.id == trade.wallet_id).first()
-        
-        # Default values if columns don't exist yet
-        trading_style = 'scalper'  # Default to scalper for aggressive trading
-        micro_target_usd = 0.25
-        min_profit_pct = 0.003
-        
-        if wallet:
-            # Read from database - use getattr for safety but log actual values
-            db_style = getattr(wallet, 'trading_style', None)
-            db_target = getattr(wallet, 'micro_profit_target_usd', None)
-            db_min_pct = getattr(wallet, 'min_profit_pct', None)
-            
-            logging.info(f"[POSITION_MONITOR] Wallet DB values: style={db_style}, target={db_target}, min_pct={db_min_pct}")
-            
-            # Apply values with fallbacks
-            trading_style = db_style if db_style else 'scalper'
-            micro_target_usd = float(db_target) if db_target is not None else 0.25
-            min_profit_pct = float(db_min_pct) if db_min_pct is not None else 0.003
-            
-            # Auto-detect scalper mode: if target is under $1, treat as scalper
-            if micro_target_usd <= 1.0 and trading_style == 'hybrid':
-                trading_style = 'scalper'
-                logging.info(f"[POSITION_MONITOR] Auto-switching to scalper mode (target=${micro_target_usd})")
-        else:
-            logging.warning(f"[POSITION_MONITOR] No wallet found for trade {trade.id}, using defaults")
+        from trading.holding_profiles import get_profile, resolve_profile_name
+        profile_name = getattr(trade, "holding_profile", None)
+        if not profile_name:
+            try:
+                from config.bot_config import BotConfig
+                profile_name = resolve_profile_name(
+                    BotConfig.load().holding_mode,
+                    float(getattr(trade, "confidence", 0.5) or 0.5),
+                )
+            except Exception:
+                profile_name = "short_swing"
+        profile = get_profile(profile_name)
+
+        logging.info(
+            f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), "
+            f"age={age_minutes:.0f}m, profile={profile.name}, momentum={momentum:.2f}"
+        )
 
         # =====================================================================
-        # ADAPTIVE PAYOFF SIZING — the structural fix.
+        # 1. TAKE PROFIT — the profile's target was reached. Best outcome.
         # =====================================================================
-        # The historical bleed was payoff 0.75 (avg win $0.80 / avg loss $1.07).
-        # Root cause: a flat $0.25 scalp target paired with a much wider stop,
-        # so even a 50% win rate would lose money. We now tier the targets by
-        # the entry confidence Claude already attached to the trade:
-        #
-        #   conf >= 0.70  → "high conviction" — let it run to Claude's full
-        #                   SL/TP from the trade record (typically 5%/10%).
-        #                   This keeps the upside Claude was reaching for.
-        #   conf >= 0.55  → "mid conviction" — widen the scalp to $target ×
-        #                   1.6 with stop at 70% of target. Payoff ≈ 2.3:1.
-        #   conf <  0.55  → "low conviction" — keep it tight. Stop at 50% of
-        #                   target. Payoff ≈ 2.0:1, but small.
-        #
-        # The crucial invariant: max_loss < target_profit, ALWAYS. That alone
-        # makes the system mathematically winnable at <50% WR.
-        entry_conf = float(getattr(trade, "confidence", 0.5) or 0.5)
-        if entry_conf >= 0.70:
-            # High-conviction: bypass scalp logic entirely, defer to Claude SL/TP.
-            high_conviction = True
-            scalp_max_loss_ratio = 0.50  # only used if we still hit the timeout path
-            scalp_target_multiplier = 1.0
-        elif entry_conf >= 0.55:
-            high_conviction = False
-            scalp_max_loss_ratio = 0.50  # max_loss = target × 0.50 → payoff 2:1
-            scalp_target_multiplier = 1.6  # widen target so we don't clip winners
-        else:
-            high_conviction = False
-            scalp_max_loss_ratio = 0.50  # max_loss = target × 0.50 → payoff 2:1
-            scalp_target_multiplier = 1.0
-
-        effective_target_usd = micro_target_usd * scalp_target_multiplier
-        
-        logging.info(f"[POSITION_MONITOR] {trade.symbol}: pnl=${pnl_usd:.2f} ({pnl_pct:.2%}), age={age_minutes:.0f}m, style={trading_style}, target=${micro_target_usd}, momentum={momentum:.2f}")
-
-        # =====================================================================
-        # SCALPER TAKE PROFIT - CHECK THIS FIRST BEFORE ANYTHING ELSE
-        # This is the HIGHEST priority exit - take the money when target is hit.
-        # `effective_target_usd` is the conviction-adjusted target, so a
-        # high-conviction trade gets to run to a bigger TP than a low-conf one.
-        # =====================================================================
-        if trading_style == "scalper" and not high_conviction and pnl_usd >= effective_target_usd:
-            logging.info(f"[SCALPER] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f} >= target ${effective_target_usd:.2f} (conf {entry_conf:.2f})")
-            self._log_exit(session, trade, "scalp_profit", current_price, pnl_pct)
+        if pnl_pct >= profile.target_pct:
+            logging.info(
+                f"[EXIT/take_profit] {trade.symbol} +{pnl_pct:.2%} >= "
+                f"target {profile.target_pct:.2%}"
+            )
+            self._log_exit(session, trade, "take_profit", current_price, pnl_pct)
             return ExitSignal(
                 trade_id=trade.id,
                 symbol=trade.symbol,
-                reason="scalp_profit",
+                reason="take_profit",
                 current_price=current_price,
                 trigger_price=None,
                 pnl_pct=pnl_pct,
+            )
+
+        # =====================================================================
+        # 2. HARD MAX LOSS — the profile's stop. Fires immediately, no grace
+        # period. There is deliberately no minimum-hold gate: the profile's
+        # max_loss_pct IS the intended risk, so honour it the instant it hits.
+        # =====================================================================
+        if pnl_pct <= -profile.max_loss_pct:
+            logging.info(
+                f"[EXIT/max_loss] {trade.symbol} {pnl_pct:.2%} <= "
+                f"-{profile.max_loss_pct:.2%}"
+            )
+            self._log_exit(session, trade, "max_loss", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="max_loss",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+                urgency="high",
             )
 
         # =====================================================================
@@ -424,109 +392,49 @@ class PositionMonitor:
             )
 
         # =====================================================================
-        # SCALPER MODE: AGGRESSIVE loss-cutting (profit-taking handled above).
-        #
-        # KEY INVARIANT: max_loss MUST be smaller than target_profit.
-        # Old code used 60% which was actually fine — but the old TARGET was
-        # only $0.25 against an unbounded SL%, so real-world losses blew
-        # through it via the time-stop and 2-min stop. We now keep the
-        # ratio (50% by default, tighter for low-conf) AND make sure the
-        # other exit paths use the same effective_target_usd.
+        # 3. HARD TIME CAP — the universal backstop. Every trade, every
+        # profile, no escape hatch. This is the rule whose ABSENCE let
+        # high-conviction trades sit dead for 40-60 minutes: previously no
+        # time limit applied to them at all.
         # =====================================================================
-        if trading_style == "scalper" and not high_conviction:
-            # Conviction-tiered max loss. With ratio=0.50 a $0.25 target
-            # caps loss at $0.125 — payoff 2:1 even before considering
-            # winners that overshoot.
-            max_loss_usd = effective_target_usd * scalp_max_loss_ratio
-            
-            # IMMEDIATE CUT: If loss exceeds max_loss threshold, exit NOW
-            # Don't wait for time - cut the loss immediately
-            if pnl_usd <= -max_loss_usd:
-                logging.info(f"[SCALPER] IMMEDIATE CUT: {trade.symbol} ${pnl_usd:.2f} <= -${max_loss_usd:.2f} threshold (conf {entry_conf:.2f})")
-                self._log_exit(session, trade, "scalp_maxloss", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_maxloss",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                    urgency="high",
-                )
-            
-            # QUICK CUT: After 2 minutes with ANY loss, exit
-            # Scalping means quick in, quick out - don't let losers run
-            if age_minutes >= 2 and pnl_usd < 0:
-                logging.info(f"[SCALPER] QUICK CUT (2m): {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
-                self._log_exit(session, trade, "scalp_stoploss", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_stoploss",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # TIME EXIT: After 5 minutes, exit if not at least 50% to target.
-            # Don't hold scalp trades hoping they'll turn around.
-            if age_minutes >= 5 and pnl_usd < (effective_target_usd * 0.5):
-                logging.info(f"[SCALPER] TIME EXIT (5m): {trade.symbol} ${pnl_usd:.2f} < 50% of target ${effective_target_usd:.2f}")
-                self._log_exit(session, trade, "scalp_timeout", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="scalp_timeout",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
+        if age_minutes >= profile.hard_cap_minutes:
+            logging.info(
+                f"[EXIT/time_cap] {trade.symbol} age {age_minutes:.0f}m >= "
+                f"cap {profile.hard_cap_minutes:.0f}m (pnl {pnl_pct:+.2%})"
+            )
+            self._log_exit(session, trade, "time_cap", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="time_cap",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+            )
 
         # =====================================================================
-        # HYBRID MODE: Balance between scalping and swing trading
+        # 4. STALE TIMEOUT — partway through the hold, if the trade has not
+        # made meaningful progress, cut it loose rather than tying up the
+        # slot. Softer than the hard cap: only fires when NOT in profit.
         # =====================================================================
-        elif trading_style == "hybrid":
-            # Take profits at target
-            if pnl_usd >= micro_target_usd or pnl_pct >= min_profit_pct:
-                logging.info(f"[HYBRID] TAKE PROFIT: {trade.symbol} +${pnl_usd:.2f}")
-                self._log_exit(session, trade, "target_profit", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="target_profit",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # Cut losses after 10 minutes with >$2 loss
-            if age_minutes >= 10 and pnl_usd < -2.0:
-                logging.info(f"[HYBRID] CUT LOSS: {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
-                self._log_exit(session, trade, "hybrid_stoploss", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="hybrid_stoploss",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
-            
-            # After 30 minutes, exit if losing
-            if age_minutes >= 30 and pnl_usd < 0:
-                logging.info(f"[HYBRID] TIME EXIT: {trade.symbol} ${pnl_usd:.2f} after {age_minutes:.0f}m")
-                self._log_exit(session, trade, "hybrid_timeout", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="hybrid_timeout",
-                    current_price=current_price,
-                    trigger_price=None,
-                    pnl_pct=pnl_pct,
-                )
+        if age_minutes >= profile.stale_minutes and pnl_pct < profile.stale_min_profit_pct:
+            logging.info(
+                f"[EXIT/stale] {trade.symbol} age {age_minutes:.0f}m >= "
+                f"{profile.stale_minutes:.0f}m, pnl {pnl_pct:+.2%} < "
+                f"{profile.stale_min_profit_pct:.2%}"
+            )
+            self._log_exit(session, trade, "stale", current_price, pnl_pct)
+            return ExitSignal(
+                trade_id=trade.id,
+                symbol=trade.symbol,
+                reason="stale",
+                current_price=current_price,
+                trigger_price=None,
+                pnl_pct=pnl_pct,
+            )
 
         # =====================================================================
-        # PROFIT LOCK-IN FLOOR (all styles, runs BEFORE the standard exits)
+        # 5. PROFIT LOCK-IN FLOOR — refuse to give back a banked peak.
         # =====================================================================
         # Hard guarantee: once peak unrealized profit hits a milestone, this
         # trade can NEVER close below the floor for that milestone. Addresses
@@ -594,61 +502,10 @@ class PositionMonitor:
                 )
 
         # =====================================================================
-        # STANDARD CHECKS (all styles)
+        # 6. TRAILING STOP — ratcheted toward price by _update_trailing_stop
+        # on every tick where no exit fired. Protects open profit against a
+        # pull-back from the high-water mark.
         # =====================================================================
-
-        # 1. Check max loss (hard cap - 10% default)
-        max_loss = float(trade.max_loss_pct or self.default_max_loss_pct)
-        if pnl_pct <= -max_loss:
-            logging.info(f"[MAX_LOSS] {trade.symbol} hit {pnl_pct:.2%} >= {max_loss:.2%} max")
-            self._log_exit(session, trade, "max_loss", current_price, pnl_pct)
-            return ExitSignal(
-                trade_id=trade.id,
-                symbol=trade.symbol,
-                reason="max_loss",
-                current_price=current_price,
-                trigger_price=None,
-                pnl_pct=pnl_pct,
-            )
-
-        # 2. Check stop-loss price
-        # IMPORTANT: Add minimum hold time before SL can trigger
-        # This prevents getting stopped out by normal market noise in the first few minutes
-        min_hold_minutes = 15  # Don't trigger SL for first 15 minutes
-        trade_age_minutes = 0
-        if trade.opened_at:
-            from utils.helpers import ensure_utc
-            opened_utc = ensure_utc(trade.opened_at)
-            trade_age_minutes = (utcnow() - opened_utc).total_seconds() / 60
-        
-        # Only check stop-loss after minimum hold period (unless loss exceeds max_loss_pct)
-        max_loss_exceeded = pnl_pct <= -0.08  # 8% max loss always triggers
-        can_trigger_sl = trade_age_minutes >= min_hold_minutes or max_loss_exceeded
-        
-        if trade.stop_loss_price and can_trigger_sl:
-            sl_price = float(trade.stop_loss_price)
-            if side == "BUY" and current_price <= sl_price:
-                self._log_exit(session, trade, "sl", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="sl",
-                    current_price=current_price,
-                    trigger_price=sl_price,
-                    pnl_pct=pnl_pct,
-                )
-            elif side == "SELL" and current_price >= sl_price:
-                self._log_exit(session, trade, "sl", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="sl",
-                    current_price=current_price,
-                    trigger_price=sl_price,
-                    pnl_pct=pnl_pct,
-                )
-
-        # 3. Check trailing stop price
         if trade.trailing_stop_price:
             trailing_price = float(trade.trailing_stop_price)
             if side == "BUY" and current_price <= trailing_price:
@@ -671,48 +528,6 @@ class PositionMonitor:
                     trigger_price=trailing_price,
                     pnl_pct=pnl_pct,
                 )
-
-        # 4. Check take-profit price (percentage-based from trade creation)
-        if trade.take_profit_price:
-            tp_price = float(trade.take_profit_price)
-            if side == "BUY" and current_price >= tp_price:
-                self._log_exit(session, trade, "tp", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="tp",
-                    current_price=current_price,
-                    trigger_price=tp_price,
-                    pnl_pct=pnl_pct,
-                )
-            elif side == "SELL" and current_price <= tp_price:
-                self._log_exit(session, trade, "tp", current_price, pnl_pct)
-                return ExitSignal(
-                    trade_id=trade.id,
-                    symbol=trade.symbol,
-                    reason="tp",
-                    current_price=current_price,
-                    trigger_price=tp_price,
-                    pnl_pct=pnl_pct,
-                )
-
-        # 5. Time limit for swing trades (4 hours default)
-        if trading_style == "swing":
-            time_limit = float(trade.time_limit_hours) if trade.time_limit_hours else 4.0
-            if trade.opened_at:
-                from utils.helpers import ensure_utc
-                opened_utc = ensure_utc(trade.opened_at)
-                deadline = opened_utc + timedelta(hours=time_limit)
-                if utcnow() >= deadline and pnl_pct <= 0.005:
-                    self._log_exit(session, trade, "time", current_price, pnl_pct)
-                    return ExitSignal(
-                        trade_id=trade.id,
-                        symbol=trade.symbol,
-                        reason="time",
-                        current_price=current_price,
-                        trigger_price=None,
-                        pnl_pct=pnl_pct,
-                    )
 
         return None
 
@@ -844,9 +659,14 @@ class PositionMonitor:
         reason_labels = {
             "sl": "Stop-Loss",
             "tp": "Take-Profit",
+            "take_profit": "Take-Profit",
             "trailing": "Trailing Stop",
             "max_loss": "Max Loss Cap",
             "time": "Time Limit",
+            "time_cap": "Hard Time Cap",
+            "stale": "Stale Timeout",
+            "momentum_reversal": "Momentum Reversal",
+            "profit_lock_in": "Profit Lock-In",
         }
         session.add(
             ActivityLog(

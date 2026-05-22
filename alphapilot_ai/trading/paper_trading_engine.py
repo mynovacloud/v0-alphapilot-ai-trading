@@ -43,6 +43,7 @@ class PaperTradingEngine:
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         trailing_stop_pct: float | None = None,
+        holding_profile_name: str | None = None,
         enable_breakeven_stop: bool = True,
         claude_decision_id: int | None = None,
         calibration_source: str | None = None,
@@ -69,33 +70,25 @@ class PaperTradingEngine:
         fees = self._estimate_fees(notional)
         slippage = self._estimate_slippage(notional)
         
-        # Get wallet's trading style to determine stop-loss/take-profit defaults
-        with session_scope() as s:
-            wallet = s.get(Wallet, wallet_id)
-            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
-            micro_target = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-        
-        # Calculate stop-loss and take-profit based on trading style
-        if trading_style == 'scalper':
-            # SCALPER: Tight stops, quick exits, but always at least 2.5:1 R:R
-            # so that fees + slippage don't erase the edge. The PRIMARY path
-            # goes through bot_engine's smart_stops() (swing-anchored, ATR-aware);
-            # these defaults are only the fallback when no candle data is
-            # available or this method is called outside the bot pipeline.
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.006  # 0.6%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.015  # 1.5% -> 2.5:1 R:R
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.003  # 0.3% trailing
-        elif trading_style == 'swing':
-            # SWING: Wider stops, longer holds
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.03  # 3%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.06  # 6%
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.02  # 2% trailing
+        # Resolve the holding profile — the single source of truth for
+        # this trade's exit thresholds (target / stop / trailing / time).
+        # bot_engine passes an explicit resolved name; manual or direct
+        # callers fall back to the global Settings mode.
+        from trading.holding_profiles import get_profile, resolve_profile_name
+        if holding_profile_name:
+            profile = get_profile(holding_profile_name)
         else:
-            # HYBRID: Balance between scalping and swing
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.015  # 1.5%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.03  # 3%
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.01  # 1% trailing
-        
+            from config.bot_config import BotConfig
+            profile = get_profile(
+                resolve_profile_name(BotConfig.load().holding_mode, confidence)
+            )
+
+        # Profile values are the defaults; an explicit per-call override
+        # (e.g. a manual ticket) still wins if one was passed in.
+        sl_pct = stop_loss_pct if stop_loss_pct is not None else profile.max_loss_pct
+        tp_pct = take_profit_pct if take_profit_pct is not None else profile.target_pct
+        trail_pct = trailing_stop_pct if trailing_stop_pct is not None else profile.trailing_pct
+
         if side == "BUY":
             stop_loss_price = entry_price * (1 - sl_pct)
             take_profit_price = entry_price * (1 + tp_pct)
@@ -134,6 +127,11 @@ class PaperTradingEngine:
                 trailing_stop_pct=trail_pct,
                 trailing_stop_price=trailing_stop_price,
                 high_water_price=entry_price,  # Track the best price we've seen
+                # Holding profile + the hard caps it implies. position_monitor
+                # reads `holding_profile` to know how this trade must exit.
+                holding_profile=profile.name,
+                max_loss_pct=profile.max_loss_pct,
+                time_limit_hours=profile.hard_cap_minutes / 60.0,
                 # Breakeven stop: once we're up 1%, move stop to entry + 0.2%
                 breakeven_trigger_pct=0.01 if enable_breakeven_stop else None,
                 breakeven_stop_pct=0.002 if enable_breakeven_stop else None,
@@ -156,7 +154,7 @@ class PaperTradingEngine:
                     category="paper_trade",
                     level="info",
                     wallet_id=wallet_id,
-                    message=f"Opened {side} {qty} {symbol} @ {entry_price:.2f} (conf={confidence:.2f}, SL=${stop_loss_price:.4f}, TP=${take_profit_price:.4f})",
+                    message=f"Opened {side} {qty} {symbol} @ {entry_price:.2f} (conf={confidence:.2f}, profile={profile.name}, SL=${stop_loss_price:.4f}, TP=${take_profit_price:.4f})",
                 )
             )
             

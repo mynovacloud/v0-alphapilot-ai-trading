@@ -141,6 +141,15 @@
         <option value="false" {{ '' if bot_cfg.dry_run else 'selected' }}>Live paper — actually open trades</option>
       </select>
     </div>
+    <div class="field">
+      <label>Holding Mode</label>
+      <select class="select" name="bot_holding_mode">
+        {% for value, label in holding_modes %}
+          <option value="{{ value }}" {{ 'selected' if bot_cfg.holding_mode == value else '' }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <small class="text-muted">How long trades are held and when they exit. "AI decides" lets Claude pick a profile per trade.</small>
+    </div>
 
     <div class="field" style="grid-column: 1 / -1;">
       <button class="btn btn-primary" type="submit">Save Bot Settings</button>
