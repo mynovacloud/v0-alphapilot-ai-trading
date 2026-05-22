@@ -24,6 +24,10 @@ DEFAULTS: dict[str, str] = {
     "bot_max_open_per_wallet": "25",       # max concurrent positions (increased for scalping)
     "bot_max_ticks_log": "200",            # how many tick rows to keep visible
     "bot_dry_run": "false",                # if true, decisions are logged only (paper layer ignored)
+    # Holding mode — how long trades are held and what their exit
+    # thresholds are. See trading/holding_profiles.py for the profiles.
+    # One of: scalp | short_hold | short_swing | long_hold | mixed | ai_decide
+    "bot_holding_mode": "mixed",
     # Aggressive trading settings
     "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
     "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+
@@ -69,6 +73,7 @@ class BotConfig:
     position_size_usd: float
     max_open_per_wallet: int
     dry_run: bool
+    holding_mode: str
     # Aggressive trading settings
     auto_dca_enabled: bool
     auto_dca_threshold_pct: float
@@ -89,6 +94,7 @@ class BotConfig:
             position_size_usd=max(1.0, float(raw.get("bot_position_size_usd") or 80)),
             max_open_per_wallet=max(1, int(float(raw.get("bot_max_open_per_wallet") or 25))),
             dry_run=_b(raw.get("bot_dry_run"), default=False),
+            holding_mode=_holding_mode(raw.get("bot_holding_mode")),
             # Aggressive trading
             auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
             auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),
@@ -102,6 +108,14 @@ def _b(value: str | None, default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _holding_mode(value: str | None) -> str:
+    """Validate the holding-mode setting, falling back to the default."""
+    from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
+
+    mode = (value or "").strip().lower()
+    return mode if mode in VALID_MODES else DEFAULT_MODE
 
 
 def _load_raw() -> dict[str, str]:

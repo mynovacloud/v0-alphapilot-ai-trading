@@ -108,6 +108,8 @@ def _migrate_schema() -> None:
             ("high_water_price", "FLOAT"),
             ("max_loss_pct", "FLOAT DEFAULT 0.10"),
             ("time_limit_hours", "FLOAT"),
+            # Holding profile resolved at entry (see holding_profiles.py).
+            ("holding_profile", "VARCHAR(20)"),
             ("dca_count", "INTEGER DEFAULT 0"),
             # Scale-in (pyramiding) tracker — separate from `dca_count`.
             # DCA = "average down on a loser to lower cost basis"

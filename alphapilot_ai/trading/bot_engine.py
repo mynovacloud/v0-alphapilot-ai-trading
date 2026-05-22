@@ -39,13 +39,12 @@ from trading.portfolio_intelligence import (
     PortfolioIntelligence,
     execute_portfolio_action,
 )
-from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
+from trading.position_monitor import PositionMonitor
 from trading.risk_manager import RiskManager
-from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles, smart_stops
+from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles
 # Advanced trading modules (signal engine temporarily disabled - uses evaluate_symbol instead)
 from trading.advanced_position_sizer import get_position_sizer
 from risk.daily_mission_controller import get_mission_controller
-from trading.advanced_exit_manager import get_exit_manager, calculate_stops
 from trading.market_intelligence import get_market_intelligence
 from trading.strategic_claude import get_strategic_router
 from trading.trade_filter import get_trade_filter, FilterResult
@@ -591,8 +590,6 @@ class BotEngine:
             # into a structure ceiling that price can't punch through, which
             # is exactly the "buy and watch it do nothing then drift down"
             # pattern the user is seeing.
-            # We also reuse the candles for our smart_stops calculation below
-            # so we only fetch them once.
             # =====================================================================
             entry_candles = get_entry_candles(symbol, tick_seconds=cfg.tick_seconds, lookback_bars=80)
             sr_check = evaluate_entry_quality(entry_candles, side)
@@ -887,6 +884,18 @@ class BotEngine:
                 level="info",
             )
             
+            # Resolve the holding profile for this trade. The mode comes
+            # from Settings; `mixed` tiers it by confidence; `ai_decide`
+            # reads the holding intent out of the take-profit Claude
+            # already chose. The resolved name governs every exit rule.
+            from trading.holding_profiles import resolve_profile_name, profile_from_claude_targets
+            ai_choice = None
+            if cfg.holding_mode == "ai_decide":
+                ai_choice = profile_from_claude_targets(getattr(decision, "take_profit_pct", None))
+            holding_profile_name = resolve_profile_name(
+                cfg.holding_mode, confidence, ai_choice
+            )
+
             try:
                 outcome = self.paper.open_trade(
                     wallet_id=wallet["id"],
@@ -897,6 +906,7 @@ class BotEngine:
                     confidence=confidence,
                     market_type="Crypto",
                     strategy_id=strategy_id,
+                    holding_profile_name=holding_profile_name,
                     notes=(
                         f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
                     ),
@@ -938,63 +948,19 @@ class BotEngine:
                 )
                 result.actions += 1
                 slots_left -= 1
-                # =====================================================================
-                # ADVANCED EXIT MANAGEMENT
-                # Structure-aware SL/TP: stops are anchored to the most recent
-                # swing low (BUY) or swing high (SELL), then ATR-padded so noise
-                # can't tag us out. Take-profits scale with confidence (2.0R
-                # base, up to 3.5R for high-conviction trades) but capped at
-                # 1.5x the recent range so we don't chase unreachable targets.
-                # =====================================================================
-                trade_id = outcome.get("trade_id")
-                if trade_id:
-                    with session_scope() as s:
-                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                        if trade:
-                            stops = smart_stops(entry_candles, side, confidence)
-                            if stops:
-                                sl_pct = float(stops.get("stop_pct") or 0.025)
-                                tp_pct = float(stops.get("tp_pct") or 0.05)
-                                atr_pct = float(stops.get("atr_pct") or 0.02)
-                                rr = float(stops.get("rr_ratio") or 2.0)
-                                # Trailing stop sized as 0.7x ATR — tight
-                                # enough to lock in profit, wide enough to
-                                # not get stopped on a single noisy bar.
-                                trailing_pct = max(0.008, min(0.04, atr_pct * 0.7))
-                                stop_label = (
-                                    f"swing-anchored (low=${stops.get('swing_low', 0):.4f}, "
-                                    f"R:R={rr:.1f})"
-                                )
-                            else:
-                                # Fallback to confidence-scaled fixed stops
-                                # only when we genuinely have no candle data.
-                                sl_pct = max(0.015, min(0.04, decision.stop_loss_pct or 0.025))
-                                tp_pct = max(0.03, sl_pct * 2.5)
-                                trailing_pct = max(0.01, sl_pct * 0.6)
-                                stop_label = "fallback-fixed"
-
-                            initialize_trade_sl_tp(
-                                trade,
-                                stop_loss_pct=sl_pct,
-                                take_profit_pct=tp_pct,
-                                trailing_stop_pct=trailing_pct,
-                                max_loss_pct=0.10,  # 10% absolute max
-                                time_limit_hours=72,
-                            )
-
-                            # Store high water mark for trailing stop
-                            trade.high_water_mark = price
-                            s.commit()
-
-                            self._log(
-                                "bot",
-                                (
-                                    f"[STOPS] {symbol}: SL={sl_pct:.2%} TP={tp_pct:.2%} "
-                                    f"Trail={trailing_pct:.2%} ({stop_label})"
-                                ),
-                                wallet_id=wallet["id"],
-                                level="info",
-                            )
+                # Exit thresholds (stop-loss, take-profit, trailing stop,
+                # and the hard time cap) were all set by open_trade from
+                # the resolved holding profile — the single source of
+                # truth for how this trade exits. Surface it for the
+                # operator so the training console shows which profile
+                # each trade is running under.
+                self._log(
+                    "bot",
+                    f"[PROFILE] {symbol}: holding profile '{holding_profile_name}' "
+                    f"(mode={cfg.holding_mode})",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
                 self._log(
                     "trade",
                     (

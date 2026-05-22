@@ -2714,11 +2714,13 @@ def settings_page(request: Request) -> HTMLResponse:
             for w in s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
         ]
     mission_enabled = _truthy(bot_config.get("mission_controller_enabled"))
+    from trading.holding_profiles import SELECTABLE_MODES
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
         request,
         active="settings",
         prefs=prefs,
         bot_cfg=bot_cfg,
+        holding_modes=SELECTABLE_MODES,
         bot_status=bot_status,
         recent_ticks=recent_ticks,
         recent_recons=recent_recons,
@@ -2788,6 +2790,7 @@ def settings_bot_save(
     bot_position_size_usd: str = Form("100"),
     bot_max_open_per_wallet: str = Form("5"),
     bot_dry_run: str = Form("true"),
+    bot_holding_mode: str = Form("mixed"),
 ) -> RedirectResponse:
     """
     Persist autonomous-bot settings and reload the scheduler so the new
@@ -2796,6 +2799,12 @@ def settings_bot_save(
     # Checkboxes only post their value when checked. Normalize.
     enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
     dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
+
+    # Validate the holding mode against the known set; fall back to default.
+    from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
+    holding_mode = (bot_holding_mode or "").strip().lower()
+    if holding_mode not in VALID_MODES:
+        holding_mode = DEFAULT_MODE
 
     bot_config.set_many(
         {
@@ -2808,6 +2817,7 @@ def settings_bot_save(
             "bot_position_size_usd": str(max(1.0, float(bot_position_size_usd or 100))),
             "bot_max_open_per_wallet": str(max(1, int(float(bot_max_open_per_wallet or 5)))),
             "bot_dry_run": dry,
+            "bot_holding_mode": holding_mode,
         }
     )
 

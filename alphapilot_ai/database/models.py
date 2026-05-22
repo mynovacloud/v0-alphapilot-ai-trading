@@ -164,6 +164,12 @@ class PaperTrade(Base):
     # Time-based exit: auto-close if position is older than N hours and flat.
     time_limit_hours = Column(Float, nullable=True)
 
+    # Holding profile resolved at entry — one of the BASE names in
+    # trading/holding_profiles.py (scalp | short_hold | short_swing |
+    # long_hold). Stamped once at open so the trade's exit rules never
+    # shift mid-flight even if the operator changes the global mode.
+    holding_profile = Column(String(20), nullable=True)
+
     # DCA / averaging support. `dca_count` tracks how many times we've added
     # on losses. `scale_in_count` is the inverse — pyramiding into winners.
     # Keep them separate so a position that pyramided 3 times during an
