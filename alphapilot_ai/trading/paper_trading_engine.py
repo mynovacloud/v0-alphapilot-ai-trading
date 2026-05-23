@@ -88,6 +88,43 @@ class PaperTradingEngine:
                 )
                 return {"ok": False, "reason": "Long-only policy active", "code": "long_only_block"}
 
+        # =====================================================================
+        # POSITION-SIZE CEILING — make `bot_position_size_usd` mean it.
+        # =====================================================================
+        # Upstream callers compute their own qty: the autonomous engine
+        # multiplies by size_multiplier (up to 1.5x), portfolio_intelligence
+        # sizes offset trades on its own scale, scale-in pyramids. With no
+        # engine-level bound, one overnight run opened $1,192 positions on
+        # an $80 config — a 15x breach of operator intent that produced the
+        # session's worst losses (the bigger the notional, the bigger the
+        # dollar loss at the same percentage move).
+        # We clamp rather than reject so the trade still happens — just at
+        # the size the operator actually authorized. 5% slack above the cap
+        # avoids tripping on float rounding right at the boundary.
+        try:
+            from config.bot_config import BotConfig
+            cfg_position_size = float(BotConfig.load().position_size_usd)
+        except Exception:
+            cfg_position_size = 0.0
+        if cfg_position_size > 0.0 and entry_price > 0:
+            requested_notional = float(qty) * float(entry_price)
+            ceiling = cfg_position_size * 1.05
+            if requested_notional > ceiling:
+                new_qty = cfg_position_size / float(entry_price)
+                logger.warning(
+                    f"[OPEN_TRADE] CLAMPED size: {symbol} {side} "
+                    f"requested ${requested_notional:.2f} > config "
+                    f"${cfg_position_size:.2f}; qty {qty:.6f} -> {new_qty:.6f}"
+                )
+                self._log(
+                    "risk",
+                    f"Position size clamped on {symbol} {side}: requested "
+                    f"${requested_notional:.2f}, capped to "
+                    f"${cfg_position_size:.2f} per bot_position_size_usd",
+                    wallet_id=wallet_id, level="warn",
+                )
+                qty = new_qty
+
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
         if not decision.allowed:
             logger.warning(f"[OPEN_TRADE] REJECTED by risk manager: {decision.reason} (code={decision.code})")
