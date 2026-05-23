@@ -1253,7 +1253,7 @@ class BotEngine:
     @staticmethod
     def _build_snapshot(symbol: str, price: float) -> dict[str, Any]:
         # Cheap deterministic-ish placeholder values until a real feature pipeline
-        # is wired in. The DecisionEngine only reads liquidity / volatility / probs.
+        # is wired in. Downstream consumers only read liquidity / volatility / probs.
         # Using stable mid-range numbers prevents the bot from acting purely on noise.
         return {
             "symbol": symbol,

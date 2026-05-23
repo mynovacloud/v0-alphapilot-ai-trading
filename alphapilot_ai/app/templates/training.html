@@ -1984,51 +1984,21 @@ document.addEventListener('keydown', e => {
 </div>
 
 <!-- ============================================================ -->
-<!-- SYNTHETIC TRAINING SESSION                                      -->
+<!-- HOW THE BOT LEARNS                                              -->
 <!-- ============================================================ -->
-<div class="grid grid-2-1 mb-4">
-  <div class="card">
-    <div class="card-header"><div class="card-title">Synthetic Training Session</div></div>
-    <p class="text-muted mb-3" style="font-size: 0.82rem;">
-      Run a fast offline simulation against synthetic snapshots to bootstrap the playbook before unleashing the bot on live data.
-      Great for stress-testing risk profiles and seeing how Claude handles edge cases.
-    </p>
-    <form hx-post="/training/run" hx-target="#training-result" hx-swap="innerHTML" hx-indicator="#train-spinner" class="grid grid-2">
-      <div class="field"><label>Wallet (optional)</label>
-        <select class="select" name="wallet_id"><option value="">— None —</option>{% for w in wallets %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Strategy (optional)</label>
-        <select class="select" name="strategy_id"><option value="">— None —</option>{% for s in strategies %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Market</label>
-        <select class="select" name="market_type">{% for m in market_types %}<option>{{ m }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Risk Level</label>
-        <select class="select" name="risk_level">{% for r in risk_levels %}<option>{{ r }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Number of Trades</label><input class="input" name="num_trades" type="number" min="5" max="500" value="50"></div>
-      <div class="field"><label>Starting Balance</label><input class="input" name="starting_balance" type="number" step="0.01" value="10000"></div>
-      <div style="grid-column: 1 / -1;" class="flex items-center gap-3 mt-2">
-        <button class="btn btn-primary" type="submit">Run Training</button>
-        <span id="train-spinner" class="htmx-indicator"><span class="spinner"></span> <span class="text-muted">simulating...</span></span>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-header"><div class="card-title">How the bot learns</div></div>
-    <ol style="font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; color: var(--text-muted);">
-      <li><strong style="color: var(--text);">Decide.</strong> The technical engine produces a signal; Claude reviews it with the full playbook and recent history before choosing an action.</li>
-      <li><strong style="color: var(--text);">Act.</strong> The trade is opened in paper mode through the existing risk manager. All caps still apply.</li>
-      <li><strong style="color: var(--text);">Reflect.</strong> When the trade closes, Claude writes a verdict (good_call / bad_call / lucky / unlucky / neutral) and a -1..1 process-quality score.</li>
-      <li><strong style="color: var(--text);">Remember.</strong> Up to 3 generalizable lessons per reflection are added to the playbook with weights.</li>
-      <li><strong style="color: var(--text);">Consolidate.</strong> Periodically the playbook is compressed: duplicates merged, contradictions resolved, weights re-ranked.</li>
-      <li><strong style="color: var(--text);">Graduate.</strong> Once the readiness score crosses 75 with a healthy sample size and win rate, you can flip a wallet to <span class="mono">live_shadow</span> and finally to <span class="mono">live</span>.</li>
-    </ol>
-  </div>
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">How the bot learns</div></div>
+  <ol style="font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; color: var(--text-muted);">
+    <li><strong style="color: var(--text);">Score.</strong> The strategy engine produces a technical signal; the adaptive engine looks up similar past trades and adjusts confidence and size before anything happens.</li>
+    <li><strong style="color: var(--text);">Filter.</strong> A confluence gate blocks weak entries (oversold shorts, blow-off buys, no-volume setups). Long-only and a hard per-trade size cap are enforced at the engine boundary, regardless of which caller initiated the trade.</li>
+    <li><strong style="color: var(--text);">Act.</strong> The trade opens through paper trading with a holding profile that fixes its take-profit, max loss, trailing stop, and hard time cap at entry.</li>
+    <li><strong style="color: var(--text);">Reflect.</strong> When the trade closes, Claude writes a verdict (good_call / bad_call / lucky / unlucky / neutral) and a -1..1 process-quality score, plus up to 3 generalizable lessons.</li>
+    <li><strong style="color: var(--text);">Remember.</strong> Reflection lessons land in the playbook; the autonomous engine derives a pattern fingerprint from the trade's entry context and outcome, and the adaptive engine updates its per-pattern and per-symbol statistics.</li>
+    <li><strong style="color: var(--text);">Adapt.</strong> On the next tick, the adaptive lookup uses the updated memory: known-losing fingerprints get smaller size, the strongest known losers get blocked outright (LEARN_BLOCK).</li>
+    <li><strong style="color: var(--text);">Consolidate.</strong> Periodically the playbook is compressed: duplicates merged, contradictions resolved, weights re-ranked.</li>
+    <li><strong style="color: var(--text);">Graduate.</strong> Once the readiness score crosses 75 with a healthy sample size and win rate, a wallet can be flipped from paper toward live trading.</li>
+  </ol>
 </div>
-
-<div id="training-result"></div>
 
 <script src="/static/positions_lab.js?v=2"></script>
 <script src="/static/live_session.js?v=2"></script>

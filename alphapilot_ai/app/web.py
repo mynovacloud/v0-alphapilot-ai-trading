@@ -15,7 +15,6 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ai.ai_engine import AIEngine
 from ai.learning_memory import LearningMemory
 from analytics.performance import performance_metrics
 from analytics.portfolio import (
@@ -148,7 +147,6 @@ templates.env.filters["timeago"] = _fmt_timeago
 router = APIRouter()
 
 _engine = PaperTradingEngine()
-_ai = AIEngine()
 _memory = LearningMemory()
 
 
@@ -2289,34 +2287,6 @@ def training_session_feed(
                 "trade_id": (fills_payload[-1]["id"] if fills_payload else since_trade_id),
             },
         }
-    )
-
-
-@router.post("/training/run", response_class=HTMLResponse)
-def training_run(
-    request: Request,
-    wallet_id: int | None = Form(None),
-    strategy_id: int | None = Form(None),
-    market_type: str = Form("Crypto"),
-    risk_level: str = Form("Moderate"),
-    num_trades: int = Form(50),
-    starting_balance: float = Form(10000.0),
-) -> HTMLResponse:
-    result = _ai.run_training_session(
-        wallet_id=wallet_id if wallet_id else None,
-        strategy_id=strategy_id if strategy_id else None,
-        market_type=market_type,
-        risk_level=risk_level,
-        num_trades=num_trades,
-        starting_balance=starting_balance,
-    )
-    eq: list[float] = [result.starting_balance]
-    for d in result.decisions:
-        eq.append(d.get("balance", eq[-1]))
-    return templates.TemplateResponse(
-        request=request,
-        name="_training_result.html",
-        context={"request": request, "result": result, "equity": eq},
     )
 
 
