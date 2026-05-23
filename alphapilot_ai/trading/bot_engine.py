@@ -2,9 +2,9 @@
 Autonomous bot engine.
 
 This is the loop that wakes up on a schedule, walks the configured universe,
-asks the AIEngine for a decision per symbol, and (if confident enough) routes
-the resulting trade through the existing PaperTradingEngine — which already
-enforces wallet caps, risk manager checks, fees, and slippage.
+asks the strategic Claude router for a decision per symbol, and (if confident
+enough) routes the resulting trade through the existing PaperTradingEngine
+— which already enforces wallet caps, risk manager checks, fees, and slippage.
 
 Design notes:
   - This module owns NO scheduling. `services/scheduler.py` calls `tick()`.
@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai.ai_engine import AIEngine
 from ai.claude_decision_engine import decide as claude_decide
 from config.bot_config import BotConfig
 from connectors.live_prices import get_price
@@ -71,7 +70,6 @@ class BotEngine:
     """Singleton-ish: one BotEngine per process. Safe to call .tick() concurrently."""
 
     def __init__(self) -> None:
-        self.ai = AIEngine()
         self.paper = PaperTradingEngine()
         self.position_monitor = PositionMonitor()
         self.portfolio_intel = PortfolioIntelligence()
