@@ -2,9 +2,9 @@
 Autonomous bot engine.
 
 This is the loop that wakes up on a schedule, walks the configured universe,
-asks the AIEngine for a decision per symbol, and (if confident enough) routes
-the resulting trade through the existing PaperTradingEngine — which already
-enforces wallet caps, risk manager checks, fees, and slippage.
+asks the strategic Claude router for a decision per symbol, and (if confident
+enough) routes the resulting trade through the existing PaperTradingEngine
+— which already enforces wallet caps, risk manager checks, fees, and slippage.
 
 Design notes:
   - This module owns NO scheduling. `services/scheduler.py` calls `tick()`.
@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
 
-from ai.ai_engine import AIEngine
 from ai.claude_decision_engine import decide as claude_decide
 from config.bot_config import BotConfig
 from connectors.live_prices import get_price
@@ -39,12 +38,12 @@ from trading.portfolio_intelligence import (
     PortfolioIntelligence,
     execute_portfolio_action,
 )
-from trading.position_monitor import PositionMonitor, initialize_trade_sl_tp
+from trading.position_monitor import PositionMonitor
 from trading.risk_manager import RiskManager
-from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles, smart_stops
+from trading.strategy_engine import evaluate_symbol, evaluate_entry_quality, get_entry_candles
 # Advanced trading modules (signal engine temporarily disabled - uses evaluate_symbol instead)
 from trading.advanced_position_sizer import get_position_sizer
-from trading.advanced_exit_manager import get_exit_manager, calculate_stops
+from risk.daily_mission_controller import get_mission_controller
 from trading.market_intelligence import get_market_intelligence
 from trading.strategic_claude import get_strategic_router
 from trading.trade_filter import get_trade_filter, FilterResult
@@ -71,7 +70,6 @@ class BotEngine:
     """Singleton-ish: one BotEngine per process. Safe to call .tick() concurrently."""
 
     def __init__(self) -> None:
-        self.ai = AIEngine()
         self.paper = PaperTradingEngine()
         self.position_monitor = PositionMonitor()
         self.portfolio_intel = PortfolioIntelligence()
@@ -590,8 +588,6 @@ class BotEngine:
             # into a structure ceiling that price can't punch through, which
             # is exactly the "buy and watch it do nothing then drift down"
             # pattern the user is seeing.
-            # We also reuse the candles for our smart_stops calculation below
-            # so we only fetch them once.
             # =====================================================================
             entry_candles = get_entry_candles(symbol, tick_seconds=cfg.tick_seconds, lookback_bars=80)
             sr_check = evaluate_entry_quality(entry_candles, side)
@@ -687,7 +683,24 @@ class BotEngine:
 
             if side not in {"BUY", "SELL"}:
                 continue
-            
+
+            # ---- Long-only policy --------------------------------------------
+            # The signal-edge harness measured every strategy's SELL signals
+            # at -127 to -196 bps forward return: shorting an asset class
+            # that structurally drifts up is a losing proposition, and on a
+            # spot account a "short" isn't even a real position. When
+            # long_only is set we never OPEN a short; SELL exits of existing
+            # longs are still handled by the position monitor.
+            if cfg.long_only and side == "SELL":
+                self._log(
+                    "bot",
+                    f"[LONG_ONLY] {symbol} SELL skipped — short entries disabled",
+                    wallet_id=wallet["id"],
+                    level="debug",
+                )
+                result.skipped += 1
+                continue
+
             # ---- Risk gating -------------------------------------------------
             # Two layers gate every entry:
             #
@@ -779,6 +792,90 @@ class BotEngine:
                     level="info",
                 )
 
+            # =====================================================================
+            # DAILY MISSION CONTROLLER — the boss layer.
+            # When the operator has enabled mission_controller_enabled in bot_config,
+            # every trade decision passes through the controller. It can:
+            #   - reject the trade (mode is LOCK/KILL, daily limits hit, edge too
+            #     small for the current mode, confidence below mode-specific floor,
+            #     symbol or strategy or combo currently quarantined for a loss
+            #     streak)
+            #   - override position_usd with a mode-scaled approved_notional
+            #     (SCOUT = 25% of proposed, BUILD = 100%, ATTACK = 120%, etc.)
+            # When the flag is off, get_mission_controller() returns a no-op
+            # that approves everything and leaves sizing as-is, so this block is
+            # safe to land before the UI toggle exists.
+            # =====================================================================
+            mission = get_mission_controller()
+            mission_inputs = _compute_mission_inputs(
+                signal=signal,
+                decision=decision,
+                confidence=confidence,
+                proposed_notional=position_usd,
+                # Phase B: pass symbol/side/strategy so the helper can build
+                # an autonomous TradeContext and look up the calibrated
+                # historical win rate for this fingerprint. Without these,
+                # the calibration falls back to raw-confidence and we get
+                # the pre-Phase-B behavior.
+                symbol=symbol,
+                side=side,
+                strategy_type=strategy_type,
+            )
+            mission_decision = mission.approve_trade(
+                symbol=symbol,
+                strategy=strategy_type,
+                confidence=confidence,
+                proposed_notional=position_usd,
+                expected_net_edge=mission_inputs["expected_net_edge"],
+                spread_bps=mission_inputs["spread_bps"],
+                volatility_score=mission_inputs["volatility_score"],
+                market_quality_score=mission_inputs["market_quality_score"],
+                router_wants_claude=(decision.source == "claude"),
+                metadata={
+                    "strategy_type": strategy_type,
+                    "decision_source": decision.source,
+                    # Phase B: record which tier of the win-probability
+                    # estimator backed this approval so post-hoc audits
+                    # can separate "approved on real data" from "approved
+                    # on a confidence guess".
+                    "calibration_source": mission_inputs.get("win_probability_source"),
+                    "calibration_sample_size": mission_inputs.get("win_probability_sample_size"),
+                    "calibration_win_prob": mission_inputs.get("win_probability_used"),
+                },
+            )
+            if not mission_decision.approved:
+                # Include the calibration source + sample so the operator
+                # can tell from the console whether this rejection was
+                # backed by measured fingerprint data or just a confidence
+                # guess. After Phase B + the fingerprint coarsening, we
+                # want to see "exact_pattern(n=N)" appearing on more
+                # rejections over time — that's evidence the learning loop
+                # is closing.
+                src = mission_inputs.get("win_probability_source", "?")
+                ssz = mission_inputs.get("win_probability_sample_size", 0)
+                self._log(
+                    "bot",
+                    f"[MISSION REJECT] {symbol} {side}: {mission_decision.rejection_code.value} "
+                    f"— {mission_decision.reason} [calib={src} n={ssz}]",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
+                continue
+            # If the controller is the real one (not the no-op), let it
+            # override the position size. The mode multipliers in MissionConfig
+            # are the authoritative sizing once the flag is on.
+            if getattr(mission_decision, "approved_notional", None) is not None and mission_decision.approved_notional > 0:
+                if mission_decision.approved_notional != position_usd:
+                    position_usd = float(mission_decision.approved_notional)
+                    qty = position_usd / price if price > 0 else 0.0
+                    self._log(
+                        "bot",
+                        f"[MISSION SIZE] {symbol}: mode={mission_decision.mode.value} "
+                        f"size ${size_result.recommended_usd:.0f} -> ${position_usd:.0f} (×{mission_decision.size_multiplier})",
+                        wallet_id=wallet["id"],
+                        level="info",
+                    )
+
             if cfg.dry_run:
                 self._log(
                     "bot",
@@ -802,6 +899,18 @@ class BotEngine:
                 level="info",
             )
             
+            # Resolve the holding profile for this trade. The mode comes
+            # from Settings; `mixed` tiers it by confidence; `ai_decide`
+            # reads the holding intent out of the take-profit Claude
+            # already chose. The resolved name governs every exit rule.
+            from trading.holding_profiles import resolve_profile_name, profile_from_claude_targets
+            ai_choice = None
+            if cfg.holding_mode == "ai_decide":
+                ai_choice = profile_from_claude_targets(getattr(decision, "take_profit_pct", None))
+            holding_profile_name = resolve_profile_name(
+                cfg.holding_mode, confidence, ai_choice
+            )
+
             try:
                 outcome = self.paper.open_trade(
                     wallet_id=wallet["id"],
@@ -812,10 +921,16 @@ class BotEngine:
                     confidence=confidence,
                     market_type="Crypto",
                     strategy_id=strategy_id,
+                    holding_profile_name=holding_profile_name,
                     notes=(
                         f"bot/{decision.source}/{strategy_type}: {decision.rationale[:400]}"
                     ),
                     claude_decision_id=getattr(decision, "claude_decision_id", None),
+                    # Persist the Phase B calibration tier so the scorecard
+                    # on /training can show how many of today's trades were
+                    # backed by measured pattern data vs raw confidence.
+                    calibration_source=mission_inputs.get("win_probability_source"),
+                    calibration_sample_size=mission_inputs.get("win_probability_sample_size"),
                 )
             except Exception as e:
                 # A single bad trade (attribute error, DB hiccup, etc.) must
@@ -832,71 +947,35 @@ class BotEngine:
                 continue
 
             if outcome.get("ok"):
+                # Surface which calibration tier backed the decision so
+                # the operator can audit live whether trades are being
+                # approved on measured data (exact_pattern / knn) or on
+                # raw confidence. Over a session the mix should shift
+                # toward exact_pattern as fingerprints accumulate.
+                src = mission_inputs.get("win_probability_source", "?")
+                ssz = mission_inputs.get("win_probability_sample_size", 0)
                 self._log(
                     "bot",
-                    f"[TRADE OPENED] {symbol} {side} - trade_id={outcome.get('trade_id')}",
+                    f"[TRADE OPENED] {symbol} {side} - trade_id={outcome.get('trade_id')} "
+                    f"[calib={src} n={ssz}]",
                     wallet_id=wallet["id"],
                     level="info",
                 )
                 result.actions += 1
                 slots_left -= 1
-                # =====================================================================
-                # ADVANCED EXIT MANAGEMENT
-                # Structure-aware SL/TP: stops are anchored to the most recent
-                # swing low (BUY) or swing high (SELL), then ATR-padded so noise
-                # can't tag us out. Take-profits scale with confidence (2.0R
-                # base, up to 3.5R for high-conviction trades) but capped at
-                # 1.5x the recent range so we don't chase unreachable targets.
-                # =====================================================================
-                trade_id = outcome.get("trade_id")
-                if trade_id:
-                    with session_scope() as s:
-                        trade = s.query(PaperTrade).filter(PaperTrade.id == trade_id).first()
-                        if trade:
-                            stops = smart_stops(entry_candles, side, confidence)
-                            if stops:
-                                sl_pct = float(stops.get("stop_pct") or 0.025)
-                                tp_pct = float(stops.get("tp_pct") or 0.05)
-                                atr_pct = float(stops.get("atr_pct") or 0.02)
-                                rr = float(stops.get("rr_ratio") or 2.0)
-                                # Trailing stop sized as 0.7x ATR — tight
-                                # enough to lock in profit, wide enough to
-                                # not get stopped on a single noisy bar.
-                                trailing_pct = max(0.008, min(0.04, atr_pct * 0.7))
-                                stop_label = (
-                                    f"swing-anchored (low=${stops.get('swing_low', 0):.4f}, "
-                                    f"R:R={rr:.1f})"
-                                )
-                            else:
-                                # Fallback to confidence-scaled fixed stops
-                                # only when we genuinely have no candle data.
-                                sl_pct = max(0.015, min(0.04, decision.stop_loss_pct or 0.025))
-                                tp_pct = max(0.03, sl_pct * 2.5)
-                                trailing_pct = max(0.01, sl_pct * 0.6)
-                                stop_label = "fallback-fixed"
-
-                            initialize_trade_sl_tp(
-                                trade,
-                                stop_loss_pct=sl_pct,
-                                take_profit_pct=tp_pct,
-                                trailing_stop_pct=trailing_pct,
-                                max_loss_pct=0.10,  # 10% absolute max
-                                time_limit_hours=72,
-                            )
-
-                            # Store high water mark for trailing stop
-                            trade.high_water_mark = price
-                            s.commit()
-
-                            self._log(
-                                "bot",
-                                (
-                                    f"[STOPS] {symbol}: SL={sl_pct:.2%} TP={tp_pct:.2%} "
-                                    f"Trail={trailing_pct:.2%} ({stop_label})"
-                                ),
-                                wallet_id=wallet["id"],
-                                level="info",
-                            )
+                # Exit thresholds (stop-loss, take-profit, trailing stop,
+                # and the hard time cap) were all set by open_trade from
+                # the resolved holding profile — the single source of
+                # truth for how this trade exits. Surface it for the
+                # operator so the training console shows which profile
+                # each trade is running under.
+                self._log(
+                    "bot",
+                    f"[PROFILE] {symbol}: holding profile '{holding_profile_name}' "
+                    f"(mode={cfg.holding_mode})",
+                    wallet_id=wallet["id"],
+                    level="info",
+                )
                 self._log(
                     "trade",
                     (
@@ -1174,7 +1253,7 @@ class BotEngine:
     @staticmethod
     def _build_snapshot(symbol: str, price: float) -> dict[str, Any]:
         # Cheap deterministic-ish placeholder values until a real feature pipeline
-        # is wired in. The DecisionEngine only reads liquidity / volatility / probs.
+        # is wired in. Downstream consumers only read liquidity / volatility / probs.
         # Using stable mid-range numbers prevents the bot from acting purely on noise.
         return {
             "symbol": symbol,
@@ -1227,6 +1306,155 @@ class BotEngine:
                     message=message,
                 )
             )
+
+
+# =============================================================================
+# MISSION-CONTROLLER INPUT DERIVATION
+# =============================================================================
+# The Daily Mission Controller's approve_trade() expects four numeric inputs
+# the rest of the pipeline doesn't currently track as first-class values:
+#
+#   expected_net_edge  - dollar edge expected after fees/slippage/loss-prob
+#   spread_bps         - bid-ask spread in basis points
+#   volatility_score   - normalized 0..1
+#   market_quality_score - composite 0..1
+#
+# We synthesize them from the technical signal's indicators + the decision's
+# SL/TP percentages. This is a lossy approximation — once we have live order
+# book data the spread/quality scores should become real measurements. Until
+# then the heuristics below give the controller plausible inputs so its
+# mode/edge gates can do useful work in paper trading.
+
+def _compute_mission_inputs(
+    *,
+    signal,
+    decision,
+    confidence: float,
+    proposed_notional: float,
+    symbol: str = "",
+    side: str = "",
+    strategy_type: str = "",
+) -> dict:
+    indicators = getattr(signal, "indicators", {}) or {}
+    sl_pct = max(0.001, float(decision.stop_loss_pct or 0.025))
+    tp_pct = max(0.001, float(decision.take_profit_pct or 0.05))
+
+    # --- Calibrated win probability (Phase B) ----------------------------
+    # The old version used `confidence` as a stand-in for "probability this
+    # trade wins". That's a quality signal, not a calibrated probability.
+    # Meanwhile the autonomous engine has been accumulating real
+    # (fingerprint -> win_rate, expectancy, sample_size) data on every
+    # closed trade. We now use that as the source of truth when we have
+    # enough samples, and blend toward confidence when we don't.
+    #
+    # Resolution order (see autonomous_learning_engine.get_calibrated_win_probability):
+    #   1. exact_pattern   - same fingerprint, n ≥ 5 closed trades
+    #   2. knn_neighbors   - k similar trades by Euclidean distance, n ≥ 5
+    #   3. raw_confidence  - no historical data; fall back to confidence
+    #
+    # We blend the measured estimate with raw confidence using the
+    # estimate's own meta-confidence (which grows with sample size). At
+    # n=0 the formula collapses to today's behavior; at n>=25 we trust
+    # the data ~75%.
+    win_prob_meta = {
+        "source": "raw_confidence",
+        "sample_size": 0,
+        "win_probability": max(0.0, min(1.0, float(confidence))),
+        "confidence_in_estimate": 0.0,
+        "expectancy": None,
+        "avg_win": None,
+        "avg_loss": None,
+    }
+    try:
+        from trading.strategic_claude import _build_autonomous_context
+        from ai.autonomous_learning_engine import get_calibrated_win_probability
+
+        ctx = _build_autonomous_context(
+            symbol=symbol or getattr(signal, "symbol", "") or "?",
+            side=side or getattr(signal, "side", "") or "BUY",
+            technical_signal=signal,
+            strategy_type=strategy_type or getattr(signal, "strategy", "Momentum"),
+            tech_confidence=float(confidence),
+        )
+        if ctx is not None:
+            win_prob_meta = get_calibrated_win_probability(ctx, float(confidence))
+    except Exception:
+        # Calibration is best-effort. If anything in the lookup chain
+        # fails we keep the raw-confidence default already in win_prob_meta
+        # and trade exactly the way we did before Phase B.
+        pass
+
+    measured = max(0.0, min(1.0, float(win_prob_meta["win_probability"])))
+    meta_conf = max(0.0, min(1.0, float(win_prob_meta["confidence_in_estimate"])))
+    raw_conf = max(0.0, min(1.0, float(confidence)))
+    prob_win = meta_conf * measured + (1.0 - meta_conf) * raw_conf
+
+    # --- Expected net edge (dollars) -------------------------------------
+    # When we have a calibrated exact_pattern estimate with measured
+    # avg_win / avg_loss magnitudes, use those instead of the decision's
+    # tp_pct / sl_pct (which are forward targets, not realized averages).
+    # The autonomous engine's averages already net out exits that hit
+    # before TP, partial fills, etc. — they're closer to reality.
+    avg_win_pct = win_prob_meta.get("avg_win")
+    avg_loss_pct = win_prob_meta.get("avg_loss")
+    if (
+        win_prob_meta.get("source") == "exact_pattern"
+        and avg_win_pct is not None
+        and avg_loss_pct is not None
+        and avg_win_pct > 0
+        and avg_loss_pct > 0
+    ):
+        win_magnitude_pct = float(avg_win_pct)
+        loss_magnitude_pct = float(avg_loss_pct)
+    else:
+        win_magnitude_pct = tp_pct
+        loss_magnitude_pct = sl_pct
+
+    expected_win_pnl = prob_win * win_magnitude_pct * proposed_notional
+    expected_loss_pnl = (1.0 - prob_win) * loss_magnitude_pct * proposed_notional
+    fee_drag = 0.005 * proposed_notional  # 50 bps round-trip
+    expected_net_edge = expected_win_pnl - expected_loss_pnl - fee_drag
+
+    # --- Volatility score (0..1) -----------------------------------------
+    # atr_pct measured fractionally (e.g. 0.02 = 2%). Map 0% -> 0.0,
+    # 5% -> 1.0, clamp. Anything above 5% atr is effectively "extreme".
+    atr_pct = float(indicators.get("atr_pct") or 0.0)
+    volatility_score = max(0.0, min(1.0, atr_pct / 0.05))
+
+    # --- Spread (bps) ----------------------------------------------------
+    # We do not yet track bid-ask spread on the paper side — every fill is
+    # at the polled mid price. Until we wire WebSocket order books, we
+    # approximate "effective spread cost" as half the atr in bps (volatile
+    # markets have wider spreads on Coinbase). Conservative bias, but the
+    # mode-specific max_spread_bps values are forgiving enough on Scout
+    # (12bps) that this won't deadlock training sessions.
+    spread_bps = min(40.0, atr_pct * 100.0 * 5.0)  # atr_pct=2% -> 10 bps
+
+    # --- Market quality (0..1) -------------------------------------------
+    # Composite of (a) volume health, (b) trend strength, (c) signal
+    # confidence. Built so reasonable markets score 0.6+ and only truly
+    # poor conditions drop below the protect_min_market_quality of 0.76.
+    vol_ratio = float(indicators.get("relative_volume") or indicators.get("volume_ratio") or 1.0)
+    adx = float(indicators.get("adx") or indicators.get("adx_trend_strength") or 0.0)
+    q = 0.30
+    q += min(0.25, max(0.0, (vol_ratio - 0.5) / 1.5) * 0.25)  # 0.5x->0, 2.0x->+0.25
+    q += min(0.20, max(0.0, (adx - 15.0) / 20.0) * 0.20)       # ADX 15->0, 35+->+0.20
+    q += min(0.25, max(0.0, (confidence - 0.4)) * 0.50)        # conf 0.4->0, 0.9->+0.25
+    market_quality_score = max(0.0, min(1.0, q))
+
+    return {
+        "expected_net_edge": round(expected_net_edge, 4),
+        "spread_bps": round(spread_bps, 2),
+        "volatility_score": round(volatility_score, 4),
+        "market_quality_score": round(market_quality_score, 4),
+        # Phase B observability: which estimator backed the edge math?
+        # Surfaced so the mission decision's metadata records (and the
+        # operator can audit) whether a given approval was based on
+        # measured data or a confidence guess.
+        "win_probability_source": win_prob_meta.get("source", "raw_confidence"),
+        "win_probability_sample_size": int(win_prob_meta.get("sample_size") or 0),
+        "win_probability_used": round(prob_win, 4),
+    }
 
 
 # Module-level singleton so the scheduler and HTTP routes share state.

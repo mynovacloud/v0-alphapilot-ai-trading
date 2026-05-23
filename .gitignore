@@ -55,6 +55,15 @@ htmlcov/
 alphapilot_ai/data/
 alphapilot_ai/*.db*
 
+# TEMPORARY (2026-05-21): one-time DB migration to a new computer.
+# The negations below override the *.db patterns above for ONLY the
+# specific files we need to ferry. Will be removed tonight after the
+# new machine has its DB. Until then this puts the user's Anthropic
+# API key + all training data into git history — see commit message.
+!alphapilot_ai/alphapilot.db
+!alphapilot_ai/alphapilot.db-shm
+!alphapilot_ai/alphapilot.db-wal
+
 # Logs
 *.log
 logs/

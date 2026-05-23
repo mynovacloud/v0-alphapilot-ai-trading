@@ -190,14 +190,218 @@ function recordIntelAction(type, symbol, reason) {
 </script>
 
 <!-- ============================================================ -->
+<!-- DAILY MISSION MODE — the boss layer's current verdict          -->
+<!-- ============================================================ -->
+<!-- Hidden by default; renderMission() in live_session.js flips it -->
+<!-- visible when /training/session/feed.mission.enabled === true.  -->
+<!-- The controller is gated by the mission_controller_enabled bot  -->
+<!-- config flag; when off, this panel stays hidden completely.     -->
+<div class="card mb-4" id="mission-panel" style="display:none; border:1px solid var(--border);">
+  <div class="flex items-center justify-between flex-wrap gap-2">
+    <div class="flex items-center gap-3">
+      <span class="text-muted" style="font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase;">Mission</span>
+      <span id="mission-mode-badge" class="badge mono" style="font-size:0.85rem; font-weight:800; padding:0.25rem 0.6rem;">—</span>
+      <span id="mission-mode-reason" class="text-dim" style="font-size:0.78rem;">—</span>
+    </div>
+    <div class="flex items-center gap-2">
+      <span id="mission-kill-indicator" class="badge" style="display:none; background:rgba(239,68,68,0.15); color:var(--bad); border:1px solid var(--bad); font-size:0.72rem;">KILL ACTIVE</span>
+      <a href="/settings#mission" class="text-dim" style="font-size:0.72rem; text-decoration:underline;">policy</a>
+    </div>
+  </div>
+
+  <div class="grid mt-3" style="grid-template-columns: repeat(5, 1fr); gap:0.8rem;">
+    <!-- Net P&L today vs target -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Net Today</div>
+      <div id="mission-net-pnl" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-target-sub" class="text-dim" style="font-size:0.7rem;">target —</div>
+    </div>
+    <!-- Distance to target / lock -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Distance to Lock</div>
+      <div id="mission-distance" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div class="text-dim" style="font-size:0.7rem;">to +$60 / day</div>
+    </div>
+    <!-- Trades today + win rate -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Trades · WR</div>
+      <div id="mission-trades" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-streak" class="text-dim" style="font-size:0.7rem;">—</div>
+    </div>
+    <!-- Drawdown from peak -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">From Peak</div>
+      <div id="mission-drawdown" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-peak" class="text-dim" style="font-size:0.7rem;">peak —</div>
+    </div>
+    <!-- Throttles active -->
+    <div>
+      <div class="text-muted" style="font-size:0.7rem; text-transform:uppercase; letter-spacing:0.05em;">Throttles</div>
+      <div id="mission-throttles" class="mono" style="font-size:1.35rem; font-weight:800;">—</div>
+      <div id="mission-throttles-sub" class="text-dim" style="font-size:0.7rem;">—</div>
+    </div>
+  </div>
+
+  <!-- Mode policy strip: shows the current allowable thresholds so the
+       operator can verify why a signal was rejected. -->
+  <div id="mission-policy-strip" style="margin-top:0.7rem; padding-top:0.6rem; border-top:1px solid var(--border); font-size:0.72rem; color:var(--text-muted);">
+    <span class="text-dim">min conf:</span> <span id="mp-conf" class="mono">—</span>
+    · <span class="text-dim">min edge:</span> <span id="mp-edge" class="mono">—</span>
+    · <span class="text-dim">size×:</span> <span id="mp-size" class="mono">—</span>
+    · <span class="text-dim">max notional:</span> <span id="mp-notional" class="mono">—</span>
+    · <span class="text-dim">claude:</span> <span id="mp-claude" class="mono">—</span>
+  </div>
+</div>
+
+<style>
+/* Per-mode color treatment of the mode badge. Set on #mission-mode-badge
+   via a `data-mode` attribute by renderMission(). */
+#mission-mode-badge[data-mode="SCOUT"]    { background: rgba(148,163,184,0.15); color: var(--text-muted); border:1px solid var(--text-muted); }
+#mission-mode-badge[data-mode="BUILD"]    { background: rgba(74,163,255,0.15);  color: var(--accent,#4aa3ff); border:1px solid var(--accent,#4aa3ff); }
+#mission-mode-badge[data-mode="ATTACK"]   { background: rgba(34,197,94,0.15);   color: var(--good); border:1px solid var(--good); }
+#mission-mode-badge[data-mode="PROTECT"]  { background: rgba(234,179,8,0.18);   color: var(--warn); border:1px solid var(--warn); }
+#mission-mode-badge[data-mode="LOCK"]     { background: rgba(34,197,94,0.30);   color: var(--good); border:1px solid var(--good); font-weight:900; }
+#mission-mode-badge[data-mode="RECOVERY"] { background: rgba(234,179,8,0.18);   color: var(--warn); border:1px solid var(--warn); }
+#mission-mode-badge[data-mode="KILL"]     { background: rgba(239,68,68,0.18);   color: var(--bad); border:1px solid var(--bad); }
+</style>
+
+<!-- ============================================================ -->
+<!-- TRADE QUALITY SCORECARD                                         -->
+<!-- Aggregates today's session into three blocks the operator       -->
+<!-- needs to see at a glance: (a) what's making my decisions,       -->
+<!-- (b) how many trades are backed by measured data, (c) is the     -->
+<!-- reflection dedup actually working.                              -->
+<!-- Polled by live_session.js alongside the existing portfolio /    -->
+<!-- mission updates. Hidden until first successful fetch.           -->
+<!-- ============================================================ -->
+<div class="card mb-4" id="scorecard-panel" style="display:none; border:1px solid var(--border);">
+  <div class="card-header" style="padding-bottom:0.4rem; border-bottom:1px solid var(--border);">
+    <div class="card-title" style="display:flex; align-items:center; gap:0.6rem;">
+      <span>Trade Quality Scorecard</span>
+      <span id="scorecard-session" class="text-dim mono" style="font-size:0.72rem; font-weight:400;">—</span>
+    </div>
+  </div>
+
+  <div class="grid mt-3" style="grid-template-columns: 1.4fr 1fr 1fr; gap: 1rem;">
+    <!-- BLOCK 1: decision-source breakdown -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Decision sources <span id="sc-decisions-total" class="mono text-dim" style="text-transform:none; letter-spacing:0;">(0)</span>
+      </div>
+      <div id="sc-decisions-bars" style="display:flex; flex-direction:column; gap:0.25rem;">
+        <!-- Filled by renderScorecard() -->
+        <div class="text-dim" style="font-size:0.78rem;">waiting for data…</div>
+      </div>
+    </div>
+
+    <!-- BLOCK 2: trade calibration breakdown -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Trade calibration <span id="sc-trades-total" class="mono text-dim" style="text-transform:none; letter-spacing:0;">(0)</span>
+      </div>
+      <div id="sc-calib-bars" style="display:flex; flex-direction:column; gap:0.25rem;">
+        <div class="text-dim" style="font-size:0.78rem;">waiting for data…</div>
+      </div>
+    </div>
+
+    <!-- BLOCK 3: reflection dedup health -->
+    <div>
+      <div class="text-muted" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:0.3rem;">
+        Reflection dedup
+      </div>
+      <div class="mono" style="font-size:1.4rem; font-weight:800;">
+        <span id="sc-dedup-ratio">—%</span>
+      </div>
+      <div class="text-dim" style="font-size:0.7rem;">
+        <span id="sc-dedup-new">0</span> new · <span id="sc-dedup-reinforced">0</span> reinforced
+        <span id="sc-dedup-empty" class="text-dim" style="margin-left:0.3rem;"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- BLOCK 4: top autonomous patterns by sample size -->
+  <details style="margin-top:0.7rem; padding-top:0.6rem; border-top:1px solid var(--border);">
+    <summary class="text-muted mono" style="font-size:0.72rem; letter-spacing:0.05em; text-transform:uppercase; cursor:pointer;">
+      Top patterns by sample size
+    </summary>
+    <div id="sc-top-patterns" style="margin-top:0.5rem; display:flex; flex-direction:column; gap:0.2rem; font-size:0.78rem;">
+      <div class="text-dim">no patterns accumulated yet</div>
+    </div>
+  </details>
+</div>
+
+<style>
+/* Tiny inline bars used by sc-decisions-bars / sc-calib-bars. The bar
+   width is set via inline style by JS; the segment color is set per
+   row via the class names below. */
+.sc-row {
+  display: grid;
+  grid-template-columns: 130px 1fr 50px;
+  gap: 0.5rem;
+  align-items: center;
+  font-size: 0.78rem;
+}
+.sc-row .sc-label { color: var(--text); font-weight: 600; }
+.sc-row .sc-track {
+  height: 8px;
+  background: rgba(255,255,255,0.04);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.sc-row .sc-fill {
+  height: 100%;
+  border-radius: 4px;
+}
+.sc-row .sc-count { font-family: var(--mono); text-align: right; color: var(--text-muted); }
+
+.sc-fill.exact_pattern  { background: var(--good); }
+.sc-fill.knn_neighbors  { background: var(--accent, #4aa3ff); }
+.sc-fill.raw_confidence { background: var(--warn); }
+.sc-fill.training_passthrough { background: var(--accent, #4aa3ff); }
+.sc-fill.autonomous     { background: var(--good); }
+.sc-fill.tech_hold      { background: var(--text-muted); }
+.sc-fill.claude         { background: var(--good); }
+.sc-fill.cache          { background: var(--text-muted); }
+.sc-fill.learn_block    { background: var(--bad); }
+.sc-fill.default        { background: var(--text-muted); }
+</style>
+
+<!-- ============================================================ -->
 <!-- PAPER MONEY STRIP — total bankroll, P&L, exposure              -->
 <!-- ============================================================ -->
 {% set pl = portfolio.total_pl %}
 {% set pl_color = 'var(--good)' if pl > 0.005 else ('var(--bad)' if pl < -0.005 else 'var(--text-muted)') %}
 {% set pl_sign = '+' if pl >= 0 else '−' %}
-<div class="card mb-4" id="paper-money-strip"
+{% set is_session = portfolio.is_session_scoped %}
+{% set hero_subtitle = ('this session' if is_session else 'seeded') %}
+{% set wr_subtitle = ('since reset' if is_session else 'across all paper trades') %}
+<div class="card mb-4 money-strip-card" id="paper-money-strip"
      style="background: linear-gradient(135deg, var(--bg-elev), var(--bg)); border: 1px solid var(--border);">
-  <div class="grid" style="grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr; gap: 1rem; align-items: stretch;">
+
+  {# Session-reset banner: only when a Paper Trading Reset has fired. #}
+  {# Wording is deliberate — operator must see that history is preserved, #}
+  {# not deleted, and exactly how many trades the strip is now hiding.    #}
+  {% if is_session %}
+  <div class="session-reset-banner" style="
+       display: flex; align-items: center; gap: 0.5rem;
+       padding: 0.4rem 0.6rem; margin-bottom: 0.8rem;
+       border-radius: 6px; background: rgba(255,255,255,0.03);
+       border: 1px solid var(--border); font-size: 0.78rem;">
+    <span style="font-weight: 600; color: var(--text);">Session view</span>
+    <span class="text-muted">·</span>
+    <span class="text-muted">
+      Showing P&amp;L since <span class="mono" style="color: var(--text);">{{ portfolio.session_reset_label }}</span>.
+      {% if portfolio.excluded_pre_reset_trades %}
+        {{ portfolio.excluded_pre_reset_trades }} trade{{ '' if portfolio.excluded_pre_reset_trades == 1 else 's' }}
+        from prior sessions hidden — still in DB and feeding the learning engines.
+      {% else %}
+        Full trade history preserved in the database; nothing was deleted.
+      {% endif %}
+    </span>
+  </div>
+  {% endif %}
+
+  <div class="money-strip-grid">
 
     <!-- HERO: current paper equity + P&L -->
     <div style="padding: 0.6rem 0.4rem;">
@@ -205,20 +409,20 @@ function recordIntelAction(type, symbol, reason) {
       <div class="mono" style="font-size: 2.6rem; font-weight: 800; line-height: 1.1; letter-spacing: -0.02em;">
         ${{ '{:,.2f}'.format(portfolio.current) }}
       </div>
-      <div class="flex items-center gap-2" style="margin-top: 0.35rem;">
+      <div class="flex items-center gap-2" style="margin-top: 0.35rem; flex-wrap: wrap;">
         <span class="mono" style="font-size: 1.15rem; font-weight: 700; color: {{ pl_color }};">
           {{ pl_sign }}${{ '{:,.2f}'.format(pl|abs) }}
         </span>
         <span class="mono" style="font-size: 0.95rem; font-weight: 600; color: {{ pl_color }};">
           ({{ pl_sign }}{{ '%.2f' | format(portfolio.total_pl_pct|abs) }}%)
         </span>
-        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} seeded</span>
+        <span class="text-dim" style="font-size: 0.78rem;">vs. ${{ '{:,.2f}'.format(portfolio.starting) }} {{ hero_subtitle }}</span>
       </div>
     </div>
 
     <!-- Realized P&L -->
     {% set rcol = 'var(--good)' if portfolio.realized > 0.005 else ('var(--bad)' if portfolio.realized < -0.005 else 'var(--text)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Realized P&amp;L</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ rcol }};">
         {{ '+' if portfolio.realized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.realized|abs) }}
@@ -228,16 +432,16 @@ function recordIntelAction(type, symbol, reason) {
 
     <!-- Unrealized P&L -->
     {% set ucol = 'var(--good)' if portfolio.unrealized > 0.005 else ('var(--bad)' if portfolio.unrealized < -0.005 else 'var(--text)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Unrealized P&amp;L</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ ucol }};">
         {{ '+' if portfolio.unrealized >= 0 else '−' }}${{ '{:,.2f}'.format(portfolio.unrealized|abs) }}
       </div>
-      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open positions</div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ portfolio.open_trades }} open position{{ '' if portfolio.open_trades == 1 else 's' }}</div>
     </div>
 
     <!-- Capital deployed -->
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Capital Deployed</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800;">
         ${{ '{:,.2f}'.format(portfolio.invested_open) }}
@@ -249,16 +453,44 @@ function recordIntelAction(type, symbol, reason) {
 
     <!-- Win rate -->
     {% set wcol = 'var(--good)' if portfolio.win_rate >= 0.55 else ('var(--warn)' if portfolio.win_rate >= 0.4 else 'var(--bad)') %}
-    <div style="padding: 0.6rem 0.4rem; border-left: 1px solid var(--border);">
+    <div class="money-strip-cell">
       <div class="text-muted" style="font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;">Win Rate</div>
       <div class="mono" style="font-size: 1.7rem; font-weight: 800; color: {{ wcol if portfolio.closed_trades else 'var(--text)' }};">
         {{ '%.1f' | format(portfolio.win_rate * 100) }}%
       </div>
-      <div class="text-dim" style="font-size: 0.78rem;">across all paper trades</div>
+      <div class="text-dim" style="font-size: 0.78rem;">{{ wr_subtitle }}</div>
     </div>
 
   </div>
 </div>
+
+<style>
+/* Money strip: 5-column desktop, collapses cleanly at narrow widths.
+   Without this the fixed `1.4fr 1fr 1fr 1fr 1fr` grid squashes the hero
+   number into a 2-line wrap by the time you hit a 13" laptop. */
+.money-strip-grid {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr 1fr 1fr 1fr;
+  gap: 1rem;
+  align-items: stretch;
+}
+.money-strip-cell {
+  padding: 0.6rem 0.4rem;
+  border-left: 1px solid var(--border);
+}
+@media (max-width: 1100px) {
+  .money-strip-grid { grid-template-columns: 1fr 1fr 1fr; }
+  .money-strip-cell:nth-child(2),
+  .money-strip-cell:nth-child(3) { border-left: 1px solid var(--border); }
+  .money-strip-cell:nth-child(4) { border-left: none; border-top: 1px solid var(--border); padding-top: 0.8rem; }
+  .money-strip-cell:nth-child(5) { border-left: 1px solid var(--border); border-top: 1px solid var(--border); padding-top: 0.8rem; }
+}
+@media (max-width: 720px) {
+  .money-strip-grid { grid-template-columns: 1fr 1fr; }
+  .money-strip-cell { border-left: none; border-top: 1px solid var(--border); padding-top: 0.6rem; }
+  .money-strip-cell:nth-child(odd) { border-right: 1px solid var(--border); }
+}
+</style>
 
 <!-- ============================================================ -->
 <!-- P&L BY TIME PERIOD                                            -->
@@ -1752,51 +1984,45 @@ document.addEventListener('keydown', e => {
 </div>
 
 <!-- ============================================================ -->
-<!-- SYNTHETIC TRAINING SESSION                                      -->
+<!-- SIGNAL EDGE AUDIT                                               -->
 <!-- ============================================================ -->
-<div class="grid grid-2-1 mb-4">
-  <div class="card">
-    <div class="card-header"><div class="card-title">Synthetic Training Session</div></div>
-    <p class="text-muted mb-3" style="font-size: 0.82rem;">
-      Run a fast offline simulation against synthetic snapshots to bootstrap the playbook before unleashing the bot on live data.
-      Great for stress-testing risk profiles and seeing how Claude handles edge cases.
-    </p>
-    <form hx-post="/training/run" hx-target="#training-result" hx-swap="innerHTML" hx-indicator="#train-spinner" class="grid grid-2">
-      <div class="field"><label>Wallet (optional)</label>
-        <select class="select" name="wallet_id"><option value="">— None —</option>{% for w in wallets %}<option value="{{ w.id }}">{{ w.name }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Strategy (optional)</label>
-        <select class="select" name="strategy_id"><option value="">— None —</option>{% for s in strategies %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Market</label>
-        <select class="select" name="market_type">{% for m in market_types %}<option>{{ m }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Risk Level</label>
-        <select class="select" name="risk_level">{% for r in risk_levels %}<option>{{ r }}</option>{% endfor %}</select>
-      </div>
-      <div class="field"><label>Number of Trades</label><input class="input" name="num_trades" type="number" min="5" max="500" value="50"></div>
-      <div class="field"><label>Starting Balance</label><input class="input" name="starting_balance" type="number" step="0.01" value="10000"></div>
-      <div style="grid-column: 1 / -1;" class="flex items-center gap-3 mt-2">
-        <button class="btn btn-primary" type="submit">Run Training</button>
-        <span id="train-spinner" class="htmx-indicator"><span class="spinner"></span> <span class="text-muted">simulating...</span></span>
-      </div>
-    </form>
-  </div>
-
-  <div class="card">
-    <div class="card-header"><div class="card-title">How the bot learns</div></div>
-    <ol style="font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; color: var(--text-muted);">
-      <li><strong style="color: var(--text);">Decide.</strong> The technical engine produces a signal; Claude reviews it with the full playbook and recent history before choosing an action.</li>
-      <li><strong style="color: var(--text);">Act.</strong> The trade is opened in paper mode through the existing risk manager. All caps still apply.</li>
-      <li><strong style="color: var(--text);">Reflect.</strong> When the trade closes, Claude writes a verdict (good_call / bad_call / lucky / unlucky / neutral) and a -1..1 process-quality score.</li>
-      <li><strong style="color: var(--text);">Remember.</strong> Up to 3 generalizable lessons per reflection are added to the playbook with weights.</li>
-      <li><strong style="color: var(--text);">Consolidate.</strong> Periodically the playbook is compressed: duplicates merged, contradictions resolved, weights re-ranked.</li>
-      <li><strong style="color: var(--text);">Graduate.</strong> Once the readiness score crosses 75 with a healthy sample size and win rate, you can flip a wallet to <span class="mono">live_shadow</span> and finally to <span class="mono">live</span>.</li>
-    </ol>
-  </div>
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">Signal Edge Audit</div></div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem;">
+    Run the live technical signal over recent Coinbase candle history for every symbol in the liquid universe.
+    Reports whether BUY signals actually pick better moments than buy-and-hold, after a 30&nbsp;bps round-trip fee assumption.
+    This is the definitive answer to <em>is the signal worth trusting</em> — independent of any session's results.
+    Takes roughly 30&ndash;60 seconds.
+  </p>
+  <form hx-post="/training/signal-audit" hx-target="#signal-audit-result" hx-swap="innerHTML" hx-indicator="#audit-spinner">
+    <div class="flex items-center gap-3">
+      <button class="btn btn-primary" type="submit">Run Audit</button>
+      <span id="audit-spinner" class="htmx-indicator">
+        <span class="spinner"></span>
+        <span class="text-muted">Fetching history and evaluating signal &mdash; this may take 30&ndash;60 seconds...</span>
+      </span>
+    </div>
+  </form>
+  <div id="signal-audit-result"></div>
 </div>
 
-<div id="training-result"></div>
+
+<!-- ============================================================ -->
+<!-- HOW THE BOT LEARNS                                              -->
+<!-- ============================================================ -->
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">How the bot learns</div></div>
+  <ol style="font-size: 0.85rem; line-height: 1.6; padding-left: 1.2rem; color: var(--text-muted);">
+    <li><strong style="color: var(--text);">Score.</strong> The strategy engine produces a technical signal; the adaptive engine looks up similar past trades and adjusts confidence and size before anything happens.</li>
+    <li><strong style="color: var(--text);">Filter.</strong> A confluence gate blocks weak entries (oversold shorts, blow-off buys, no-volume setups). Long-only and a hard per-trade size cap are enforced at the engine boundary, regardless of which caller initiated the trade.</li>
+    <li><strong style="color: var(--text);">Act.</strong> The trade opens through paper trading with a holding profile that fixes its take-profit, max loss, trailing stop, and hard time cap at entry.</li>
+    <li><strong style="color: var(--text);">Reflect.</strong> When the trade closes, Claude writes a verdict (good_call / bad_call / lucky / unlucky / neutral) and a -1..1 process-quality score, plus up to 3 generalizable lessons.</li>
+    <li><strong style="color: var(--text);">Remember.</strong> Reflection lessons land in the playbook; the autonomous engine derives a pattern fingerprint from the trade's entry context and outcome, and the adaptive engine updates its per-pattern and per-symbol statistics.</li>
+    <li><strong style="color: var(--text);">Adapt.</strong> On the next tick, the adaptive lookup uses the updated memory: known-losing fingerprints get smaller size, the strongest known losers get blocked outright (LEARN_BLOCK).</li>
+    <li><strong style="color: var(--text);">Consolidate.</strong> Periodically the playbook is compressed: duplicates merged, contradictions resolved, weights re-ranked.</li>
+    <li><strong style="color: var(--text);">Graduate.</strong> Once the readiness score crosses 75 with a healthy sample size and win rate, a wallet can be flipped from paper toward live trading.</li>
+  </ol>
+</div>
 
 <script src="/static/positions_lab.js?v=2"></script>
 <script src="/static/live_session.js?v=2"></script>

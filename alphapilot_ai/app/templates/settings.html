@@ -141,6 +141,23 @@
         <option value="false" {{ '' if bot_cfg.dry_run else 'selected' }}>Live paper — actually open trades</option>
       </select>
     </div>
+    <div class="field">
+      <label>Holding Mode</label>
+      <select class="select" name="bot_holding_mode">
+        {% for value, label in holding_modes %}
+          <option value="{{ value }}" {{ 'selected' if bot_cfg.holding_mode == value else '' }}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <small class="text-muted">How long trades are held and when they exit. "AI decides" lets Claude pick a profile per trade.</small>
+    </div>
+    <div class="field">
+      <label>Long-Only</label>
+      <select class="select" name="bot_long_only">
+        <option value="true"  {{ 'selected' if bot_cfg.long_only else '' }}>On — never open shorts (recommended)</option>
+        <option value="false" {{ '' if bot_cfg.long_only else 'selected' }}>Off — allow short entries</option>
+      </select>
+      <small class="text-muted">Signal testing measured SELL/short entries at strongly negative edge. Keep On for spot trading.</small>
+    </div>
 
     <div class="field" style="grid-column: 1 / -1;">
       <button class="btn btn-primary" type="submit">Save Bot Settings</button>
@@ -433,6 +450,35 @@
     Live trading is intentionally disabled. To enable it you must set <span class="mono">LIVE_TRADING_ENABLED=true</span> in your <span class="mono">.env</span> file and restart the server. Even then, no real-API trade execution code is wired up.
   </div>
   <p class="text-muted">All API credentials are stored as encrypted-at-rest placeholders. Replace the placeholder columns in <span class="mono">api_credentials_placeholder</span> with real encrypted storage (e.g. <span class="mono">cryptography.fernet</span> or an OS keychain) before going live.</p>
+</div>
+
+<!-- =============================================================
+     DAILY MISSION CONTROLLER — gating toggle
+     ============================================================= -->
+<div class="card mt-4" id="mission">
+  <div class="card-header">
+    <div class="card-title">Daily Mission Controller</div>
+  </div>
+  <p class="text-muted mb-3">
+    The "boss layer" over the trade pipeline. When enabled, every trade decision passes through a state machine
+    over today's P&amp;L (SCOUT / BUILD / ATTACK / PROTECT / LOCK / RECOVERY / KILL) that adjusts the confidence
+    floor, position size, Claude routing, and per-symbol/strategy throttles. The mission panel will appear at
+    the top of the AI Training page once this is on.
+  </p>
+  <div class="banner banner-warn" style="margin-bottom:0.8rem;">
+    Scout-mode defaults are conservative: <span class="mono">conf ≥ 0.64</span>, <span class="mono">expected net edge ≥ $0.03</span> per trade.
+    Turning this on for the first time will reject most signals until either thresholds are tuned or trade quality improves.
+  </div>
+  <form method="post" action="/settings/mission/save" class="flex gap-2 items-end">
+    <div class="field">
+      <label>Mission Controller</label>
+      <select class="select" name="mission_controller_enabled">
+        <option value="false" {% if not mission_enabled %}selected{% endif %}>Disabled (default — passthrough)</option>
+        <option value="true"  {% if mission_enabled %}selected{% endif %}>Enabled (enforce mode policies)</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" type="submit">Save</button>
+  </form>
 </div>
 
 <div class="card mt-4">

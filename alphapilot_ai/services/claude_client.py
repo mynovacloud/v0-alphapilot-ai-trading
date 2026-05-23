@@ -49,11 +49,19 @@ def chat(
     max_tokens: int = 1024,
     temperature: float = 0.4,
     model: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> dict[str, Any]:
     """
     Send a single user message to Claude. Returns:
         {"ok": True,  "text": "...", "raw": <full response>}
         {"ok": False, "error": "..."}
+
+    `timeout` is the per-call HTTP timeout in seconds (defaults to
+    DEFAULT_TIMEOUT). Bump it on calls with large max_tokens or rich
+    prompts — Claude streams text-block tokens within the response, so
+    the read phase scales with output size and a 30s default that's
+    fine for decision calls (max_tokens≈700) routinely times out on
+    reflection calls (max_tokens=2000 over a nested schema).
     """
     key = _api_key()
     if not key:
@@ -75,7 +83,12 @@ def chat(
     }
 
     try:
-        with httpx.Client(timeout=DEFAULT_TIMEOUT) as c:
+        # Split timeouts so a slow connect doesn't get the same budget as a
+        # slow read. Connect/write/pool stay tight (fail fast on infra
+        # problems); read gets the configurable budget (scales with output).
+        effective_read = float(timeout) if timeout is not None else DEFAULT_TIMEOUT
+        http_timeout = httpx.Timeout(connect=10.0, read=effective_read, write=10.0, pool=10.0)
+        with httpx.Client(timeout=http_timeout) as c:
             r = c.post(API_URL, headers=headers, json=body)
         if r.status_code != 200:
             # Anthropic returns structured errors — surface the message if present.

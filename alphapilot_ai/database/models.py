@@ -71,6 +71,15 @@ class Wallet(Base):
     api_status = Column(String(40), default="mock")
     last_synced = Column(DateTime, default=utcnow)
     created_at = Column(DateTime, default=utcnow)
+    # Bankroll-reset markers. NULL on a wallet that has never been reset.
+    # When the Paper Trading Reset action fires, we stamp utcnow() here and
+    # remember the value paper_balance was reset to. The training-page money
+    # strip filters realized P&L to trades closed AFTER this timestamp, so
+    # the operator sees performance "since the new $10K" instead of all-time
+    # numbers that mix the old and new sessions. Trade history is NEVER
+    # deleted — these columns are purely a display-filter cursor.
+    bankroll_reset_at = Column(DateTime, nullable=True)
+    session_starting_bankroll = Column(Float, nullable=True)
     # Metadata for session settings backup/restore
     meta = Column(JSON, default=dict)
 
@@ -155,6 +164,12 @@ class PaperTrade(Base):
     # Time-based exit: auto-close if position is older than N hours and flat.
     time_limit_hours = Column(Float, nullable=True)
 
+    # Holding profile resolved at entry — one of the BASE names in
+    # trading/holding_profiles.py (scalp | short_hold | short_swing |
+    # long_hold). Stamped once at open so the trade's exit rules never
+    # shift mid-flight even if the operator changes the global mode.
+    holding_profile = Column(String(20), nullable=True)
+
     # DCA / averaging support. `dca_count` tracks how many times we've added
     # on losses. `scale_in_count` is the inverse — pyramiding into winners.
     # Keep them separate so a position that pyramided 3 times during an
@@ -172,6 +187,18 @@ class PaperTrade(Base):
     # learning engine rebuild the entry-time market context on close. Nullable
     # because not every trade originates from a Claude decision (e.g. manual).
     claude_decision_id = Column(Integer, ForeignKey("claude_decisions.id"), nullable=True, index=True)
+
+    # Phase B calibration audit: which tier of the win-probability estimator
+    # backed the approval. Populated by bot_engine when the trade is opened.
+    # The training-page scorecard aggregates these to show the operator how
+    # many trades today were backed by measured data vs raw confidence.
+    #   - 'exact_pattern' : same fingerprint has >= MIN_EXACT_PATTERN_TRADES
+    #                       closed trades; uses measured win_rate.
+    #   - 'knn_neighbors' : kNN of similar trades by vector distance.
+    #   - 'raw_confidence': no historical data; fell back to signal confidence.
+    #   - NULL on manual / pre-Phase-B trades.
+    calibration_source = Column(String(20), nullable=True, index=True)
+    calibration_sample_size = Column(Integer, nullable=True)
 
     wallet = relationship("Wallet", back_populates="trades")
     strategy = relationship("Strategy")

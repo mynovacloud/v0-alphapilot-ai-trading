@@ -15,7 +15,6 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ai.ai_engine import AIEngine
 from ai.learning_memory import LearningMemory
 from analytics.performance import performance_metrics
 from analytics.portfolio import (
@@ -42,6 +41,7 @@ from database.models import (
     ActivityLog,
     AppSetting,
     ApiCredentialPlaceholder,
+    ClaudeDecision,
     PaperTrade,
     Position,
     Strategy,
@@ -147,7 +147,6 @@ templates.env.filters["timeago"] = _fmt_timeago
 router = APIRouter()
 
 _engine = PaperTradingEngine()
-_ai = AIEngine()
 _memory = LearningMemory()
 
 
@@ -1121,15 +1120,49 @@ def training_page(request: Request) -> HTMLResponse:
 
         # Portfolio P&L roll-up across every paper trade (powers the bold
         # money-strip at the top of the Training Center).
+        #
+        # "Session" scoping: when Settings → Paper Trading Reset has fired,
+        # each wallet carries a bankroll_reset_at cursor + session starting
+        # bankroll. The money strip then shows P&L SINCE that point, while
+        # the underlying PaperTrade rows are untouched (the playbook,
+        # reflections, autonomous-engine fingerprints all still see them).
+        # Trades closed before the cursor are excluded from realized P&L
+        # so the operator sees "new profits/losses against the new $10K"
+        # without losing any history.
         all_trades = s.query(PaperTrade).all()
-        starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
+        # Pick the most recent reset across wallets as the session cutoff.
+        # If no wallet has ever been reset, cutoff is None and the math
+        # collapses to "all-time" (the legacy behavior).
+        wallet_rows = s.query(Wallet).all()
+        reset_cutoff = None
+        for w in wallet_rows:
+            if w.bankroll_reset_at is not None:
+                if reset_cutoff is None or w.bankroll_reset_at > reset_cutoff:
+                    reset_cutoff = w.bankroll_reset_at
+        # Starting bankroll: prefer the session-starting value when a reset
+        # has stamped one, else the live paper_balance (legacy behavior).
+        if reset_cutoff is not None:
+            starting = sum(
+                float(w.session_starting_bankroll or w.paper_balance or 0.0)
+                for w in wallet_rows
+            )
+        else:
+            starting = sum((w.get("paper_balance") or 0.0) for w in wallets)
         realized = 0.0
         unrealized = 0.0
         invested_open = 0.0
         wins = 0
         losses = 0
+        excluded_pre_reset = 0
         for t in all_trades:
             if t.status == "closed":
+                # Trades closed before the cutoff belong to the OLD session.
+                # Keep them in the DB (they feed learning) but don't count
+                # them in this session's money strip.
+                closed_at = t.closed_at
+                if reset_cutoff is not None and closed_at is not None and closed_at < reset_cutoff:
+                    excluded_pre_reset += 1
+                    continue
                 pnl = t.realized_pnl or 0.0
                 realized += pnl
                 if pnl > 0:
@@ -1137,6 +1170,8 @@ def training_page(request: Request) -> HTMLResponse:
                 elif pnl < 0:
                     losses += 1
             else:
+                # All currently-open trades count toward unrealized P&L
+                # regardless of when they opened — they're live capital now.
                 unrealized += (t.unrealized_pnl or 0.0)
                 invested_open += (t.entry_price or 0.0) * (t.qty or 0.0)
         closed_count = wins + losses
@@ -1148,11 +1183,22 @@ def training_page(request: Request) -> HTMLResponse:
             "total_pl": realized + unrealized,
             "total_pl_pct": ((realized + unrealized) / starting * 100.0) if starting else 0.0,
             "invested_open": invested_open,
-            "open_trades": len(all_trades) - closed_count,
+            "open_trades": sum(1 for t in all_trades if t.status != "closed"),
             "closed_trades": closed_count,
             "wins": wins,
             "losses": losses,
             "win_rate": (wins / closed_count) if closed_count else 0.0,
+            "session_reset_at": reset_cutoff.isoformat() if reset_cutoff else None,
+            # Human-readable label for the money-strip subtitle. Server-side
+            # so the template stays free of timezone-conversion JS. UTC since
+            # the rest of the page uses UTC consistently in storage.
+            "session_reset_label": (
+                reset_cutoff.strftime("%b %d at %I:%M %p UTC").replace(" 0", " ")
+                if reset_cutoff else None
+            ),
+            "excluded_pre_reset_trades": excluded_pre_reset,
+            # Whether to apply session-scoped framing to subtitles.
+            "is_session_scoped": reset_cutoff is not None,
         }
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
@@ -1317,6 +1363,25 @@ def _truthy(v: str | None) -> bool:
     return str(v or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _mission_snapshot_for_feed() -> dict[str, Any]:
+    """Lazy import + snapshot of the Daily Mission Controller.
+
+    Returns a small dict every poll so the training UI can render the current
+    mode, distance to target, and key thresholds without separate endpoints.
+    When the controller is disabled (mission_controller_enabled = False) the
+    snapshot returns `{"enabled": False, "mode": "BUILD"}` and the UI hides
+    the panel.
+    """
+    try:
+        from risk.daily_mission_controller import get_mission_controller, is_enabled
+        snap = get_mission_controller().snapshot()
+        snap["enabled"] = is_enabled()
+        return snap
+    except Exception:
+        # Never let the controller break the polling endpoint.
+        return {"enabled": False, "mode": "BUILD", "error": "snapshot_failed"}
+
+
 @router.post("/training/session/start")
 def training_session_start(
     tick_seconds: int = Form(15),
@@ -1443,13 +1508,27 @@ def training_session_start(
                         w.meta = {}
                     w.meta["_session_prev_max_open"] = w.max_open_positions
                     w.meta["_session_prev_max_position_usd"] = w.max_position_usd
+                    w.meta["_session_prev_max_daily_trades"] = w.max_daily_trades
                     w.meta["_session_prev_trading_style"] = getattr(w, "trading_style", None)
                 except Exception:
                     # meta column may not exist in older schema - skip the backup
                     pass
                 # Apply session settings to wallet
                 w.max_open_positions = max_open
-                w.max_position_usd = pos_usd
+                # The wallet hard cap must sit ABOVE the per-trade size, not
+                # equal to it. The position sizer targets pos_usd and scales
+                # up on high conviction; a cap == pos_usd then rejects nearly
+                # every trade ("Notional $750 > cap $750", code
+                # wallet_position_cap) on conviction boosts and float
+                # rounding alone. 2x keeps a real safety rail with room for
+                # the sizer to work.
+                w.max_position_usd = pos_usd * 2.0
+                # A training session exists to generate many trades to learn
+                # from; the default 10-trades/day cap (code wallet_daily_count)
+                # chokes it within the first minute at a 7s tick. 0 disables
+                # the daily-count gate entirely for the duration of the
+                # session (RiskManager skips the check when it is falsy).
+                w.max_daily_trades = 0
                 w.bot_paused = False  # Unpause all wallets for training
                 # Force the trading style for the duration of the session so the
                 # autonomous engine and exit loop both honor what the user picked
@@ -1459,7 +1538,7 @@ def training_session_start(
                     w.trading_style = style
                 except Exception:
                     pass
-            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, max_position_usd={pos_usd}, trading_style={style}")
+            logger.info(f"[SESSION_START] Updated {len(wallets)} wallets: max_open={max_open}, position_size=${pos_usd}, max_position_usd=${pos_usd * 2.0}, max_daily_trades=0 (unlimited), trading_style={style}")
 
         bot_scheduler.reload()  # pick up the new tick interval
 
@@ -1561,6 +1640,170 @@ def training_learning_stats() -> JSONResponse:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 
+@router.get("/training/scorecard")
+def training_scorecard() -> JSONResponse:
+    """Trade-quality scorecard for the training UI.
+
+    Aggregates today's session into three blocks the operator should see at
+    a glance:
+
+      1. DECISION SOURCES — across every ClaudeDecision row since the last
+         bankroll reset, count what `source` produced each verdict. This
+         answers "what's actually making my trade decisions today?" — is it
+         the autonomous engine dominating, training_passthroughs, or Claude?
+
+      2. TRADE CALIBRATION — across PaperTrade rows opened since the last
+         bankroll reset, count which Phase B calibration tier
+         (exact_pattern / knn_neighbors / raw_confidence) backed each
+         approved trade. Tells the operator how many trades today were
+         based on measured pattern data vs heuristic confidence.
+
+      3. REFLECTION DEDUP — over the past N reflections, sum lessons_added
+         vs lessons_reinforced. Proves whether the new dedup is matching
+         paraphrases (reinforced rises) or still cloning everything
+         (reinforced stays at 0).
+
+    Cheap to compute (three small aggregations); safe to poll on the
+    feed cadence.
+    """
+    from datetime import datetime, timezone
+    from sqlalchemy import func
+
+    try:
+        with session_scope() as s:
+            # --- session cutoff ----------------------------------------------
+            # Use the most recent bankroll_reset_at across wallets as "today".
+            # If no wallet has been reset, fall back to UTC start-of-day.
+            wallets_db = s.query(Wallet).all()
+            cutoff = None
+            for w in wallets_db:
+                if w.bankroll_reset_at is not None:
+                    if cutoff is None or w.bankroll_reset_at > cutoff:
+                        cutoff = w.bankroll_reset_at
+            if cutoff is None:
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                cutoff = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            # --- decision sources (block 1) ----------------------------------
+            decision_rows = (
+                s.query(ClaudeDecision.source, ClaudeDecision.action, func.count())
+                .filter(ClaudeDecision.created_at >= cutoff)
+                .group_by(ClaudeDecision.source, ClaudeDecision.action)
+                .all()
+            )
+            decision_breakdown: dict[str, dict[str, int]] = {}
+            total_decisions = 0
+            for src, action, count in decision_rows:
+                src_key = (src or "unknown").strip()
+                action_key = (action or "HOLD").strip().upper()
+                decision_breakdown.setdefault(src_key, {"HOLD": 0, "BUY": 0, "SELL": 0, "OTHER": 0})
+                bucket = action_key if action_key in {"HOLD", "BUY", "SELL"} else "OTHER"
+                decision_breakdown[src_key][bucket] += int(count or 0)
+                total_decisions += int(count or 0)
+
+            # --- trade calibration (block 2) ---------------------------------
+            calib_rows = (
+                s.query(PaperTrade.calibration_source, func.count(), func.avg(PaperTrade.calibration_sample_size))
+                .filter(PaperTrade.opened_at >= cutoff)
+                .group_by(PaperTrade.calibration_source)
+                .all()
+            )
+            calib_breakdown = []
+            total_trades = 0
+            for src, count, avg_n in calib_rows:
+                src_key = (src or "raw_confidence")
+                cnt = int(count or 0)
+                calib_breakdown.append({
+                    "source": src_key,
+                    "count": cnt,
+                    "avg_sample_size": round(float(avg_n or 0.0), 1),
+                })
+                total_trades += cnt
+            # Stable ordering so the UI renders in the same place every poll.
+            _ORDER = {"exact_pattern": 0, "knn_neighbors": 1, "raw_confidence": 2}
+            calib_breakdown.sort(key=lambda r: _ORDER.get(r["source"], 99))
+
+            # --- reflection dedup (block 3) ----------------------------------
+            # Sum lessons_added vs reinforced across the most recent N
+            # reflections (since cutoff). We don't have explicit columns for
+            # added/reinforced on TradeReflection — they're embedded in the
+            # ActivityLog message "(new=N, reinforced=M)". We parse that.
+            reflection_logs = (
+                s.query(ActivityLog.message)
+                .filter(ActivityLog.category == "ai")
+                .filter(ActivityLog.created_at >= cutoff)
+                .filter(ActivityLog.message.like("Reflection saved%"))
+                .all()
+            )
+            import re
+            lessons_new = 0
+            lessons_reinforced = 0
+            reflections_count = 0
+            empty_reflections = 0
+            for (msg,) in reflection_logs:
+                reflections_count += 1
+                m = re.search(r"new=(\d+),\s*reinforced=(\d+)", msg or "")
+                if m:
+                    lessons_new += int(m.group(1))
+                    lessons_reinforced += int(m.group(2))
+                # Detect the "lessons=0 ... — <cause>" pattern from Phase A.
+                if "lessons=0" in (msg or ""):
+                    empty_reflections += 1
+
+            dedup_ratio = (
+                lessons_reinforced / (lessons_new + lessons_reinforced)
+                if (lessons_new + lessons_reinforced) > 0 else 0.0
+            )
+
+            # --- top patterns (block 4) — autonomous engine top fingerprints --
+            top_patterns = []
+            try:
+                from ai.autonomous_learning_engine import get_autonomous_engine
+                eng = get_autonomous_engine()
+                eng._ensure_loaded()
+                # _patterns is dict[fingerprint -> LearnedPattern]
+                ranked = sorted(
+                    eng._patterns.values(),
+                    key=lambda p: p.total_trades,
+                    reverse=True,
+                )[:5]
+                for p in ranked:
+                    top_patterns.append({
+                        "fingerprint": p.fingerprint,
+                        "side": p.side,
+                        "sample_size": int(p.total_trades),
+                        "win_rate": round(float(p.win_rate or 0.0), 3),
+                        "expectancy_pct": round(float(p.expectancy or 0.0) * 100, 2),
+                    })
+            except Exception:
+                # Top-patterns is supplementary — don't block the scorecard
+                # if the engine can't be queried right now.
+                top_patterns = []
+
+            return JSONResponse({
+                "ok": True,
+                "session_cutoff": cutoff.isoformat(),
+                "decisions": {
+                    "total": total_decisions,
+                    "by_source": decision_breakdown,
+                },
+                "trades": {
+                    "total": total_trades,
+                    "by_calibration": calib_breakdown,
+                },
+                "reflections": {
+                    "total": reflections_count,
+                    "lessons_new": lessons_new,
+                    "lessons_reinforced": lessons_reinforced,
+                    "dedup_ratio": round(dedup_ratio, 3),
+                    "empty": empty_reflections,
+                },
+                "top_patterns": top_patterns,
+            })
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+
 @router.get("/training/learning/symbol/{symbol}")
 def training_learning_symbol(symbol: str) -> JSONResponse:
     """Get learned insights for a specific symbol."""
@@ -1634,6 +1877,9 @@ def training_session_stop() -> JSONResponse:
                         # Clean up the temporary keys
                         w.meta.pop("_session_prev_max_open", None)
                         w.meta.pop("_session_prev_max_position_usd", None)
+                    if w.meta and "_session_prev_max_daily_trades" in w.meta:
+                        w.max_daily_trades = w.meta.get("_session_prev_max_daily_trades")
+                        w.meta.pop("_session_prev_max_daily_trades", None)
                     if w.meta and "_session_prev_trading_style" in w.meta:
                         prev_style = w.meta.get("_session_prev_trading_style")
                         if prev_style:
@@ -1794,13 +2040,32 @@ def training_session_feed(
         # ---- Live portfolio mark-to-market ----
         # Query wallets directly from database to ensure we get fresh data
         wallets_db = s.query(Wallet).all()
-        starting = sum(float(w.paper_balance or 0) for w in wallets_db)
+        # Session-scoped money strip. See training_page() for the full
+        # rationale: when a Paper Trading Reset has been performed, P&L is
+        # computed only from trades closed AFTER the reset cutoff so the
+        # operator sees "since the new $10K" instead of all-time numbers.
+        # Trade history is never deleted — this is purely a display filter.
+        reset_cutoff = None
+        for w in wallets_db:
+            if w.bankroll_reset_at is not None:
+                if reset_cutoff is None or w.bankroll_reset_at > reset_cutoff:
+                    reset_cutoff = w.bankroll_reset_at
+        if reset_cutoff is not None:
+            starting = sum(
+                float(w.session_starting_bankroll or w.paper_balance or 0.0)
+                for w in wallets_db
+            )
+        else:
+            starting = sum(float(w.paper_balance or 0) for w in wallets_db)
         wallet_count = len(wallets_db)
-        
-        logging.info(f"[SESSION_FEED] Wallets: {wallet_count} found, starting balance=${starting}")
+
+        logging.info(
+            f"[SESSION_FEED] Wallets: {wallet_count} found, starting=${starting}, "
+            f"session_reset_at={reset_cutoff.isoformat() if reset_cutoff else 'never'}"
+        )
         for w in wallets_db:
             logging.info(f"[SESSION_FEED]   - {w.name}: paper_balance=${w.paper_balance}")
-        
+
         # If no starting balance, use a default seed amount for display
         if starting == 0:
             starting = 10000.0  # Default seed for display purposes
@@ -1824,8 +2089,16 @@ def training_session_feed(
         
         logging.info(f"[SESSION_FEED] Fetched prices for {len(symbol_prices)} symbols")
         
+        excluded_pre_reset = 0
         for t in all_trades:
             if t.status == "closed":
+                # Trades closed BEFORE the bankroll reset don't count toward
+                # session P&L (but stay in the DB — the autonomous engine,
+                # playbook, and reflections all still see them).
+                closed_at = t.closed_at
+                if reset_cutoff is not None and closed_at is not None and closed_at < reset_cutoff:
+                    excluded_pre_reset += 1
+                    continue
                 pnl = float(t.realized_pnl or 0)
                 realized += pnl
                 if pnl > 0:
@@ -1862,6 +2135,12 @@ def training_session_feed(
             "wins": wins,
             "losses": losses,
             "win_rate": round((wins / closed_count) if closed_count else 0.0, 4),
+            # When a bankroll reset has fired, these tell the UI we're
+            # showing P&L "since X" instead of all-time. UI can render a
+            # subtle banner like: "Showing 12 trades since reset at HH:MM.
+            # Full history preserved in Recent Decisions / Playbook."
+            "session_reset_at": reset_cutoff.isoformat() if reset_cutoff else None,
+            "excluded_pre_reset_trades": excluded_pre_reset,
         }
 
         # ---- Compute the session-start cutoff ONCE, used to scope every
@@ -1996,6 +2275,7 @@ def training_session_feed(
                 "bot_enabled": sched.get("bot_enabled"),
             },
             "portfolio": portfolio,
+            "mission": _mission_snapshot_for_feed(),
             "decisions": decisions_payload,
             "fills": fills_payload,
             "logs": logs_payload,
@@ -2010,32 +2290,57 @@ def training_session_feed(
     )
 
 
-@router.post("/training/run", response_class=HTMLResponse)
-def training_run(
-    request: Request,
-    wallet_id: int | None = Form(None),
-    strategy_id: int | None = Form(None),
-    market_type: str = Form("Crypto"),
-    risk_level: str = Form("Moderate"),
-    num_trades: int = Form(50),
-    starting_balance: float = Form(10000.0),
-) -> HTMLResponse:
-    result = _ai.run_training_session(
-        wallet_id=wallet_id if wallet_id else None,
-        strategy_id=strategy_id if strategy_id else None,
-        market_type=market_type,
-        risk_level=risk_level,
-        num_trades=num_trades,
-        starting_balance=starting_balance,
+@router.post("/training/signal-audit", response_class=HTMLResponse)
+def training_signal_audit(request: Request) -> HTMLResponse:
+    """Run the signal-edge harness over the liquid universe and return the
+    report as HTML for HTMX swap-in. The button this serves lives on the
+    AI Training page — the operator clicks it when they want to know
+    whether the underlying signal is worth trusting (independent of any
+    session results)."""
+    from html import escape as _esc
+    try:
+        from signal_edge import run_audit_lite
+        result = run_audit_lite(bars=600)
+    except RuntimeError as e:
+        # Audit already running — surface a clear wait message, not a 500.
+        body = (
+            f'<div class="text-muted" style="padding: 0.75rem;">'
+            f'<strong>{_esc(str(e))}.</strong> Please wait for the current '
+            f'run to finish before starting another.</div>'
+        )
+        return HTMLResponse(content=body, status_code=409)
+    except Exception as e:
+        import traceback
+        logger.exception("[SIGNAL_AUDIT] failed")
+        body = (
+            f'<div class="text-warn" style="padding: 0.75rem;">'
+            f'<strong>Signal audit failed:</strong> {_esc(str(e))}<br>'
+            f'<pre style="font-size: 0.75rem; opacity: 0.7;">{_esc(traceback.format_exc()[-800:])}</pre>'
+            f'</div>'
+        )
+        return HTMLResponse(content=body, status_code=500)
+
+    header = (
+        f"{result['strategy']} @ {result['granularity']}s candles · "
+        f"{result['samples_evaluated']:,} evaluations across "
+        f"{result['symbols_fetched']} symbols · "
+        f"ran in {result['duration_seconds']:.1f}s · "
+        f"cost assumption {result['cost_bps']:.0f} bps round-trip"
     )
-    eq: list[float] = [result.starting_balance]
-    for d in result.decisions:
-        eq.append(d.get("balance", eq[-1]))
-    return templates.TemplateResponse(
-        request=request,
-        name="_training_result.html",
-        context={"request": request, "result": result, "equity": eq},
+    body = (
+        f'<div class="card mt-3" style="border: 1px solid var(--border, #2a2a2a);">'
+        f'  <div class="card-header"><div class="card-title">Signal Audit Result</div></div>'
+        f'  <div class="text-muted mb-2" style="font-size: 0.78rem;">{_esc(header)}</div>'
+        f'  <pre style="white-space: pre-wrap; font-family: ui-monospace, '
+        f'        SFMono-Regular, Menlo, monospace; font-size: 0.74rem; '
+        f'        line-height: 1.5; color: var(--text-muted, #b0b0b0); '
+        f'        margin: 0; padding: 0.75rem; background: rgba(0,0,0,0.18); '
+        f'        border-radius: 4px; max-height: 70vh; overflow: auto;">'
+        f'{_esc(result["report_text"])}'
+        f'  </pre>'
+        f'</div>'
     )
+    return HTMLResponse(content=body)
 
 
 @router.post("/training/memory/reset")
@@ -2448,11 +2753,14 @@ def settings_page(request: Request) -> HTMLResponse:
             {"id": w.id, "name": w.name}
             for w in s.query(Wallet).filter(Wallet.bot_paused.is_(True)).all()
         ]
+    mission_enabled = _truthy(bot_config.get("mission_controller_enabled"))
+    from trading.holding_profiles import SELECTABLE_MODES
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
         request,
         active="settings",
         prefs=prefs,
         bot_cfg=bot_cfg,
+        holding_modes=SELECTABLE_MODES,
         bot_status=bot_status,
         recent_ticks=recent_ticks,
         recent_recons=recent_recons,
@@ -2460,9 +2768,31 @@ def settings_page(request: Request) -> HTMLResponse:
         claude_cfg=claude_cfg,
         kill_switch=kill_switch,
         paused_wallets=paused_wallets,
+        mission_enabled=mission_enabled,
         settings=settings,
     ),
     )
+
+
+@router.post("/settings/mission/save")
+def settings_mission_save(
+    mission_controller_enabled: str = Form("false"),
+) -> RedirectResponse:
+    """Toggle the Daily Mission Controller's enforce flag.
+
+    Off (default) -> get_mission_controller() returns a no-op stand-in that
+    approves every trade. On -> the real controller becomes the boss layer
+    (confidence floor, edge gate, position sizing, Claude routing, throttles).
+    """
+    enabled = "true" if str(mission_controller_enabled).lower() in {"on", "true", "1", "yes"} else "false"
+    bot_config.set_many({"mission_controller_enabled": enabled})
+    with session_scope() as s:
+        s.add(ActivityLog(
+            category="settings",
+            level="info",
+            message=f"Daily Mission Controller {'ENABLED' if enabled == 'true' else 'DISABLED'} (enforce flag toggled).",
+        ))
+    return RedirectResponse(url="/settings#mission", status_code=303)
 
 
 @router.post("/settings/save")
@@ -2500,6 +2830,8 @@ def settings_bot_save(
     bot_position_size_usd: str = Form("100"),
     bot_max_open_per_wallet: str = Form("5"),
     bot_dry_run: str = Form("true"),
+    bot_holding_mode: str = Form("mixed"),
+    bot_long_only: str = Form("true"),
 ) -> RedirectResponse:
     """
     Persist autonomous-bot settings and reload the scheduler so the new
@@ -2508,6 +2840,13 @@ def settings_bot_save(
     # Checkboxes only post their value when checked. Normalize.
     enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
     dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
+    long_only = "true" if str(bot_long_only).lower() in {"on", "true", "1", "yes"} else "false"
+
+    # Validate the holding mode against the known set; fall back to default.
+    from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
+    holding_mode = (bot_holding_mode or "").strip().lower()
+    if holding_mode not in VALID_MODES:
+        holding_mode = DEFAULT_MODE
 
     bot_config.set_many(
         {
@@ -2520,6 +2859,8 @@ def settings_bot_save(
             "bot_position_size_usd": str(max(1.0, float(bot_position_size_usd or 100))),
             "bot_max_open_per_wallet": str(max(1, int(float(bot_max_open_per_wallet or 5)))),
             "bot_dry_run": dry,
+            "bot_holding_mode": holding_mode,
+            "bot_long_only": long_only,
         }
     )
 
@@ -2749,10 +3090,18 @@ def settings_reset_paper_balance(
             deleted_count = s.query(PaperTrade).delete()
             logging.info(f"[RESET_PAPER] Deleted {deleted_count} trade records")
         
-        # Step 3: Reset all wallet balances
+        # Step 3: Reset all wallet balances AND stamp the bankroll-reset
+        # cursor so the training-page money strip can scope "this session"
+        # without erasing any history. paper_balance is the LIVE cash; the
+        # new session_starting_bankroll preserves the post-reset starting
+        # amount for the % return math, and bankroll_reset_at is the cutoff
+        # the money-strip query uses to filter closed-trade realized P&L.
+        reset_now = utcnow()
         for w in wallets:
             w.paper_balance = new_balance
-        
+            w.session_starting_bankroll = float(new_balance)
+            w.bankroll_reset_at = reset_now
+
         # Log the action
         s.add(
             ActivityLog(
@@ -2760,7 +3109,8 @@ def settings_reset_paper_balance(
                 level="info",
                 message=f"Paper balance reset to ${new_balance:,.2f} for {wallet_count} wallet(s). "
                         f"Closed {closed_count} positions. "
-                        f"{'Cleared trade history.' if should_clear else 'Trade history preserved.'}",
+                        f"{'Cleared trade history.' if should_clear else 'Trade history preserved.'} "
+                        f"Session P&L now counts from this point; full history retained.",
             )
         )
     

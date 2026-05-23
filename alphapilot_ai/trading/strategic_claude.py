@@ -315,29 +315,24 @@ Be specific and actionable. Focus on process, not outcome."""
 # =============================================================================
 
 def _derive_regime(ind: dict) -> str:
-    """Coarse regime label from the signal's indicators, using the SAME
-    vocabulary the autonomous engine's regime_map understands
-    (TRENDING_UP/TRENDING_DOWN/VOLATILE/RANGING)."""
-    def f(k):
-        v = ind.get(k)
-        try:
-            return float(v) if v is not None else None
-        except (TypeError, ValueError):
-            return None
+    """Single source of truth for the regime label.
 
-    adx = f("adx")
-    plus_di = f("plus_di")
-    minus_di = f("minus_di")
-    atr_pct = f("atr_pct")
-    exp = f("atr_expansion")
+    Delegates to claude_decision_engine._derive_regime_hint so the
+    decide-time fingerprint (built here) and the persisted market_snapshot
+    (also built via _derive_regime_hint through _extract_market_state)
+    produce the SAME regime string. If these two diverge — even on
+    fallback labels like RANGING vs DRIFT_UP — the autonomous engine's
+    learn-time fingerprint won't match the decide-time one, and the
+    pattern/kNN/mistake tables silently fragment.
 
-    if adx is not None and adx >= 25 and plus_di is not None and minus_di is not None:
-        return "TRENDING_UP" if plus_di > minus_di else "TRENDING_DOWN"
-    if (exp is not None and exp >= 2.0) or (atr_pct is not None and atr_pct >= 0.05):
-        return "VOLATILE"
-    if adx is not None and adx < 18:
-        return "RANGING"
-    return "RANGING"  # default neutral bucket the engine understands
+    Cross-module reach into an underscore-prefixed helper is intentional:
+    the helper is the canonical regime classifier for the pipeline.
+    """
+    try:
+        from ai.claude_decision_engine import _derive_regime_hint
+        return str(_derive_regime_hint(ind).get("regime") or "UNKNOWN")
+    except Exception:
+        return "UNKNOWN"
 
 
 def _build_autonomous_context(symbol: str, side: str, technical_signal, strategy_type: str, tech_confidence: float):

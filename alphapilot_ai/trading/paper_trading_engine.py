@@ -43,8 +43,11 @@ class PaperTradingEngine:
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         trailing_stop_pct: float | None = None,
+        holding_profile_name: str | None = None,
         enable_breakeven_stop: bool = True,
         claude_decision_id: int | None = None,
+        calibration_source: str | None = None,
+        calibration_sample_size: int | None = None,
     ) -> dict[str, Any]:
         side = side.upper()
         if side not in {"BUY", "SELL"}:
@@ -54,6 +57,73 @@ class PaperTradingEngine:
             f"[OPEN_TRADE] Attempting: wallet={wallet_id}, symbol={symbol}, "
             f"side={side}, qty={qty}, price={entry_price}, conf={confidence}"
         )
+
+        # =====================================================================
+        # LONG-ONLY ENFORCEMENT — the engine-level deadbolt.
+        # =====================================================================
+        # bot_engine's guard catches the main entry path. Every OTHER path —
+        # portfolio_intelligence offset trades, scale-ins, manual tickets,
+        # the autonomous learner's direct route — calls open_trade without
+        # ever passing through that guard. The playbook spent an overnight
+        # run shouting about it ("a gate that can be routed around is not
+        # a gate"). Enforcing here means there is no path left that can
+        # open a short while long_only is set.
+        if side == "SELL":
+            from config.bot_config import BotConfig
+            try:
+                long_only = BotConfig.load().long_only
+            except Exception:
+                long_only = True  # safer default if config can't be read
+            if long_only:
+                logger.warning(
+                    f"[OPEN_TRADE] BLOCKED by long-only policy: {symbol} SELL refused. "
+                    f"Caller bypassed the bot_engine guard (likely portfolio_intel "
+                    f"offset, scale-in, or direct API)."
+                )
+                self._log(
+                    "risk",
+                    f"Long-only policy blocked SELL on {symbol} (path: engine-level "
+                    f"defense; some caller skipped bot_engine.long_only check)",
+                    wallet_id=wallet_id, level="warn",
+                )
+                return {"ok": False, "reason": "Long-only policy active", "code": "long_only_block"}
+
+        # =====================================================================
+        # POSITION-SIZE CEILING — make `bot_position_size_usd` mean it.
+        # =====================================================================
+        # Upstream callers compute their own qty: the autonomous engine
+        # multiplies by size_multiplier (up to 1.5x), portfolio_intelligence
+        # sizes offset trades on its own scale, scale-in pyramids. With no
+        # engine-level bound, one overnight run opened $1,192 positions on
+        # an $80 config — a 15x breach of operator intent that produced the
+        # session's worst losses (the bigger the notional, the bigger the
+        # dollar loss at the same percentage move).
+        # We clamp rather than reject so the trade still happens — just at
+        # the size the operator actually authorized. 5% slack above the cap
+        # avoids tripping on float rounding right at the boundary.
+        try:
+            from config.bot_config import BotConfig
+            cfg_position_size = float(BotConfig.load().position_size_usd)
+        except Exception:
+            cfg_position_size = 0.0
+        if cfg_position_size > 0.0 and entry_price > 0:
+            requested_notional = float(qty) * float(entry_price)
+            ceiling = cfg_position_size * 1.05
+            if requested_notional > ceiling:
+                new_qty = cfg_position_size / float(entry_price)
+                logger.warning(
+                    f"[OPEN_TRADE] CLAMPED size: {symbol} {side} "
+                    f"requested ${requested_notional:.2f} > config "
+                    f"${cfg_position_size:.2f}; qty {qty:.6f} -> {new_qty:.6f}"
+                )
+                self._log(
+                    "risk",
+                    f"Position size clamped on {symbol} {side}: requested "
+                    f"${requested_notional:.2f}, capped to "
+                    f"${cfg_position_size:.2f} per bot_position_size_usd",
+                    wallet_id=wallet_id, level="warn",
+                )
+                qty = new_qty
 
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
         if not decision.allowed:
@@ -67,33 +137,25 @@ class PaperTradingEngine:
         fees = self._estimate_fees(notional)
         slippage = self._estimate_slippage(notional)
         
-        # Get wallet's trading style to determine stop-loss/take-profit defaults
-        with session_scope() as s:
-            wallet = s.get(Wallet, wallet_id)
-            trading_style = getattr(wallet, 'trading_style', 'scalper') or 'scalper'
-            micro_target = getattr(wallet, 'micro_profit_target_usd', 0.25) or 0.25
-        
-        # Calculate stop-loss and take-profit based on trading style
-        if trading_style == 'scalper':
-            # SCALPER: Tight stops, quick exits, but always at least 2.5:1 R:R
-            # so that fees + slippage don't erase the edge. The PRIMARY path
-            # goes through bot_engine's smart_stops() (swing-anchored, ATR-aware);
-            # these defaults are only the fallback when no candle data is
-            # available or this method is called outside the bot pipeline.
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.006  # 0.6%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.015  # 1.5% -> 2.5:1 R:R
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.003  # 0.3% trailing
-        elif trading_style == 'swing':
-            # SWING: Wider stops, longer holds
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.03  # 3%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.06  # 6%
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.02  # 2% trailing
+        # Resolve the holding profile — the single source of truth for
+        # this trade's exit thresholds (target / stop / trailing / time).
+        # bot_engine passes an explicit resolved name; manual or direct
+        # callers fall back to the global Settings mode.
+        from trading.holding_profiles import get_profile, resolve_profile_name
+        if holding_profile_name:
+            profile = get_profile(holding_profile_name)
         else:
-            # HYBRID: Balance between scalping and swing
-            sl_pct = stop_loss_pct if stop_loss_pct is not None else 0.015  # 1.5%
-            tp_pct = take_profit_pct if take_profit_pct is not None else 0.03  # 3%
-            trail_pct = trailing_stop_pct if trailing_stop_pct is not None else 0.01  # 1% trailing
-        
+            from config.bot_config import BotConfig
+            profile = get_profile(
+                resolve_profile_name(BotConfig.load().holding_mode, confidence)
+            )
+
+        # Profile values are the defaults; an explicit per-call override
+        # (e.g. a manual ticket) still wins if one was passed in.
+        sl_pct = stop_loss_pct if stop_loss_pct is not None else profile.max_loss_pct
+        tp_pct = take_profit_pct if take_profit_pct is not None else profile.target_pct
+        trail_pct = trailing_stop_pct if trailing_stop_pct is not None else profile.trailing_pct
+
         if side == "BUY":
             stop_loss_price = entry_price * (1 - sl_pct)
             take_profit_price = entry_price * (1 + tp_pct)
@@ -132,6 +194,11 @@ class PaperTradingEngine:
                 trailing_stop_pct=trail_pct,
                 trailing_stop_price=trailing_stop_price,
                 high_water_price=entry_price,  # Track the best price we've seen
+                # Holding profile + the hard caps it implies. position_monitor
+                # reads `holding_profile` to know how this trade must exit.
+                holding_profile=profile.name,
+                max_loss_pct=profile.max_loss_pct,
+                time_limit_hours=profile.hard_cap_minutes / 60.0,
                 # Breakeven stop: once we're up 1%, move stop to entry + 0.2%
                 breakeven_trigger_pct=0.01 if enable_breakeven_stop else None,
                 breakeven_stop_pct=0.002 if enable_breakeven_stop else None,
@@ -140,6 +207,10 @@ class PaperTradingEngine:
                 # close. None when the trade didn't originate from a persisted
                 # decision (e.g. manual entries, autonomous-only strategic path).
                 claude_decision_id=claude_decision_id,
+                # Phase B calibration audit fields — see PaperTrade model.
+                # Populated by bot_engine when the trade is opened.
+                calibration_source=calibration_source,
+                calibration_sample_size=calibration_sample_size,
             )
             s.add(trade)
             s.flush()
@@ -150,7 +221,7 @@ class PaperTradingEngine:
                     category="paper_trade",
                     level="info",
                     wallet_id=wallet_id,
-                    message=f"Opened {side} {qty} {symbol} @ {entry_price:.2f} (conf={confidence:.2f}, SL=${stop_loss_price:.4f}, TP=${take_profit_price:.4f})",
+                    message=f"Opened {side} {qty} {symbol} @ {entry_price:.2f} (conf={confidence:.2f}, profile={profile.name}, SL=${stop_loss_price:.4f}, TP=${take_profit_price:.4f})",
                 )
             )
             
@@ -185,7 +256,23 @@ class PaperTradingEngine:
                 fees = float(trade.fees or 0)
                 slippage = float(trade.slippage or 0)
                 side = (trade.side or "BUY").upper()
-                
+                # FIX (latent bug): symbol and duration_minutes are referenced
+                # by the three learn hooks below but were never assigned in this
+                # function — they NameError'd silently inside the broad
+                # try/except, so adaptive_learning_engine.learn_from_trade and
+                # autonomous_learning_engine.learn_from_closed_trade had been
+                # no-ops since they were wired in. Capture them here so the
+                # learn loop actually runs.
+                symbol = trade.symbol
+                trade_notes = trade.notes or ""  # captured for post-with-block use
+                if trade.opened_at and trade.closed_at:
+                    duration_minutes = max(0.0, (trade.closed_at - trade.opened_at).total_seconds() / 60.0)
+                elif trade.opened_at:
+                    from datetime import datetime, timezone
+                    duration_minutes = max(0.0, (datetime.now(timezone.utc).replace(tzinfo=None) - trade.opened_at).total_seconds() / 60.0)
+                else:
+                    duration_minutes = 0.0
+
                 if entry_price <= 0 or qty <= 0:
                     return {"ok": False, "reason": f"Invalid trade data: entry={entry_price}, qty={qty}"}
                 
@@ -250,7 +337,13 @@ class PaperTradingEngine:
             )
             logger.debug(f"[LEARN] Adaptive learning updated for trade {trade_id}")
         except Exception:
-            logger.debug("Adaptive learning update failed for trade %s", trade_id)
+            # Bumped from logger.debug -> logger.exception (Phase C). The
+            # debug-level swallow was what hid the symbol/duration_minutes
+            # NameError for weeks: the adaptive learn hook ran on every
+            # close, NameError'd silently, and never updated any
+            # per-strategy stats. Future NameErrors / shape mismatches now
+            # surface in the console with a full stack trace.
+            logger.exception("[LEARN] Adaptive learning update failed for trade %s", trade_id)
         
         # CRITICAL: Update the autonomous learning engine
         # This is the self-improving brain that operates WITHOUT Claude
@@ -268,8 +361,55 @@ class PaperTradingEngine:
                 exit_reason=exit_reason,
             )
             logger.info(f"[AUTONOMOUS] Learned from trade {trade_id}: {symbol} {'WIN' if pnl > 0 else 'LOSS'}")
-        except Exception as e:
-            logger.debug(f"Autonomous learning update failed for trade {trade_id}: {e}")
+        except Exception:
+            # Bumped from logger.debug -> logger.exception (Phase C). Same
+            # latent-bug story as the adaptive hook above: silent
+            # NameError / shape mismatch here means autonomous fingerprints
+            # never accumulate. We still don't raise — the trade closes
+            # regardless of whether learning succeeds — but the operator
+            # now sees the failure live in the console.
+            logger.exception("[AUTONOMOUS] Learning update failed for trade %s", trade_id)
+
+        # Notify the Daily Mission Controller of the outcome so it can advance
+        # its state machine: update daily P&L, trip the loss-streak counter,
+        # apply per-symbol/strategy quarantines, transition modes (RECOVERY,
+        # PROTECT, LOCK, KILL, etc.). When the controller is disabled this
+        # resolves to a no-op via the singleton accessor — safe to call
+        # unconditionally. Wrapped in try/except so a controller bug can never
+        # prevent a trade from closing.
+        try:
+            from risk.daily_mission_controller import get_mission_controller, TradeResult
+            mission = get_mission_controller()
+            # Strategy-name parsing from the free-text notes field is
+            # genuinely best-effort. If the format changes or notes is
+            # empty, we fall through with strategy_name="" and the mission
+            # controller buckets the trade as "unknown". No trade
+            # information is lost — the close still happens regardless.
+            from utils.errors import swallow_with_reason
+            strategy_name = ""
+            with swallow_with_reason(
+                logger,
+                "strategy-name parsing from notes is opportunistic; falls back to 'unknown'",
+            ):
+                if "bot/" in trade_notes and ":" in trade_notes:
+                    prefix = trade_notes.split(":", 1)[0]   # "bot/<source>/<strategy_type>"
+                    parts = prefix.split("/")
+                    if len(parts) >= 3:
+                        strategy_name = parts[2]
+            mission.record_trade_result(TradeResult(
+                symbol=symbol,
+                strategy=strategy_name or "unknown",
+                pnl=float(pnl),
+                fees=0.0,  # fees are already netted into realized_pnl on the close
+                notional=float(entry_price) * float(qty),
+            ))
+        except Exception:
+            # Bumped from logger.debug -> logger.exception (Phase C).
+            # The mission controller is the boss layer over future trades;
+            # if it silently fails to record an outcome the next mode
+            # transition is based on stale data. Operator must see this
+            # in the console rather than have to dig in debug logs.
+            logger.exception("[MISSION] record_trade_result failed for trade %s", trade_id)
 
         return {"ok": True, "pnl": round(pnl, 2), "exit_reason": exit_reason}
     

@@ -86,6 +86,13 @@ def _migrate_schema() -> None:
             ("liquidation_buffer_pct", "FLOAT DEFAULT 0.10"),
             # Metadata column for session settings backup/restore
             ("meta", "JSON DEFAULT '{}'"),
+            # Bankroll-reset cursor: stamped when the operator hits "Reset
+            # Paper Balance" in Settings. The training-page money strip uses
+            # these to scope "this session" P&L without ever touching the
+            # underlying trade history. NULL on wallets that have never been
+            # reset.
+            ("bankroll_reset_at", "DATETIME"),
+            ("session_starting_bankroll", "FLOAT"),
         ],
         "paper_trades": [
             ("is_perp", "BOOLEAN DEFAULT 0"),
@@ -101,6 +108,8 @@ def _migrate_schema() -> None:
             ("high_water_price", "FLOAT"),
             ("max_loss_pct", "FLOAT DEFAULT 0.10"),
             ("time_limit_hours", "FLOAT"),
+            # Holding profile resolved at entry (see holding_profiles.py).
+            ("holding_profile", "VARCHAR(20)"),
             ("dca_count", "INTEGER DEFAULT 0"),
             # Scale-in (pyramiding) tracker — separate from `dca_count`.
             # DCA = "average down on a loser to lower cost basis"
@@ -123,6 +132,11 @@ def _migrate_schema() -> None:
             # at close time. Nullable for trades that don't originate from
             # a Claude decision.
             ("claude_decision_id", "INTEGER"),
+            # Phase B calibration audit (see PaperTrade model docstring).
+            # Lets the training-page scorecard show how many of today's
+            # trades were backed by measured pattern data vs raw confidence.
+            ("calibration_source", "VARCHAR(20)"),
+            ("calibration_sample_size", "INTEGER"),
         ],
         "claude_decisions": [
             # JSON snapshot of indicators + regime at decision time. Consumed

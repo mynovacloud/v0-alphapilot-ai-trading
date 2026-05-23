@@ -72,7 +72,7 @@ from typing import Any
 from ai.claude_learning import build_playbook
 from ai.adaptive_learning_engine import analyze_signal
 from database.db import session_scope
-from database.models import ClaudeDecision, PaperTrade
+from database.models import ActivityLog, ClaudeDecision, PaperTrade
 from services.claude_client import chat as claude_chat
 from services.claude_client import is_configured as claude_is_configured
 from trading.strategy_engine import Signal
@@ -126,6 +126,13 @@ SECOND_OPINION_CONF_THRESHOLD = 0.85   # or confidence at/above this
 
 # --- Passthrough --------------------------------------------------------- #
 STRONG_PASSTHROUGH_FLOOR = 0.62    # technical confidence >= this bypasses Claude
+
+# LEARN_BLOCK / STRONG tier — bypass the training-mode fallthrough when the
+# adaptive engine has accumulated CONCLUSIVE evidence that a fingerprint
+# loses. Below this bar we keep exploring; above it we refuse the trade
+# even in training, because more samples will not flip a 5-of-5 loser.
+_LEARN_BLOCK_STRONG_MIN_TRADES = 5
+_LEARN_BLOCK_STRONG_MAX_WR = 0.20
 
 
 # =============================================================================
@@ -409,13 +416,101 @@ def _read_calibration_knobs() -> tuple[float, bool]:
             floor = float(raw_floor)
         is_training = (cfg_get("training_session_active") or "").strip().lower() in {"1", "true", "yes", "on"}
     except Exception:
-        pass
+        # Labeled-but-quiet swallow: bot_config read failure leaves us on
+        # hard-coded defaults (floor=0.55, is_training=False). The bot can
+        # still trade at its baseline. A real DB problem will surface
+        # elsewhere in this tick at a louder level. Keep this DEBUG so the
+        # signal-to-noise on the console stays clean.
+        logger.debug("[swallowed:bot_config-read] using hard-coded defaults", exc_info=True)
     return floor, is_training
 
 
 # =============================================================================
 # MAIN ENTRY POINT
 # =============================================================================
+
+# Minimum number of directional confluence checks a passthrough trade must
+# pass. The bot's own playbook arrived at this independently (w2.0 rule:
+# "at least 3 of {...} must be TRUE before executing").
+_PASSTHROUGH_MIN_CONFLUENCE = 3
+
+
+def _confluence_gate(technical_signal: Signal, side: str) -> tuple[bool, str]:
+    """Deterministic multi-indicator quality gate for passthrough trades.
+
+    The training_passthrough / technical_strong paths execute a raw
+    technical signal WITHOUT Claude review. With no gate, that fired
+    textbook-bad entries — shorting RSI 28, buying RSI 83, entering on
+    0.0x volume — every one of which the learned playbook already had a
+    rule against but could not enforce (Claude, which carries the
+    playbook, is never called on the passthrough path).
+
+    This gate is the enforcement the playbook kept asking for. It uses
+    only the core indicators `_common_indicators` puts on every Signal,
+    so it works regardless of which strategy produced the signal.
+
+    Returns (passed, reason). A blocked signal is turned into a HOLD.
+    """
+    ind = technical_signal.indicators or {}
+
+    def _num(key: str, default: float) -> float:
+        try:
+            v = ind.get(key)
+            return default if v is None else float(v)
+        except (TypeError, ValueError):
+            return default
+
+    rsi = _num("rsi", 50.0)
+    macd_h = _num("macd_histogram", 0.0)
+    rel_vol = _num("relative_volume", 1.0)
+    vel3 = _num("velocity_3bar", 0.0)
+    body = _num("body_direction", 0.0)
+    cross_age = ind.get("cross_age_bars")
+
+    # ---- HARD VETOES: the egregious entries the playbook flagged repeatedly.
+    # RSI thresholds match the playbook's strongest rules ("NEVER initiate a
+    # momentum SELL when RSI < 32"; "RSI > 70 ... overbought exhaustion").
+    if side == "BUY" and rsi >= 72.0:
+        return False, f"overbought RSI {rsi:.0f} (>=72) — blow-off, not momentum"
+    if side == "SELL" and rsi <= 32.0:
+        return False, f"oversold RSI {rsi:.0f} (<=32) — exhaustion, not momentum"
+    if rel_vol <= 0.5:
+        return False, f"volume {rel_vol:.1f}x (<=0.5x) — no participation"
+    if cross_age is not None:
+        try:
+            if float(cross_age) <= 1.0:
+                return False, f"EMA cross {cross_age}b old — noise, not a cross"
+        except (TypeError, ValueError):
+            pass
+
+    # ---- CONFLUENCE: require >= N directional confirmations.
+    if side == "BUY":
+        checks = {
+            "rsi_room": rsi < 65.0,
+            "macd_up": macd_h > 0.0,
+            "volume": rel_vol >= 1.0,
+            "velocity": vel3 > 0.0,
+            "body": body > 0.0,
+        }
+    else:  # SELL
+        checks = {
+            "rsi_room": rsi > 35.0,
+            "macd_down": macd_h < 0.0,
+            "volume": rel_vol >= 1.0,
+            "velocity": vel3 < 0.0,
+            "body": body < 0.0,
+        }
+
+    passed = [name for name, ok in checks.items() if ok]
+    if len(passed) < _PASSTHROUGH_MIN_CONFLUENCE:
+        failed = [name for name, ok in checks.items() if not ok]
+        return False, (
+            f"only {len(passed)}/{len(checks)} confluence "
+            f"[{'+'.join(passed) or 'none'}], need {_PASSTHROUGH_MIN_CONFLUENCE} "
+            f"— weak on {'+'.join(failed)}"
+        )
+    return True, f"{len(passed)}/{len(checks)} confluence [{'+'.join(passed)}]"
+
 
 def decide(
     *,
@@ -484,14 +579,159 @@ def decide(
                 [p.name for p in adaptive_rec.matched_patterns],
                 adaptive_rec.strategy_weight,
             )
-    except Exception as e:
-        logger.warning("[ADAPTIVE] error: %s", e)
+    except Exception:
+        # The adaptive engine runs on every decision and is part of the
+        # mission-controller edge math. Bumped from logger.warning (no
+        # traceback) -> logger.exception so any future signature drift or
+        # shape mismatch surfaces with a stack trace. The decision still
+        # continues — adaptive context is additive, not required.
+        logger.exception("[ADAPTIVE] enhancement failed; decision continues with empty adaptive context")
+
+    # ----- Known-losing-pattern guard ------------------------------------- #
+    # Don't repeat mistakes. When the adaptive engine has built up enough
+    # evidence that this fingerprint loses money (>= 3 similar trades with
+    # success rate <= 45%), the "strong" technical signal is no longer
+    # ambiguity-free — it's a known leak. The whole point of the learning
+    # loop is to make trades like this rarer over time. Mirrors the
+    # live/training split used by autonomous_learning_engine.decide(): in
+    # live mode we refuse outright; in training mode we log + fall through
+    # so we keep collecting fresh evidence (but the adaptive engine's own
+    # size_multiplier will already be shrinking the bet).
+    known_loser = (
+        side in {"BUY", "SELL"}
+        and adaptive_rec is not None
+        and adaptive_rec.similar_past_trades >= 3
+        and adaptive_rec.historical_success_rate <= 0.45
+    )
+    if known_loser:
+        msg = (
+            f"[LEARN_BLOCK] {symbol} {side}: known-losing pattern "
+            f"(hist_wr={adaptive_rec.historical_success_rate*100:.0f}% over "
+            f"{adaptive_rec.similar_past_trades} trades) — "
+            f"{'logging only in training mode' if is_training else 'refusing trade'}"
+        )
+        logger.warning(msg)
+        try:
+            with session_scope() as _s:
+                _s.add(ActivityLog(category="ai", level="warn", message=msg))
+        except Exception:
+            logger.debug("LEARN_BLOCK audit-log failed", exc_info=True)
+
+        if not is_training:
+            refused = TradeDecision(
+                action="HOLD",
+                confidence=0.0,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"[LEARN_BLOCK] Pattern historically wins "
+                    f"{adaptive_rec.historical_success_rate*100:.0f}% over "
+                    f"{adaptive_rec.similar_past_trades} similar trades. "
+                    "Refusing to repeat a known-losing setup. "
+                    f"Original signal: {(technical_signal.reasoning or '')[:200]}"
+                ),
+                key_factors=[
+                    "learn_block",
+                    f"hist_wr={adaptive_rec.historical_success_rate:.2f}",
+                    f"n={adaptive_rec.similar_past_trades}",
+                ],
+                risk_flags=["known_losing_pattern", *list(adaptive_rec.warnings or [])[:2]],
+                source="learn_block",
+            )
+            refused.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, refused,
+                prompt_used="[LEARN_BLOCK]", extra_context=extra_context,
+            )
+            return refused
+
+        # Training mode normally falls through here — more samples might
+        # reverse a marginal pattern, and the adaptive size_multiplier
+        # already shrinks the bet. But once a fingerprint has crossed
+        # STRONG-evidence territory (>= 5 trades AND <= 20% WR), more
+        # samples won't reverse it. At that point the "gather evidence"
+        # rationale is just paying for the same mistake over and over —
+        # exactly the bypass the overnight playbook hammered ("a gate
+        # that can be routed around is not a gate", w 2.00).
+        if (
+            adaptive_rec.similar_past_trades >= _LEARN_BLOCK_STRONG_MIN_TRADES
+            and adaptive_rec.historical_success_rate <= _LEARN_BLOCK_STRONG_MAX_WR
+        ):
+            refused = TradeDecision(
+                action="HOLD",
+                confidence=0.0,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"[LEARN_BLOCK/STRONG] Confirmed losing pattern: "
+                    f"{adaptive_rec.historical_success_rate*100:.0f}% WR over "
+                    f"{adaptive_rec.similar_past_trades} similar trades. "
+                    "Refusing in training mode too — additional samples "
+                    "will not reverse this. "
+                    f"Original signal: {(technical_signal.reasoning or '')[:200]}"
+                ),
+                key_factors=[
+                    "learn_block_strong",
+                    f"hist_wr={adaptive_rec.historical_success_rate:.2f}",
+                    f"n={adaptive_rec.similar_past_trades}",
+                ],
+                risk_flags=[
+                    "known_losing_pattern_strong",
+                    *list(adaptive_rec.warnings or [])[:2],
+                ],
+                source="learn_block",
+            )
+            refused.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, refused,
+                prompt_used="[LEARN_BLOCK/STRONG]", extra_context=extra_context,
+            )
+            return refused
+        # Otherwise the evidence isn't yet conclusive — fall through and
+        # let the adaptive size_multiplier (already shrunk for losers)
+        # bound the damage while more data accumulates.
 
     # ----- Strong-signal / training passthrough --------------------------- #
     bypass_threshold = max(0.0, min(STRONG_PASSTHROUGH_FLOOR, floor)) if is_training else STRONG_PASSTHROUGH_FLOOR
     if side in {"BUY", "SELL"} and tech_conf >= bypass_threshold:
+        # Quality gate. The passthrough executes a raw technical signal
+        # without Claude review; the gate is what stops it from firing the
+        # textbook-bad entries (oversold shorts, overbought buys, no-volume
+        # entries) that the playbook already had rules against but could
+        # not enforce on this path. A blocked signal becomes a HOLD.
+        gate_ok, gate_reason = _confluence_gate(technical_signal, side)
+        if not gate_ok:
+            blocked = TradeDecision(
+                action="HOLD",
+                confidence=tech_conf,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"Passthrough blocked by confluence gate: {gate_reason}. "
+                    f"Raw technical signal was {side} (conf {tech_conf:.2f}) but "
+                    f"lacked the multi-indicator agreement required to execute "
+                    f"without Claude review."
+                ),
+                key_factors=["passthrough_blocked", f"side={side}"],
+                risk_flags=["weak_confluence"],
+                source="passthrough_blocked",
+            )
+            blocked.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, blocked,
+                prompt_used="", extra_context=extra_context,
+            )
+            return blocked
+
         size_mult, stop_pct, take_pct = 1.0, 0.05, 0.10
-        key_factors = [f"strategy={technical_signal.strategy}", f"floor={bypass_threshold:.2f}"]
+        key_factors = [
+            f"strategy={technical_signal.strategy}",
+            f"floor={bypass_threshold:.2f}",
+            f"gate={gate_reason}",
+        ]
         risk_flags: list[str] = []
         if adaptive_rec:
             size_mult = adaptive_rec.size_multiplier
@@ -717,8 +957,11 @@ def _maybe_second_opinion(
         if parsed is None:
             return decision
         second = _normalize_and_clamp(parsed, wallet)
-    except Exception as e:
-        logger.warning("[SECOND_OPINION] failed: %s", e)
+    except Exception:
+        # Bumped to exception level so a second-opinion failure shows a
+        # stack trace. The original decision is returned unchanged —
+        # second opinion is additive when ENABLE_SECOND_OPINION is True.
+        logger.exception("[SECOND_OPINION] failed; returning original decision unchanged")
         return decision
 
     if second.action != decision.action:
@@ -987,8 +1230,13 @@ def _symbol_recent_history(wallet_id: int, symbol: str, limit: int = 5) -> list[
                     "exit_reason": getattr(t, "exit_reason", None),
                 })
             return out
-    except Exception as e:
-        logger.debug("[SYMBOL_HISTORY] %s: %s", symbol, e)
+    except Exception:
+        # Bumped from logger.debug -> logger.warning. Symbol history feeds
+        # Claude's prompt context for the symbol — a silent failure here
+        # would mean Claude reasons with no per-symbol memory, which is
+        # invisible from the outside. Worth surfacing.
+        logger.warning("[SYMBOL_HISTORY] failed for %s; prompt will lack per-symbol context",
+                       symbol, exc_info=True)
         return []
 
 
@@ -1114,8 +1362,13 @@ def _confidence_calibration_factor(wallet_id: int) -> float:
             win_rate = wins / len(rows) if rows else 0.5
             if mean_pred > 0:
                 factor = _clamp(win_rate / mean_pred, CALIBRATION_FLOOR, CALIBRATION_CEIL)
-    except Exception as e:
-        logger.debug("[CALIBRATION] unavailable: %s", e)
+    except Exception:
+        # Calibration is the anti-overconfidence damper applied to every
+        # Claude directional decision. Silent debug-level failure was
+        # hiding shape mismatches; bumped to warning so the operator
+        # notices when the calibrator goes dark.
+        logger.warning("[CALIBRATION] unavailable; using factor=1.0 (no damping)",
+                       exc_info=True)
         factor = 1.0
 
     _calibration_cache.set(wallet_id, factor)
@@ -1144,6 +1397,12 @@ def _fetch_fear_greed() -> dict | None:
                 "summary": fg.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: external service failure (network / API down)
+        # is non-fatal — we cache None so the next tick gets a fresh
+        # retry, and Claude's prompt reasons without the fear/greed
+        # signal this tick. DEBUG level: we don't want this to spam the
+        # console during outages.
+        logger.debug("[swallowed:fear_greed-fetch] external API failed", exc_info=True)
         out = None
     _global_md_cache.set("fear_greed", out or {})
     return out
@@ -1166,6 +1425,12 @@ def _fetch_derivatives(symbol: str) -> dict | None:
                 "summary": d.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: derivatives data is opportunistic context for
+        # Claude. External fetcher down is non-fatal — None is cached so
+        # the next tick retries; Claude's prompt this tick skips the
+        # derivatives block. DEBUG-level to avoid console spam during
+        # external outages.
+        logger.debug("[swallowed:derivatives-fetch] external API failed for %s", symbol, exc_info=True)
         out = None
     _global_md_cache.set(("deriv", symbol), out or {})
     return out
@@ -1189,6 +1454,10 @@ def _fetch_mtf(symbol: str, confidence: float) -> dict | None:
                 "summary": m.get("summary", ""),
             }
     except Exception:
+        # Labeled swallow: multi-timeframe analysis is opportunistic
+        # context. Same pattern as the other external-fetcher swallows
+        # above — non-fatal, debug-level to avoid spamming on outages.
+        logger.debug("[swallowed:mtf-fetch] external service failed for %s", symbol, exc_info=True)
         out = None
     _global_md_cache.set(("mtf", symbol), out or {})
     return out
@@ -1350,8 +1619,15 @@ def _persist_decision(
     snapshot into market_snapshot so the autonomous learning engine can rebuild
     a populated TradeContext at close time. Never lets logging fail a trade."""
     try:
+        # Signal stores its indicator dict on `.indicators` — `.metadata` does
+        # not exist on the Signal dataclass. Reading the wrong attribute here
+        # was silently producing an empty snapshot post-merge, which means
+        # every persisted market_snapshot had rsi=50/macd=0/adx=0 defaults
+        # and the close-side learn fingerprint never matched the decide-side
+        # one (built from .indicators in strategic_claude). That collapses
+        # the whole Phase A loop on every trade.
         snapshot = _extract_market_state(
-            getattr(technical_signal, "metadata", {}) or {},
+            getattr(technical_signal, "indicators", {}) or {},
             extra_context or {},
         )
         new_id: int | None = None
