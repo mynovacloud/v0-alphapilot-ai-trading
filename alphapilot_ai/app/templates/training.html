@@ -1984,6 +1984,30 @@ document.addEventListener('keydown', e => {
 </div>
 
 <!-- ============================================================ -->
+<!-- SIGNAL EDGE AUDIT                                               -->
+<!-- ============================================================ -->
+<div class="card mb-4">
+  <div class="card-header"><div class="card-title">Signal Edge Audit</div></div>
+  <p class="text-muted mb-3" style="font-size: 0.82rem;">
+    Run the live technical signal over recent Coinbase candle history for every symbol in the liquid universe.
+    Reports whether BUY signals actually pick better moments than buy-and-hold, after a 30&nbsp;bps round-trip fee assumption.
+    This is the definitive answer to <em>is the signal worth trusting</em> — independent of any session's results.
+    Takes roughly 30&ndash;60 seconds.
+  </p>
+  <form hx-post="/training/signal-audit" hx-target="#signal-audit-result" hx-swap="innerHTML" hx-indicator="#audit-spinner">
+    <div class="flex items-center gap-3">
+      <button class="btn btn-primary" type="submit">Run Audit</button>
+      <span id="audit-spinner" class="htmx-indicator">
+        <span class="spinner"></span>
+        <span class="text-muted">Fetching history and evaluating signal &mdash; this may take 30&ndash;60 seconds...</span>
+      </span>
+    </div>
+  </form>
+  <div id="signal-audit-result"></div>
+</div>
+
+
+<!-- ============================================================ -->
 <!-- HOW THE BOT LEARNS                                              -->
 <!-- ============================================================ -->
 <div class="card mb-4">
