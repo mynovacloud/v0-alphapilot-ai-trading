@@ -54,11 +54,23 @@ def test_priority_ordering_is_honored():
 
 def test_limit_caps_result():
     _seed(*_LIQUID_UNIVERSE)
-    assert len(coinbase_usd_universe(limit=10)) == 10
+    # Use a limit smaller than the focused universe so the cap binds.
+    cap = max(1, len(_LIQUID_UNIVERSE) - 2)
+    assert len(coinbase_usd_universe(limit=cap)) == cap
 
 
 def test_curated_list_is_sane():
     # No duplicates, all USD pairs — a typo here silently shrinks the universe.
     assert len(_LIQUID_UNIVERSE) == len(set(_LIQUID_UNIVERSE))
     assert all(s.endswith("-USD") for s in _LIQUID_UNIVERSE)
-    assert len(_LIQUID_UNIVERSE) >= 40  # enough breadth to diversify 25 slots
+    # Phase A: the focused list is intentionally small (~8). The bigger
+    # diversification claim moved to the _BROAD_UNIVERSE fallback below.
+    assert 5 <= len(_LIQUID_UNIVERSE) <= 20
+
+
+def test_broad_universe_is_kept_as_fallback():
+    """The 50+ symbol list must stay reachable in case we ever want to
+    A/B test a wider universe or revert Phase A."""
+    from connectors.universe import _BROAD_UNIVERSE
+    assert len(_BROAD_UNIVERSE) >= 40
+    assert all(s.endswith("-USD") for s in _BROAD_UNIVERSE)

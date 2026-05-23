@@ -86,14 +86,37 @@ class _SideStat:
         return self.mean / (sd / (len(self.returns) ** 0.5))
 
 
+def _in_peak_window(bar_time_unix: int, window: tuple[int, int] | None) -> bool:
+    """True iff the candle's UTC hour falls in the peak-hours window.
+
+    `None` means no filter (every bar passes). A window with equal
+    bounds also disables the filter. Wrap-around windows supported.
+    """
+    if window is None:
+        return True
+    start, end = int(window[0]), int(window[1])
+    if start == end:
+        return True
+    h = datetime.datetime.fromtimestamp(int(bar_time_unix), datetime.timezone.utc).hour
+    if start < end:
+        return start <= h < end
+    return h >= start or h < end
+
+
 def measure(
     candles_by_symbol: dict[str, list[dict]],
     strategy_name: str,
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
     warmup: int = WARMUP_BARS,
+    peak_hours: tuple[int, int] | None = None,
 ) -> list[_Sample]:
     """Walk every symbol bar-by-bar, evaluate the real signal, record
-    forward returns. Pure (no network) so it is unit-testable."""
+    forward returns. Pure (no network) so it is unit-testable.
+
+    `peak_hours=(start, end)` restricts evaluation to bars whose UTC
+    hour falls in that window — answers the question "if we only
+    traded during these hours, what's the edge?". `None` = all hours.
+    """
     signal_fn = _STRATEGY_REGISTRY.get(strategy_name)
     if signal_fn is None:
         raise ValueError(
@@ -109,6 +132,10 @@ def measure(
         if n < warmup + max_h + 1:
             continue
         for i in range(warmup, n - max_h):
+            if peak_hours is not None and not _in_peak_window(
+                candles[i].get("time", 0), peak_hours
+            ):
+                continue
             try:
                 sig = signal_fn(candles[: i + 1])
             except Exception:
@@ -431,6 +458,7 @@ def run_audit_lite(
     granularity: int = 60,
     bars: int = 600,
     cost_bps: float = 30.0,
+    peak_hours: tuple[int, int] | None = None,
 ) -> dict[str, Any]:
     """Synchronous, web-callable signal-edge audit.
 
@@ -438,6 +466,10 @@ def run_audit_lite(
     requests, ~30-50 second wall time over 57 symbols) so it returns
     inside a sane HTTP wait. The CLI version (`python signal_edge.py`)
     remains the canonical deeper run.
+
+    `peak_hours=(start, end)` restricts the evaluation window to those
+    UTC hours, answering "if we only traded during these hours, would
+    the edge be different?". None = all hours.
 
     Raises RuntimeError if another audit is already in flight; the
     caller (the route handler) maps that to a 409 response so the UI
@@ -449,7 +481,7 @@ def run_audit_lite(
     try:
         t0 = time.time()
         series = _fetch(_LIQUID_UNIVERSE, granularity, bars)
-        samples = measure(series, strategy, DEFAULT_HORIZONS)
+        samples = measure(series, strategy, DEFAULT_HORIZONS, peak_hours=peak_hours)
         report = "\n".join((
             alpha_report(samples, DEFAULT_HORIZONS, cost_bps),
             "",
@@ -462,6 +494,7 @@ def run_audit_lite(
             "duration_seconds": time.time() - t0,
             "strategy": strategy,
             "granularity": granularity,
+            "peak_hours": peak_hours,
             "bars_per_symbol": bars,
             "cost_bps": cost_bps,
         }
@@ -479,11 +512,16 @@ def main(argv: list[str] | None = None) -> int:
                    help="target candles per symbol (paginated, ~300 per request)")
     p.add_argument("--cost-bps", type=float, default=30.0,
                    help="round-trip fee+slippage in bps (paper engine models ~30)")
+    p.add_argument("--peak-hours", nargs=2, type=int, metavar=("START", "END"),
+                   help="restrict evaluation to UTC hours [START, END) "
+                        "(e.g. --peak-hours 12 22 for London-NY overlap)")
     args = p.parse_args(argv)
 
     horizons = DEFAULT_HORIZONS
+    peak = tuple(args.peak_hours) if args.peak_hours else None
+    peak_label = f", peak-hours={peak[0]:02d}-{peak[1]:02d} UTC" if peak else ""
     print(f"Signal-edge harness — strategy={args.strategy!r}, granularity={args.granularity}s, "
-          f"target {args.bars} bars/symbol, horizons={horizons}")
+          f"target {args.bars} bars/symbol, horizons={horizons}{peak_label}")
     print(f"Fetching deep candle history for {len(_LIQUID_UNIVERSE)} liquid symbols "
           f"(paginated — takes a few minutes)...")
     series = _fetch(_LIQUID_UNIVERSE, args.granularity, args.bars)
@@ -495,7 +533,7 @@ def main(argv: list[str] | None = None) -> int:
         hrs = statistics.median(spans) / 3600.0
         print(f"  median history per symbol: {hrs:.1f}h ({hrs / 24:.1f} days)")
     print("Evaluating the real signal at every bar...")
-    samples = measure(series, args.strategy, horizons)
+    samples = measure(series, args.strategy, horizons, peak_hours=peak)
     print("")
     print(alpha_report(samples, horizons, args.cost_bps))
     print("")

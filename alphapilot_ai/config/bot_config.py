@@ -32,6 +32,11 @@ DEFAULTS: dict[str, str] = {
     # harness measured SELL signals at -127 to -196 bps forward return,
     # and a spot account cannot really short anyway.
     "bot_long_only": "true",
+    # Trading-hours window (UTC). Skip ticks outside [start, end). Defaults
+    # to the London-NY overlap (12:00-22:00 UTC) where actual volume is.
+    # Set both to 0 to disable the filter and trade 24/7.
+    "bot_trading_hours_start_utc": "12",
+    "bot_trading_hours_end_utc": "22",
     # Aggressive trading settings
     "bot_auto_dca_enabled": "true",        # automatically DCA into losing positions
     "bot_auto_dca_threshold_pct": "0.03",  # DCA when position down 3%+
@@ -79,6 +84,8 @@ class BotConfig:
     dry_run: bool
     holding_mode: str
     long_only: bool
+    trading_hours_start_utc: int
+    trading_hours_end_utc: int
     # Aggressive trading settings
     auto_dca_enabled: bool
     auto_dca_threshold_pct: float
@@ -101,6 +108,8 @@ class BotConfig:
             dry_run=_b(raw.get("bot_dry_run"), default=False),
             holding_mode=_holding_mode(raw.get("bot_holding_mode")),
             long_only=_b(raw.get("bot_long_only"), default=True),
+            trading_hours_start_utc=_hour(raw.get("bot_trading_hours_start_utc"), default=12),
+            trading_hours_end_utc=_hour(raw.get("bot_trading_hours_end_utc"), default=22),
             # Aggressive trading
             auto_dca_enabled=_b(raw.get("bot_auto_dca_enabled"), default=True),
             auto_dca_threshold_pct=max(0.01, min(0.20, float(raw.get("bot_auto_dca_threshold_pct") or 0.03))),
@@ -122,6 +131,15 @@ def _holding_mode(value: str | None) -> str:
 
     mode = (value or "").strip().lower()
     return mode if mode in VALID_MODES else DEFAULT_MODE
+
+
+def _hour(value: str | None, default: int) -> int:
+    """Coerce a UTC hour string to int in [0, 24]; out-of-range -> default."""
+    try:
+        h = int(float(value)) if value not in (None, "") else default
+    except (TypeError, ValueError):
+        return default
+    return h if 0 <= h <= 24 else default
 
 
 def _load_raw() -> dict[str, str]:

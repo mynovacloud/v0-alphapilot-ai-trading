@@ -37,12 +37,33 @@ logger = get_logger(__name__)
 _CACHE: dict[str, tuple[list[dict[str, Any]], float]] = {}
 _CACHE_TTL = 600.0  # 10 minutes
 
-# Curated liquid universe. This is the bot's tradable set when
-# `liquid_only` is True (the default). Ordered loosely by tier so the
-# most-liquid names are evaluated first within a tick's budget. A symbol
-# that has since been delisted simply drops out — it won't survive the
-# intersection with Coinbase's live `online` product list.
-_LIQUID_UNIVERSE: tuple[str, ...] = (
+# =====================================================================
+# Phase A of the signal overhaul: hyperfocus on a handful of majors.
+#
+# Trading 50+ symbols means the per-symbol learning loop never accumulates
+# enough samples to detect a real pattern. With 8 majors, every symbol
+# gets thousands of fingerprints per week and per-symbol calibration
+# starts being statistically meaningful. The broader curated list is
+# preserved below for the day we want to expand or A/B test a wider
+# universe — flip _LIQUID_UNIVERSE to _BROAD_UNIVERSE to revert.
+# =====================================================================
+_FOCUSED_UNIVERSE: tuple[str, ...] = (
+    "BTC-USD",   # the macro anchor
+    "ETH-USD",   # second anchor; clean structure
+    "SOL-USD",   # high-volatility L1 with deep volume
+    "LINK-USD",  # DeFi staple, well-respected levels
+    "AVAX-USD",  # L1 with clean technicals
+    "AAVE-USD",  # DeFi leader, mid-cap behavior
+    "ARB-USD",   # L2 with real volume
+    "INJ-USD",   # ecosystem token with active liquidity
+)
+
+# Broader curated list (preserved for fallback / future expansion).
+# Ordered loosely by tier so the most-liquid names are evaluated first
+# within a tick's budget. A symbol that has since been delisted simply
+# drops out — it won't survive the intersection with Coinbase's live
+# `online` product list.
+_BROAD_UNIVERSE: tuple[str, ...] = (
     # Top tier — highest liquidity
     "BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD", "DOGE-USD", "ADA-USD",
     # Layer 1s
@@ -66,6 +87,11 @@ _LIQUID_UNIVERSE: tuple[str, ...] = (
     # Misc high-volume
     "INJ-USD", "SEI-USD", "TIA-USD", "PYTH-USD", "JTO-USD", "JUP-USD",
 )
+
+# The bot's actual trading universe — Phase A of the signal overhaul
+# uses the focused list. Flip this assignment to _BROAD_UNIVERSE to
+# revert to the wider set.
+_LIQUID_UNIVERSE: tuple[str, ...] = _FOCUSED_UNIVERSE
 _PRIORITY_INDEX: dict[str, int] = {sym: i for i, sym in enumerate(_LIQUID_UNIVERSE)}
 
 

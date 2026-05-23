@@ -158,6 +158,18 @@
       </select>
       <small class="text-muted">Signal testing measured SELL/short entries at strongly negative edge. Keep On for spot trading.</small>
     </div>
+    <div class="field">
+      <label>Trading-Hours Start (UTC)</label>
+      <input class="input" type="number" name="bot_trading_hours_start_utc"
+             min="0" max="24" value="{{ bot_cfg.trading_hours_start_utc }}">
+      <small class="text-muted">Bot skips ticks before this hour (UTC). Default 12 = start of London-NY overlap.</small>
+    </div>
+    <div class="field">
+      <label>Trading-Hours End (UTC)</label>
+      <input class="input" type="number" name="bot_trading_hours_end_utc"
+             min="0" max="24" value="{{ bot_cfg.trading_hours_end_utc }}">
+      <small class="text-muted">Bot skips ticks at or after this hour. Set both to 0 to trade 24/7. Default 22.</small>
+    </div>
 
     <div class="field" style="grid-column: 1 / -1;">
       <button class="btn btn-primary" type="submit">Save Bot Settings</button>

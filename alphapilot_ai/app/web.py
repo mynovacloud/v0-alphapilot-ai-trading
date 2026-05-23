@@ -2832,6 +2832,8 @@ def settings_bot_save(
     bot_dry_run: str = Form("true"),
     bot_holding_mode: str = Form("mixed"),
     bot_long_only: str = Form("true"),
+    bot_trading_hours_start_utc: str = Form("12"),
+    bot_trading_hours_end_utc: str = Form("22"),
 ) -> RedirectResponse:
     """
     Persist autonomous-bot settings and reload the scheduler so the new
@@ -2841,6 +2843,15 @@ def settings_bot_save(
     enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
     dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
     long_only = "true" if str(bot_long_only).lower() in {"on", "true", "1", "yes"} else "false"
+
+    def _clamp_hour(v: str, default: int) -> int:
+        try:
+            h = int(float(v))
+        except (TypeError, ValueError):
+            return default
+        return h if 0 <= h <= 24 else default
+    hours_start = _clamp_hour(bot_trading_hours_start_utc, 12)
+    hours_end = _clamp_hour(bot_trading_hours_end_utc, 22)
 
     # Validate the holding mode against the known set; fall back to default.
     from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
@@ -2861,6 +2872,8 @@ def settings_bot_save(
             "bot_dry_run": dry,
             "bot_holding_mode": holding_mode,
             "bot_long_only": long_only,
+            "bot_trading_hours_start_utc": str(hours_start),
+            "bot_trading_hours_end_utc": str(hours_end),
         }
     )
 
