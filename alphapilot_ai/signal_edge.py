@@ -29,8 +29,10 @@ import argparse
 import datetime
 import statistics
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 import httpx
 
@@ -415,6 +417,56 @@ def _fetch(symbols, granularity: int, target_bars: int) -> dict[str, list[dict]]
     total = sum(len(c) for c in series.values())
     print(f"  fetched {total:,} candles across {ok} symbols ({fail} skipped — no/insufficient data)")
     return series
+
+
+# A single-runner lock so a button-spammer can't kick off two parallel
+# Coinbase-pounding audits at once. The lock is process-local — fine for
+# the single-process FastAPI server; if the app is ever scaled out we'd
+# need an external coordinator.
+_AUDIT_LOCK = threading.Lock()
+
+
+def run_audit_lite(
+    strategy: str = "Momentum",
+    granularity: int = 60,
+    bars: int = 600,
+    cost_bps: float = 30.0,
+) -> dict[str, Any]:
+    """Synchronous, web-callable signal-edge audit.
+
+    Lighter than the CLI default (600 bars per symbol = ~2 paginated
+    requests, ~30-50 second wall time over 57 symbols) so it returns
+    inside a sane HTTP wait. The CLI version (`python signal_edge.py`)
+    remains the canonical deeper run.
+
+    Raises RuntimeError if another audit is already in flight; the
+    caller (the route handler) maps that to a 409 response so the UI
+    can show a wait message instead of starting a second Coinbase
+    pounding alongside the first.
+    """
+    if not _AUDIT_LOCK.acquire(blocking=False):
+        raise RuntimeError("A signal audit is already running")
+    try:
+        t0 = time.time()
+        series = _fetch(_LIQUID_UNIVERSE, granularity, bars)
+        samples = measure(series, strategy, DEFAULT_HORIZONS)
+        report = "\n".join((
+            alpha_report(samples, DEFAULT_HORIZONS, cost_bps),
+            "",
+            summarize(samples, DEFAULT_HORIZONS, cost_bps),
+        ))
+        return {
+            "report_text": report,
+            "samples_evaluated": len(samples),
+            "symbols_fetched": len(series),
+            "duration_seconds": time.time() - t0,
+            "strategy": strategy,
+            "granularity": granularity,
+            "bars_per_symbol": bars,
+            "cost_bps": cost_bps,
+        }
+    finally:
+        _AUDIT_LOCK.release()
 
 
 def main(argv: list[str] | None = None) -> int:

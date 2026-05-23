@@ -15,7 +15,6 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-from ai.ai_engine import AIEngine
 from ai.learning_memory import LearningMemory
 from analytics.performance import performance_metrics
 from analytics.portfolio import (
@@ -148,7 +147,6 @@ templates.env.filters["timeago"] = _fmt_timeago
 router = APIRouter()
 
 _engine = PaperTradingEngine()
-_ai = AIEngine()
 _memory = LearningMemory()
 
 
@@ -2292,32 +2290,57 @@ def training_session_feed(
     )
 
 
-@router.post("/training/run", response_class=HTMLResponse)
-def training_run(
-    request: Request,
-    wallet_id: int | None = Form(None),
-    strategy_id: int | None = Form(None),
-    market_type: str = Form("Crypto"),
-    risk_level: str = Form("Moderate"),
-    num_trades: int = Form(50),
-    starting_balance: float = Form(10000.0),
-) -> HTMLResponse:
-    result = _ai.run_training_session(
-        wallet_id=wallet_id if wallet_id else None,
-        strategy_id=strategy_id if strategy_id else None,
-        market_type=market_type,
-        risk_level=risk_level,
-        num_trades=num_trades,
-        starting_balance=starting_balance,
+@router.post("/training/signal-audit", response_class=HTMLResponse)
+def training_signal_audit(request: Request) -> HTMLResponse:
+    """Run the signal-edge harness over the liquid universe and return the
+    report as HTML for HTMX swap-in. The button this serves lives on the
+    AI Training page — the operator clicks it when they want to know
+    whether the underlying signal is worth trusting (independent of any
+    session results)."""
+    from html import escape as _esc
+    try:
+        from signal_edge import run_audit_lite
+        result = run_audit_lite(bars=600)
+    except RuntimeError as e:
+        # Audit already running — surface a clear wait message, not a 500.
+        body = (
+            f'<div class="text-muted" style="padding: 0.75rem;">'
+            f'<strong>{_esc(str(e))}.</strong> Please wait for the current '
+            f'run to finish before starting another.</div>'
+        )
+        return HTMLResponse(content=body, status_code=409)
+    except Exception as e:
+        import traceback
+        logger.exception("[SIGNAL_AUDIT] failed")
+        body = (
+            f'<div class="text-warn" style="padding: 0.75rem;">'
+            f'<strong>Signal audit failed:</strong> {_esc(str(e))}<br>'
+            f'<pre style="font-size: 0.75rem; opacity: 0.7;">{_esc(traceback.format_exc()[-800:])}</pre>'
+            f'</div>'
+        )
+        return HTMLResponse(content=body, status_code=500)
+
+    header = (
+        f"{result['strategy']} @ {result['granularity']}s candles · "
+        f"{result['samples_evaluated']:,} evaluations across "
+        f"{result['symbols_fetched']} symbols · "
+        f"ran in {result['duration_seconds']:.1f}s · "
+        f"cost assumption {result['cost_bps']:.0f} bps round-trip"
     )
-    eq: list[float] = [result.starting_balance]
-    for d in result.decisions:
-        eq.append(d.get("balance", eq[-1]))
-    return templates.TemplateResponse(
-        request=request,
-        name="_training_result.html",
-        context={"request": request, "result": result, "equity": eq},
+    body = (
+        f'<div class="card mt-3" style="border: 1px solid var(--border, #2a2a2a);">'
+        f'  <div class="card-header"><div class="card-title">Signal Audit Result</div></div>'
+        f'  <div class="text-muted mb-2" style="font-size: 0.78rem;">{_esc(header)}</div>'
+        f'  <pre style="white-space: pre-wrap; font-family: ui-monospace, '
+        f'        SFMono-Regular, Menlo, monospace; font-size: 0.74rem; '
+        f'        line-height: 1.5; color: var(--text-muted, #b0b0b0); '
+        f'        margin: 0; padding: 0.75rem; background: rgba(0,0,0,0.18); '
+        f'        border-radius: 4px; max-height: 70vh; overflow: auto;">'
+        f'{_esc(result["report_text"])}'
+        f'  </pre>'
+        f'</div>'
     )
+    return HTMLResponse(content=body)
 
 
 @router.post("/training/memory/reset")

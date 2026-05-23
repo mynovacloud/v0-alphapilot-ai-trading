@@ -99,11 +99,3 @@ class StrategyOut(StrategyCreate):
         from_attributes = True
 
 
-class TrainingRunRequest(BaseModel):
-    wallet_id: Optional[int] = None
-    strategy_id: Optional[int] = None
-    market_type: str = "Crypto"
-    risk_level: str = "Moderate"
-    num_trades: int = 50
-    starting_balance: float = 10_000.0
-    speed: str = "fast"  # fast / normal / slow (placeholder)

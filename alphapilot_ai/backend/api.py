@@ -18,7 +18,6 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from ai.ai_engine import AIEngine
 from ai.learning_memory import LearningMemory
 from analytics.performance import performance_metrics
 from analytics.portfolio import portfolio_summary
@@ -37,7 +36,6 @@ from database.schemas import (
     PaperTradeCreate,
     StrategyCreate,
     StrategyOut,
-    TrainingRunRequest,
     WalletCreate,
     WalletOut,
 )
@@ -69,7 +67,6 @@ app.add_middleware(
 )
 
 _engine = PaperTradingEngine()
-_ai = AIEngine()
 _memory = LearningMemory()
 
 
@@ -276,33 +273,8 @@ def scan(n: int = 20) -> list[dict[str, Any]]:
 
 
 # ----------------------------------------------------------------------
-# AI / training
+# AI memory (admin)
 # ----------------------------------------------------------------------
-
-@app.post("/ai/train")
-def ai_train(payload: TrainingRunRequest) -> dict[str, Any]:
-    result = _ai.run_training_session(
-        wallet_id=payload.wallet_id,
-        strategy_id=payload.strategy_id,
-        market_type=payload.market_type,
-        risk_level=payload.risk_level,
-        num_trades=payload.num_trades,
-        starting_balance=payload.starting_balance,
-    )
-    return {
-        "session_id": result.session_id,
-        "starting_balance": result.starting_balance,
-        "ending_balance": result.ending_balance,
-        "pnl": result.pnl,
-        "trades": result.trades,
-        "wins": result.wins,
-        "losses": result.losses,
-        "win_rate": result.win_rate,
-        "avg_confidence": result.avg_confidence,
-        "max_drawdown": result.max_drawdown,
-        "lessons": result.lessons,
-    }
-
 
 @app.get("/ai/memory")
 def ai_memory(limit: int = 100) -> list[dict[str, Any]]:

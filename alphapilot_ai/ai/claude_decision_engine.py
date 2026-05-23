@@ -127,6 +127,13 @@ SECOND_OPINION_CONF_THRESHOLD = 0.85   # or confidence at/above this
 # --- Passthrough --------------------------------------------------------- #
 STRONG_PASSTHROUGH_FLOOR = 0.62    # technical confidence >= this bypasses Claude
 
+# LEARN_BLOCK / STRONG tier — bypass the training-mode fallthrough when the
+# adaptive engine has accumulated CONCLUSIVE evidence that a fingerprint
+# loses. Below this bar we keep exploring; above it we refuse the trade
+# even in training, because more samples will not flip a 5-of-5 loser.
+_LEARN_BLOCK_STRONG_MIN_TRADES = 5
+_LEARN_BLOCK_STRONG_MAX_WR = 0.20
+
 
 # =============================================================================
 # SMALL UTILITIES
@@ -638,9 +645,53 @@ def decide(
                 prompt_used="[LEARN_BLOCK]", extra_context=extra_context,
             )
             return refused
-        # Training mode: fall through. The passthrough will still fire, but
-        # adaptive_rec.size_multiplier (already shrunk for losers) bounds the
-        # damage while we collect fresh evidence.
+
+        # Training mode normally falls through here — more samples might
+        # reverse a marginal pattern, and the adaptive size_multiplier
+        # already shrinks the bet. But once a fingerprint has crossed
+        # STRONG-evidence territory (>= 5 trades AND <= 20% WR), more
+        # samples won't reverse it. At that point the "gather evidence"
+        # rationale is just paying for the same mistake over and over —
+        # exactly the bypass the overnight playbook hammered ("a gate
+        # that can be routed around is not a gate", w 2.00).
+        if (
+            adaptive_rec.similar_past_trades >= _LEARN_BLOCK_STRONG_MIN_TRADES
+            and adaptive_rec.historical_success_rate <= _LEARN_BLOCK_STRONG_MAX_WR
+        ):
+            refused = TradeDecision(
+                action="HOLD",
+                confidence=0.0,
+                size_multiplier=0.0,
+                stop_loss_pct=0.05,
+                take_profit_pct=0.10,
+                rationale=(
+                    f"[LEARN_BLOCK/STRONG] Confirmed losing pattern: "
+                    f"{adaptive_rec.historical_success_rate*100:.0f}% WR over "
+                    f"{adaptive_rec.similar_past_trades} similar trades. "
+                    "Refusing in training mode too — additional samples "
+                    "will not reverse this. "
+                    f"Original signal: {(technical_signal.reasoning or '')[:200]}"
+                ),
+                key_factors=[
+                    "learn_block_strong",
+                    f"hist_wr={adaptive_rec.historical_success_rate:.2f}",
+                    f"n={adaptive_rec.similar_past_trades}",
+                ],
+                risk_flags=[
+                    "known_losing_pattern_strong",
+                    *list(adaptive_rec.warnings or [])[:2],
+                ],
+                source="learn_block",
+            )
+            refused.quality = "F"
+            _persist_decision(
+                wallet, symbol, price, technical_signal, refused,
+                prompt_used="[LEARN_BLOCK/STRONG]", extra_context=extra_context,
+            )
+            return refused
+        # Otherwise the evidence isn't yet conclusive — fall through and
+        # let the adaptive size_multiplier (already shrunk for losers)
+        # bound the damage while more data accumulates.
 
     # ----- Strong-signal / training passthrough --------------------------- #
     bypass_threshold = max(0.0, min(STRONG_PASSTHROUGH_FLOOR, floor)) if is_training else STRONG_PASSTHROUGH_FLOOR
