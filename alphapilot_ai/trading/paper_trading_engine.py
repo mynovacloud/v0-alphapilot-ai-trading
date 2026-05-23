@@ -58,6 +58,36 @@ class PaperTradingEngine:
             f"side={side}, qty={qty}, price={entry_price}, conf={confidence}"
         )
 
+        # =====================================================================
+        # LONG-ONLY ENFORCEMENT — the engine-level deadbolt.
+        # =====================================================================
+        # bot_engine's guard catches the main entry path. Every OTHER path —
+        # portfolio_intelligence offset trades, scale-ins, manual tickets,
+        # the autonomous learner's direct route — calls open_trade without
+        # ever passing through that guard. The playbook spent an overnight
+        # run shouting about it ("a gate that can be routed around is not
+        # a gate"). Enforcing here means there is no path left that can
+        # open a short while long_only is set.
+        if side == "SELL":
+            from config.bot_config import BotConfig
+            try:
+                long_only = BotConfig.load().long_only
+            except Exception:
+                long_only = True  # safer default if config can't be read
+            if long_only:
+                logger.warning(
+                    f"[OPEN_TRADE] BLOCKED by long-only policy: {symbol} SELL refused. "
+                    f"Caller bypassed the bot_engine guard (likely portfolio_intel "
+                    f"offset, scale-in, or direct API)."
+                )
+                self._log(
+                    "risk",
+                    f"Long-only policy blocked SELL on {symbol} (path: engine-level "
+                    f"defense; some caller skipped bot_engine.long_only check)",
+                    wallet_id=wallet_id, level="warn",
+                )
+                return {"ok": False, "reason": "Long-only policy active", "code": "long_only_block"}
+
         decision = self.risk.evaluate(wallet_id, qty, entry_price, confidence, strategy_id)
         if not decision.allowed:
             logger.warning(f"[OPEN_TRADE] REJECTED by risk manager: {decision.reason} (code={decision.code})")

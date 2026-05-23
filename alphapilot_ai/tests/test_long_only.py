@@ -45,3 +45,73 @@ def test_engine_skips_short_entries_when_long_only():
     guard_idx = next(i for i, ln in enumerate(lines) if "cfg.long_only" in ln)
     window = " ".join(lines[guard_idx:guard_idx + 12])
     assert "continue" in window, "long-only guard does not skip the SELL entry"
+
+
+# --------------------------------------------------------------------------
+# Engine-level deadbolt — every path that bypasses bot_engine must still
+# be blocked when long_only is on. This is the fix the playbook spent an
+# overnight run shouting about ("a gate that can be routed around is not
+# a gate"): portfolio_intelligence offsets, scale-ins, manual tickets,
+# and the autonomous learner all call paper_engine.open_trade directly.
+# --------------------------------------------------------------------------
+
+def _make_wallet(name: str) -> int:
+    from database.db import session_scope
+    from database.models import Wallet
+    with session_scope() as s:
+        w = Wallet(name=name, platform="paper")
+        s.add(w); s.flush()
+        return w.id
+
+
+def test_open_trade_blocks_sell_directly_when_long_only():
+    """Calling open_trade with side=SELL must be refused at the engine
+    boundary — even if the caller never went through bot_engine's guard."""
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    _bc.set_many({"bot_long_only": "true"})
+    try:
+        wallet_id = _make_wallet("engine-deadbolt-on")
+        outcome = PaperTradingEngine().open_trade(
+            wallet_id=wallet_id, symbol="BTC-USD", side="SELL",
+            qty=0.01, entry_price=50000.0,
+        )
+        assert outcome["ok"] is False
+        assert outcome["code"] == "long_only_block"
+    finally:
+        _bc.set_many({"bot_long_only": "true"})
+
+
+def test_open_trade_allows_sell_when_long_only_disabled():
+    """When the operator disables long_only (e.g. for futures), SELL must
+    reach the rest of the open_trade pipeline. Any rejection from this
+    point on is for a different reason — never long_only_block."""
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    _bc.set_many({"bot_long_only": "false"})
+    try:
+        wallet_id = _make_wallet("engine-deadbolt-off")
+        outcome = PaperTradingEngine().open_trade(
+            wallet_id=wallet_id, symbol="BTC-USD", side="SELL",
+            qty=0.01, entry_price=50000.0,
+        )
+        assert outcome.get("code") != "long_only_block"
+    finally:
+        _bc.set_many({"bot_long_only": "true"})
+
+
+def test_open_trade_buys_pass_long_only_check():
+    """BUY entries must never trip the long-only deadbolt — it's a
+    short-blocker, not a no-trade-at-all switch."""
+    from trading.paper_trading_engine import PaperTradingEngine
+
+    _bc.set_many({"bot_long_only": "true"})
+    try:
+        wallet_id = _make_wallet("engine-deadbolt-buy")
+        outcome = PaperTradingEngine().open_trade(
+            wallet_id=wallet_id, symbol="BTC-USD", side="BUY",
+            qty=0.01, entry_price=50000.0,
+        )
+        assert outcome.get("code") != "long_only_block"
+    finally:
+        _bc.set_many({"bot_long_only": "true"})
