@@ -156,3 +156,128 @@ def test_setup_is_registered_in_strategy_registry():
     fn = _STRATEGY_REGISTRY["VWAP Reclaim"]
     sig = fn(_below_then_reclaim())
     assert sig.side == "BUY"
+
+
+# ==========================================================================
+# Opening-Range Breakout (ORB)
+# ==========================================================================
+# Build candles around a specific UTC anchor so we can deterministically
+# place the opening-range window. Anchor = 2026-01-15 13:30 UTC.
+
+import datetime as _dt   # local alias keeps the top of file clean
+
+from trading.setups import (
+    opening_range_breakout_signal,
+    _ORB_ANCHOR_HOUR_UTC,
+    _ORB_ANCHOR_MINUTE_UTC,
+    _ORB_RANGE_MINUTES,
+)
+
+
+def _orb_anchor_ts() -> int:
+    return int(_dt.datetime(
+        2026, 1, 15,
+        _ORB_ANCHOR_HOUR_UTC, _ORB_ANCHOR_MINUTE_UTC, 0,
+        tzinfo=_dt.timezone.utc,
+    ).timestamp())
+
+
+def _orb_setup_candles(
+    or_high: float = 101.0,
+    or_low: float = 99.0,
+    n_post_or_bars: int = 5,
+    last_close: float = 102.0,
+    last_open: float = 100.5,
+    last_volume: float = 3000.0,
+    in_range_volume: float = 1000.0,
+) -> list[dict]:
+    """Build a candle series with a clean opening range and a final
+    breakout bar. Defaults produce a textbook ORB BUY."""
+    a = _orb_anchor_ts()
+    candles: list[dict] = []
+    # 30 in-range bars, each oscillating tightly between or_low and or_high
+    for i in range(_ORB_RANGE_MINUTES):
+        candles.append(_c(a + 60 * i, or_low + 0.1, or_high, or_low,
+                          or_low + 0.5, v=in_range_volume))
+    # Post-OR bars below or_high (no premature breakout)
+    for i in range(n_post_or_bars - 1):
+        t = a + 60 * (_ORB_RANGE_MINUTES + i)
+        candles.append(_c(t, or_low + 0.5, or_high - 0.1, or_low + 0.2,
+                          or_high - 0.2, v=in_range_volume))
+    # The breakout bar (transition: prev was below, this closes above or_high)
+    t = a + 60 * (_ORB_RANGE_MINUTES + n_post_or_bars - 1)
+    candles.append(_c(t, last_open,
+                      max(last_close, last_open) + 0.2,
+                      min(last_close, last_open) - 0.5,
+                      last_close, v=last_volume))
+    return candles
+
+
+def test_orb_fires_buy_on_textbook_breakout():
+    """OR cleanly defined, latest bar closes above OR_high on heavy
+    volume — all six gates pass."""
+    candles = _orb_setup_candles()
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "BUY"
+    assert sig.confidence > 0.70
+    assert sig.indicators["or_high"] == 101.0
+    assert sig.indicators["or_low"] == 99.0
+    assert sig.indicators["volume_ratio"] > 1.3
+
+
+def test_orb_holds_when_too_few_candles():
+    """Below the 35-bar minimum the setup can't even establish the OR."""
+    candles = [_c(i * 60, 100, 101, 99, 100) for i in range(20)]
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "HOLD"
+    assert "need >=" in sig.reasoning
+
+
+def test_orb_holds_when_still_inside_or_window():
+    """Latest bar's time still inside [anchor, anchor+30min) → too
+    early to call a breakout."""
+    a = _orb_anchor_ts()
+    candles = [
+        _c(a + i * 60, 99.5, 101.0, 99.0, 100.0, v=1000.0)
+        for i in range(35)
+    ]
+    # Place the LAST bar inside the OR window (time = anchor + 20m)
+    candles[-1] = _c(a + 20 * 60, 99.5, 101.0, 99.0, 100.0, v=1000.0)
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "HOLD"
+    # Either "still inside" or "no transition" is acceptable here —
+    # the point is it doesn't fire BUY.
+    assert sig.side == "HOLD"
+
+
+def test_orb_holds_when_no_breakout_transition():
+    """OR is established, time is past it, but price never closes above
+    OR_high. No transition, no signal."""
+    candles = _orb_setup_candles(last_close=100.5)   # below or_high=101.0
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "HOLD"
+    assert "no breakout transition" in sig.reasoning
+
+
+def test_orb_holds_when_breakout_volume_weak():
+    """Price breaks out but on weak volume — not confirmed."""
+    candles = _orb_setup_candles(last_volume=900.0)   # below 1.3x avg
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "HOLD"
+    assert "volume" in sig.reasoning.lower()
+
+
+def test_orb_holds_when_or_signal_decayed():
+    """Far past the OR close (> 4h), the signal is stale even on a
+    fresh breakout."""
+    candles = _orb_setup_candles(n_post_or_bars=260)   # > 240 max
+    sig = opening_range_breakout_signal(candles)
+    assert sig.side == "HOLD"
+    assert "decayed" in sig.reasoning or "past OR close" in sig.reasoning
+
+
+def test_orb_is_registered_in_strategy_registry():
+    from trading.strategy_engine import _STRATEGY_REGISTRY
+    assert "ORB" in _STRATEGY_REGISTRY
+    sig = _STRATEGY_REGISTRY["ORB"](_orb_setup_candles())
+    assert sig.side == "BUY"
