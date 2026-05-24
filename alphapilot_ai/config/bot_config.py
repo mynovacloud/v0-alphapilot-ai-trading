@@ -32,6 +32,11 @@ DEFAULTS: dict[str, str] = {
     # harness measured SELL signals at -127 to -196 bps forward return,
     # and a spot account cannot really short anyway.
     "bot_long_only": "true",
+    # Focused trading universe — comma/space separated symbol list. Empty
+    # string means "use the hardcoded default (the 8 majors)". The bot
+    # re-reads this every tick via connectors.universe.get_active_universe
+    # so Settings changes take effect immediately, no restart.
+    "bot_focused_symbols": "",
     # Trading-hours window (UTC). Skip ticks outside [start, end). Defaults
     # to the London-NY overlap (12:00-22:00 UTC) where actual volume is.
     # Set both to 0 to disable the filter and trade 24/7.

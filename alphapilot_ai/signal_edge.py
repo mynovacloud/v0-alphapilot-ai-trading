@@ -40,7 +40,11 @@ import httpx
 # whether run as `python signal_edge.py` or `python -m signal_edge`.
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
-from connectors.universe import _LIQUID_UNIVERSE
+# Import the resolver (settings-aware) AND the default constant
+# (backward-compatible alias). The harness measures what the bot
+# actually trades — so if the operator edits Settings, the harness
+# follows.
+from connectors.universe import get_active_universe, _LIQUID_UNIVERSE
 from trading.strategy_engine import _STRATEGY_REGISTRY
 
 _COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/{pid}/candles"
@@ -480,7 +484,7 @@ def run_audit_lite(
         raise RuntimeError("A signal audit is already running")
     try:
         t0 = time.time()
-        series = _fetch(_LIQUID_UNIVERSE, granularity, bars)
+        series = _fetch(get_active_universe(), granularity, bars)
         samples = measure(series, strategy, DEFAULT_HORIZONS, peak_hours=peak_hours)
         report = "\n".join((
             alpha_report(samples, DEFAULT_HORIZONS, cost_bps),
@@ -522,9 +526,11 @@ def main(argv: list[str] | None = None) -> int:
     peak_label = f", peak-hours={peak[0]:02d}-{peak[1]:02d} UTC" if peak else ""
     print(f"Signal-edge harness — strategy={args.strategy!r}, granularity={args.granularity}s, "
           f"target {args.bars} bars/symbol, horizons={horizons}{peak_label}")
-    print(f"Fetching deep candle history for {len(_LIQUID_UNIVERSE)} liquid symbols "
-          f"(paginated — takes a few minutes)...")
-    series = _fetch(_LIQUID_UNIVERSE, args.granularity, args.bars)
+    active = get_active_universe()
+    print(f"Fetching deep candle history for {len(active)} liquid symbols "
+          f"({', '.join(active[:8])}{'...' if len(active) > 8 else ''}; "
+          f"paginated — takes a few minutes)...")
+    series = _fetch(active, args.granularity, args.bars)
     if not series:
         print("ERROR: no candle data fetched. Is this machine able to reach Coinbase?")
         return 1

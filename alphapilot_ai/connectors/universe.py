@@ -88,18 +88,93 @@ _BROAD_UNIVERSE: tuple[str, ...] = (
     "INJ-USD", "SEI-USD", "TIA-USD", "PYTH-USD", "JTO-USD", "JUP-USD",
 )
 
-# The bot's actual trading universe — Phase A of the signal overhaul
-# uses the focused list. Flip this assignment to _BROAD_UNIVERSE to
-# revert to the wider set.
+# Backward-compatible alias for the focused default. The live bot
+# resolves the *active* universe via get_active_universe() instead,
+# which reads from settings and falls back to _FOCUSED_UNIVERSE.
 _LIQUID_UNIVERSE: tuple[str, ...] = _FOCUSED_UNIVERSE
-_PRIORITY_INDEX: dict[str, int] = {sym: i for i, sym in enumerate(_LIQUID_UNIVERSE)}
+
+
+def _is_valid_symbol_shape(sym: str) -> bool:
+    """A token is a valid Coinbase USD pair shape iff it looks like
+    BASE-USD where BASE is alphanumeric and at most 12 characters."""
+    if not sym.endswith("-USD"):
+        return False
+    base = sym[:-4]
+    return bool(base) and len(base) <= 12 and all(c.isalnum() for c in base)
+
+
+def parse_symbols(raw: str) -> tuple[str, ...]:
+    """Parse a free-form symbol list into canonical Coinbase product IDs.
+
+    Accepts comma, space, semicolon, or newline-separated input. Each
+    token gets:
+      - whitespace trimmed, uppercased
+      - leading '$' stripped (some users habitually type "$BTC")
+      - '-USD' auto-suffixed if no dash is present ("BTC" -> "BTC-USD")
+      - shape-validated (BASE alphanumeric, length <= 12, "-USD" suffix)
+      - deduped (first occurrence wins, order preserved)
+
+    Invalid tokens are silently dropped. Empty/all-invalid input returns
+    an empty tuple, which callers treat as 'fall back to the default'.
+    """
+    if not raw:
+        return ()
+    seen: set[str] = set()
+    out: list[str] = []
+    text = raw.replace(",", " ").replace(";", " ").replace("\n", " ").replace("\t", " ")
+    for token in text.split():
+        sym = token.strip().upper()
+        if not sym:
+            continue
+        if sym.startswith("$"):
+            sym = sym[1:]
+        if "-" not in sym:
+            sym = f"{sym}-USD"
+        if not _is_valid_symbol_shape(sym):
+            continue
+        if sym in seen:
+            continue
+        seen.add(sym)
+        out.append(sym)
+    return tuple(out)
+
+
+def get_active_universe() -> tuple[str, ...]:
+    """Resolve the symbols the bot should trade RIGHT NOW.
+
+    Reads `bot_focused_symbols` from settings on every call (no caching
+    here — the upstream candle-products cache is plenty), so a Settings
+    edit propagates to the live bot on the very next tick. Returns the
+    hardcoded _FOCUSED_UNIVERSE when the setting is empty or unparseable.
+    """
+    try:
+        from config.bot_config import get as cfg_get   # local import: avoid cycle at module load
+        raw = cfg_get("bot_focused_symbols") or ""
+        parsed = parse_symbols(raw)
+        if parsed:
+            return parsed
+    except Exception:
+        pass
+    return _FOCUSED_UNIVERSE
 
 
 def _rank(rows: list[dict[str, Any]], limit: int, liquid_only: bool) -> list[dict[str, Any]]:
-    """Filter to the liquid set (if requested), order by priority, cap at limit."""
+    """Filter + order the candidate universe.
+
+    When `liquid_only` is True, restrict to the operator's *active*
+    focused list (settings-driven). Order by the operator's preferred
+    order within that list. When False, return every tradable product
+    but still sort by the broader curated list's priority so familiar
+    majors appear first.
+    """
     if liquid_only:
-        rows = [r for r in rows if r["product_id"] in _PRIORITY_INDEX]
-    rows = sorted(rows, key=lambda r: (_PRIORITY_INDEX.get(r["product_id"], 999), r["product_id"]))
+        active = get_active_universe()
+        active_set = frozenset(active)
+        priority = {s: i for i, s in enumerate(active)}
+        rows = [r for r in rows if r["product_id"] in active_set]
+    else:
+        priority = {s: i for i, s in enumerate(_BROAD_UNIVERSE)}
+    rows = sorted(rows, key=lambda r: (priority.get(r["product_id"], 999), r["product_id"]))
     return rows[:limit]
 
 
