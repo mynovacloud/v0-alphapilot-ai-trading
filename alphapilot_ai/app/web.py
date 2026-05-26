@@ -1200,6 +1200,15 @@ def training_page(request: Request) -> HTMLResponse:
             # Whether to apply session-scoped framing to subtitles.
             "is_session_scoped": reset_cutoff is not None,
         }
+    # Surface the operator's configured focused universe so the session-
+    # settings panel doesn't lie about "100 coins" when really we trade
+    # 8. Reads through get_active_universe() so Settings edits show up
+    # without any other plumbing.
+    from connectors.universe import get_active_universe
+    active_symbols = get_active_universe()
+    active_symbol_count = len(active_symbols)
+    active_symbol_preview = ", ".join(active_symbols[:8])
+
     return templates.TemplateResponse(request=request, name="training.html", context=_ctx(
             request,
             active="training",
@@ -1214,6 +1223,9 @@ def training_page(request: Request) -> HTMLResponse:
             portfolio=portfolio,
             risk_levels=["Conservative", "Moderate", "Aggressive", "Degenerate"],
             market_types=["Crypto", "Stocks", "Prediction Markets"],
+            active_symbols=list(active_symbols),
+            active_symbol_count=active_symbol_count,
+            active_symbol_preview=active_symbol_preview,
         ),
 )
 
@@ -2755,12 +2767,25 @@ def settings_page(request: Request) -> HTMLResponse:
         ]
     mission_enabled = _truthy(bot_config.get("mission_controller_enabled"))
     from trading.holding_profiles import SELECTABLE_MODES
+    from connectors.universe import get_active_universe
+
+    # Surface what's CURRENTLY active so the operator sees their saved list
+    # plus the count, and the count from get_active_universe() reflects
+    # the live resolution (settings value OR fallback to code default).
+    focused_symbols_raw = bot_config.get("bot_focused_symbols") or ""
+    active_symbols = get_active_universe()
+    focused_symbols_count = len(active_symbols)
+    focused_symbols_preview = ", ".join(active_symbols[:8])
+
     return templates.TemplateResponse(request=request, name="settings.html", context=_ctx(
         request,
         active="settings",
         prefs=prefs,
         bot_cfg=bot_cfg,
         holding_modes=SELECTABLE_MODES,
+        focused_symbols_raw=focused_symbols_raw,
+        focused_symbols_count=focused_symbols_count,
+        focused_symbols_preview=focused_symbols_preview,
         bot_status=bot_status,
         recent_ticks=recent_ticks,
         recent_recons=recent_recons,
@@ -2832,6 +2857,9 @@ def settings_bot_save(
     bot_dry_run: str = Form("true"),
     bot_holding_mode: str = Form("mixed"),
     bot_long_only: str = Form("true"),
+    bot_trading_hours_start_utc: str = Form("12"),
+    bot_trading_hours_end_utc: str = Form("22"),
+    bot_focused_symbols: str = Form(""),
 ) -> RedirectResponse:
     """
     Persist autonomous-bot settings and reload the scheduler so the new
@@ -2841,6 +2869,23 @@ def settings_bot_save(
     enabled = "true" if str(bot_enabled).lower() in {"on", "true", "1", "yes"} else "false"
     dry = "true" if str(bot_dry_run).lower() in {"on", "true", "1", "yes"} else "false"
     long_only = "true" if str(bot_long_only).lower() in {"on", "true", "1", "yes"} else "false"
+
+    def _clamp_hour(v: str, default: int) -> int:
+        try:
+            h = int(float(v))
+        except (TypeError, ValueError):
+            return default
+        return h if 0 <= h <= 24 else default
+    hours_start = _clamp_hour(bot_trading_hours_start_utc, 12)
+    hours_end = _clamp_hour(bot_trading_hours_end_utc, 22)
+
+    # Parse the focused-symbols textarea into a canonical comma-separated
+    # form. parse_symbols() handles "$BTC", "btc", missing -USD suffix,
+    # commas vs whitespace, etc. Empty or all-invalid input is stored
+    # as "" so the universe builder falls back to the hardcoded default.
+    from connectors.universe import parse_symbols as _parse_focused
+    parsed_symbols = _parse_focused(bot_focused_symbols or "")
+    focused_canonical = ",".join(parsed_symbols)
 
     # Validate the holding mode against the known set; fall back to default.
     from trading.holding_profiles import VALID_MODES, DEFAULT_MODE
@@ -2861,6 +2906,9 @@ def settings_bot_save(
             "bot_dry_run": dry,
             "bot_holding_mode": holding_mode,
             "bot_long_only": long_only,
+            "bot_trading_hours_start_utc": str(hours_start),
+            "bot_trading_hours_end_utc": str(hours_end),
+            "bot_focused_symbols": focused_canonical,
         }
     )
 

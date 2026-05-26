@@ -7,7 +7,11 @@ logic that decides EDGE FOUND vs NO EDGE.
 """
 from __future__ import annotations
 
-from signal_edge import measure, summarize, alpha_report, _signed_bps, _Sample
+import datetime as _dt
+
+from signal_edge import (
+    measure, summarize, alpha_report, _signed_bps, _Sample, _in_peak_window,
+)
 
 
 def _candle(t: int, close: float, vol: float = 1000.0) -> dict:
@@ -130,6 +134,34 @@ def test_alpha_report_no_alpha_when_buy_matches_market():
         samples.append(_Sample("BUY", 0.75, {15: 0.0003 + n}))
     report = alpha_report(samples, (15,), cost_bps=30.0)
     assert "NO TIMING ALPHA" in report
+
+
+# --------------------------------------------------------------------------
+# Peak-hours window — measure() can restrict evaluation to a UTC band
+# --------------------------------------------------------------------------
+
+def _ts(hour: int) -> int:
+    return int(_dt.datetime(2026, 1, 15, hour, 30, 0, tzinfo=_dt.timezone.utc).timestamp())
+
+
+def test_in_peak_window_same_day():
+    # 12:00 - 22:00 UTC: standard London-NY overlap window.
+    assert _in_peak_window(_ts(12), (12, 22)) is True
+    assert _in_peak_window(_ts(15), (12, 22)) is True
+    assert _in_peak_window(_ts(21), (12, 22)) is True
+    assert _in_peak_window(_ts(22), (12, 22)) is False  # end exclusive
+    assert _in_peak_window(_ts(3), (12, 22)) is False
+
+
+def test_in_peak_window_wraps_across_midnight():
+    assert _in_peak_window(_ts(23), (22, 4)) is True
+    assert _in_peak_window(_ts(2), (22, 4)) is True
+    assert _in_peak_window(_ts(12), (22, 4)) is False
+
+
+def test_in_peak_window_none_means_all_hours():
+    for h in range(24):
+        assert _in_peak_window(_ts(h), None) is True
 
 
 def test_alpha_report_marginal_when_alpha_below_cost():

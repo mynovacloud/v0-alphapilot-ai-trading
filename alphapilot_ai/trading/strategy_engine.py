@@ -779,6 +779,14 @@ _STRATEGY_REGISTRY = {
     "Volatility Breakout": volatility_breakout_signal,
 }
 
+# Phase C setups — registered after the base strategies via a late
+# import. The setups module imports Signal from THIS module, so a
+# top-of-file import here would be a cycle. Doing the import after
+# the class + registry are both defined breaks the cycle cleanly.
+from trading.setups import vwap_reclaim_signal, opening_range_breakout_signal       # noqa: E402
+_STRATEGY_REGISTRY["VWAP Reclaim"] = vwap_reclaim_signal
+_STRATEGY_REGISTRY["ORB"] = opening_range_breakout_signal
+
 
 def evaluate_entry_quality(candles: list[dict[str, Any]], side: str) -> dict[str, Any]:
     """Accept/reject gate on where price sits vs market structure, plus a

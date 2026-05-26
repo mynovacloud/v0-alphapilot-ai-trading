@@ -106,6 +106,19 @@
         <option value="coinbase_usd" {{ 'selected' if bot_cfg.universe == 'coinbase_usd' else '' }}>All Coinbase USD pairs</option>
       </select>
     </div>
+    <div class="field" style="grid-column: 1 / -1;">
+      <label>Focused Trading Universe</label>
+      <textarea class="input" name="bot_focused_symbols" rows="3" style="font-family: ui-monospace, SFMono-Regular, Menlo, monospace;"
+                placeholder="Leave empty for the default 8 majors (BTC, ETH, SOL, LINK, AVAX, AAVE, ARB, INJ). Or paste your own list: BTC, ETH, SHIB, PEPE, DOGE">{{ focused_symbols_raw }}</textarea>
+      <small class="text-muted">
+        Comma, space, or newline separated. The bare ticker is fine &mdash; <code>BTC</code> becomes <code>BTC-USD</code> automatically.
+        <br>
+        <strong>Currently active:</strong> {{ focused_symbols_count }} symbol{{ 's' if focused_symbols_count != 1 else '' }}
+        &mdash; {{ focused_symbols_preview }}{% if focused_symbols_count > 8 %}, ...{% endif %}
+        <br>
+        Changes take effect on the next tick &mdash; no app restart needed. Set "Max Symbols Per Tick" above the count here, or the cap will silently trim your list.
+      </small>
+    </div>
     <div class="field">
       <label>Max Symbols Per Tick</label>
       <input class="input" type="number" name="bot_universe_limit" min="1" max="500" value="{{ bot_cfg.universe_limit }}">
@@ -157,6 +170,18 @@
         <option value="false" {{ '' if bot_cfg.long_only else 'selected' }}>Off — allow short entries</option>
       </select>
       <small class="text-muted">Signal testing measured SELL/short entries at strongly negative edge. Keep On for spot trading.</small>
+    </div>
+    <div class="field">
+      <label>Trading-Hours Start (UTC)</label>
+      <input class="input" type="number" name="bot_trading_hours_start_utc"
+             min="0" max="24" value="{{ bot_cfg.trading_hours_start_utc }}">
+      <small class="text-muted">Bot skips ticks before this hour (UTC). Default 12 = start of London-NY overlap.</small>
+    </div>
+    <div class="field">
+      <label>Trading-Hours End (UTC)</label>
+      <input class="input" type="number" name="bot_trading_hours_end_utc"
+             min="0" max="24" value="{{ bot_cfg.trading_hours_end_utc }}">
+      <small class="text-muted">Bot skips ticks at or after this hour. Set both to 0 to trade 24/7. Default 22.</small>
     </div>
 
     <div class="field" style="grid-column: 1 / -1;">

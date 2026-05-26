@@ -66,6 +66,26 @@ class TickResult:
     notes: list[str] = field(default_factory=list)
 
 
+def _within_trading_hours(cfg, now_utc) -> bool:
+    """True iff `now_utc` falls inside the configured trading-hours window.
+
+    Window is [start, end) in UTC hours. Wrap-around windows (e.g.
+    22:00 → 04:00 next day) are supported. Setting both bounds to 0
+    disables the filter (the bot trades 24/7).
+
+    Manual ticks bypass this check at the call site — this helper just
+    answers the time-window question.
+    """
+    start = int(getattr(cfg, "trading_hours_start_utc", 0))
+    end = int(getattr(cfg, "trading_hours_end_utc", 0))
+    if start == end:                  # 0/0 or any equal pair -> filter off
+        return True
+    hour = now_utc.hour
+    if start < end:                   # same-day window e.g. 12-22
+        return start <= hour < end
+    return hour >= start or hour < end   # wrap-around e.g. 22-04
+
+
 class BotEngine:
     """Singleton-ish: one BotEngine per process. Safe to call .tick() concurrently."""
 
@@ -168,6 +188,25 @@ class BotEngine:
         if not cfg.bot_enabled and not manual:
             result.notes.append("bot_disabled")
             self._log("bot", "Tick skipped: bot is disabled.", level="info")
+            return self._record(result)
+
+        # Trading-hours filter. Manual ticks bypass this (the operator
+        # deliberately fired one). Crypto is 24/7, but real volume is
+        # concentrated in the London-NY overlap; trading dead hours just
+        # bleeds fees on chop.
+        if not manual and not _within_trading_hours(cfg, started):
+            note = (
+                f"outside_trading_hours_{cfg.trading_hours_start_utc:02d}-"
+                f"{cfg.trading_hours_end_utc:02d}_UTC"
+            )
+            result.notes.append(note)
+            self._log(
+                "bot",
+                f"Tick skipped: outside trading-hours window "
+                f"{cfg.trading_hours_start_utc:02d}:00-{cfg.trading_hours_end_utc:02d}:00 UTC "
+                f"(current hour={started.hour:02d} UTC)",
+                level="info",
+            )
             return self._record(result)
 
         # Global kill switch — fast-path before we touch the network.
